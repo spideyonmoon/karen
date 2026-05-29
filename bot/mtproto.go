@@ -9,7 +9,6 @@ import (
 	"sync"
 
 	"github.com/gotd/td/telegram"
-	"github.com/gotd/td/telegram/message"
 	"github.com/gotd/td/telegram/uploader"
 	"github.com/gotd/td/tg"
 )
@@ -274,21 +273,29 @@ func (m *MTProtoClient) UploadAndSendDocument(
 		return fmt.Errorf("failed to upload document via MTProto: %w", err)
 	}
 
-	// Use the high-level sender for simplicity
-	sender := message.NewSender(m.api).WithUploader(u)
-	target := sender.To(m.resolveInputPeer(chatID))
-
-	doc := message.UploadedDocument(docFile).
-		Filename(displayName).
-		MIME(mimeForDocExt(filepath.Ext(filePath)))
-
-	if replyToID > 0 {
-		target = target.ReplyMsg(&tg.InputReplyToMessage{
-			ReplyToMsgID: replyToID,
-		})
+	media := &tg.InputMediaUploadedDocument{
+		File:     docFile,
+		MimeType: mimeForDocExt(filepath.Ext(filePath)),
+		Attributes: []tg.DocumentAttributeClass{
+			&tg.DocumentAttributeFilename{
+				FileName: displayName,
+			},
+		},
 	}
 
-	_, err = target.Media(m.ctx, doc.Caption(message.PlainText(caption)))
+	req := &tg.MessagesSendMediaRequest{
+		Peer:    m.resolveInputPeer(chatID),
+		Media:   media,
+		Message: caption,
+	}
+	if replyToID > 0 {
+		req.ReplyTo = &tg.InputReplyToMessage{
+			ReplyToMsgID: replyToID,
+		}
+		req.SetFlags()
+	}
+
+	_, err = m.api.MessagesSendMedia(m.ctx, req)
 	if err != nil {
 		return fmt.Errorf("failed to send document via MTProto: %w", err)
 	}

@@ -1103,9 +1103,9 @@ func (b *TelegramBot) handleSelection(chatID int64, messageID int, choice int) {
 	switch pending.Kind {
 	case "song":
 		setSearchMeta(selected.ID, selected.Name, selected.Artist)
-		b.queueDownloadSongWithReply(chatID, selected.ID, replyToID, false)
+		b.queueDownloadSongWithReply(chatID, selected.ID, replyToID, false, false)
 	case "album", "artist_album":
-		b.queueDownloadAlbumWithReply(chatID, selected.ID, replyToID, false)
+		b.queueDownloadAlbumWithReply(chatID, selected.ID, replyToID, false, false)
 	case "artist":
 		b.showArtistAlbums(chatID, selected.ID, selected.Name, replyToID)
 	default:
