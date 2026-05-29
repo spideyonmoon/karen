@@ -57,6 +57,8 @@ type ConfigSet struct {
 	TelegramAPIURL             string  `yaml:"telegram-api-url"`
 	TelegramDownloadMaxGB         int `yaml:"telegram-download-max-gb"`
 	TelegramRequestTimeoutSeconds int `yaml:"telegram-request-timeout-seconds"`
+	TelegramApiID                 int    `yaml:"telegram-api-id"`
+	TelegramApiHash               string `yaml:"telegram-api-hash"`
 	GofileToken                   string  `yaml:"gofile-token"`
 }
 

@@ -4,9 +4,10 @@ FROM --platform=$BUILDPLATFORM golang:${GOVERSION}-alpine AS builder
 ARG TARGETOS
 ARG TARGETARCH
 WORKDIR /app
-RUN --mount=type=cache,target=/go/pkg/mod/ \
-    --mount=type=bind,target=. \
-    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /bin/apple-music-dl .
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /bin/apple-music-dl .
 
 FROM gpac/ubuntu
 ENV DEBIAN_FRONTEND=noninteractive

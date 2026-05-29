@@ -72,4 +72,7 @@ telegram-download-folder: ""      # Optional override for downloads
 telegram-cache-file: ""           # Optional cache file for Telegram file_id reuse
 telegram-download-max-gb: 3        # Cleanup threshold for Telegram download folder
 telegram-request-timeout-seconds: 3600 # Telegram API request timeout, including large uploads
+# MTProto settings (required for direct Telegram upload of files >50MB, up to 2GB)
+telegram-api-id: 0            # Get from https://my.telegram.org/apps
+telegram-api-hash: ""         # Get from https://my.telegram.org/apps
 gofile-token: "YOUR_GOFILE_TOKEN_HERE"
