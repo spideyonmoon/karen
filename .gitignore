@@ -1,0 +1,6 @@
+bot/config.yaml
+bot/telegram-cache.json
+bot/downloads/
+wrapper/wrapper-data/
+*.zip
+.env
