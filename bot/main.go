@@ -69,6 +69,11 @@ type AudioMeta struct {
 	Title          string
 	Performer      string
 	DurationMillis int64
+	AlbumName      string
+	ReleaseDate    string
+	ContentRating  string
+	Quality        string
+	Codec          string
 }
 
 func loadConfig() error {
@@ -96,6 +101,11 @@ func recordDownloadedTrack(track *task.Track) {
 		Title:          strings.TrimSpace(track.Resp.Attributes.Name),
 		Performer:      strings.TrimSpace(track.Resp.Attributes.ArtistName),
 		DurationMillis: int64(track.Resp.Attributes.DurationInMillis),
+		AlbumName:      strings.TrimSpace(track.Resp.Attributes.AlbumName),
+		ReleaseDate:    strings.TrimSpace(track.Resp.Attributes.ReleaseDate),
+		ContentRating:  strings.TrimSpace(track.Resp.Attributes.ContentRating),
+		Quality:        strings.TrimSpace(track.Quality),
+		Codec:          strings.TrimSpace(track.Codec),
 	}
 	if meta.TrackID != "" {
 		if override, ok := popSearchMeta(meta.TrackID); ok {

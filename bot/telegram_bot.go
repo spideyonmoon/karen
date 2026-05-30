@@ -1572,9 +1572,11 @@ func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, re
 
 		// Prepare thumbnail
 		thumbPath := ""
-		coverPath := findCoverFile(filepath.Dir(path)); fmt.Printf("DEBUG coverPath=%s dir=%s\n", coverPath, filepath.Dir(path))
+		coverPath := findCoverFile(filepath.Dir(path))
 		if coverPath != "" {
-			if tp, err := makeTelegramThumb(coverPath); err != nil { fmt.Printf("makeTelegramThumb failed: %v\n", err) } else {
+			if tp, err := makeTelegramThumb(coverPath); err != nil {
+				fmt.Printf("makeTelegramThumb failed: %v\n", err)
+			} else {
 				thumbPath = tp
 				defer os.Remove(tp)
 			}
@@ -1589,7 +1591,7 @@ func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, re
 		bitrateKbps := calcBitrateKbps(sizeBytes, meta.DurationMillis)
 		caption := formatTelegramCaption(sizeBytes, bitrateKbps, format)
 
-		err = b.mtproto.UploadAndSendAudio(chatID, path, title, performer, durationSecs, caption, thumbPath, replyToID, status)
+		err = b.mtproto.UploadAndSendAudio(chatID, path, title, performer, durationSecs, caption, thumbPath, 0, status)
 		if err != nil {
 			fmt.Printf("MTProto audio upload failed for %s (chatID=%d): %v\n", filepath.Base(path), chatID, err)
 			status.Update(fmt.Sprintf("Upload failed: %v", err), 0, 0)
@@ -1598,7 +1600,7 @@ func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, re
 			downloadLink, gofileErr := apputils.UploadToGofile(path, Config.GofileToken)
 			if gofileErr == nil {
 				msg := fmt.Sprintf("File: %s\nDownload Link: %s", filepath.Base(path), downloadLink)
-				_ = b.sendMessageWithReply(chatID, msg, nil, replyToID)
+				_ = b.sendMessage(chatID, msg, nil)
 				sentAny = true
 			}
 			continue
@@ -1630,7 +1632,7 @@ func (b *TelegramBot) deliverTelegramIndividualFallback(chatID int64, paths []st
 		}
 		if info.Size() <= b.maxFileBytes {
 			// Small enough for Bot API
-			err = b.sendAudioFile(chatID, path, replyToID, status, format)
+			err = b.sendAudioFile(chatID, path, 0, status, format)
 			if err == nil {
 				sentAny = true
 				continue
@@ -1645,7 +1647,7 @@ func (b *TelegramBot) deliverTelegramIndividualFallback(chatID int64, paths []st
 			continue
 		}
 		msg := fmt.Sprintf("File: %s\nDownload Link: %s", filepath.Base(path), downloadLink)
-		_ = b.sendMessageWithReply(chatID, msg, nil, replyToID)
+		_ = b.sendMessage(chatID, msg, nil)
 		sentAny = true
 	}
 	if sentAny {
@@ -1667,7 +1669,7 @@ func (b *TelegramBot) deliverTelegramZip(chatID int64, paths []string, replyToID
 	defer os.Remove(zipPath)
 
 	if b.mtproto != nil && b.mtproto.IsReady() {
-		err = b.mtproto.UploadAndSendDocument(chatID, zipPath, displayName, "", replyToID, status)
+		err = b.mtproto.UploadAndSendDocument(chatID, zipPath, displayName, "", 0, status)
 		if err != nil {
 			fmt.Printf("MTProto ZIP upload failed, falling back to Gofile: %v\n", err)
 			// Fallback to Gofile
@@ -1702,7 +1704,7 @@ func (b *TelegramBot) deliverGofileZip(chatID int64, paths []string, replyToID i
 				continue
 			}
 			msg := fmt.Sprintf("File: %s\nDownload Link: %s", filepath.Base(path), downloadLink)
-			_ = b.sendMessageWithReply(chatID, msg, nil, replyToID)
+			_ = b.sendMessage(chatID, msg, nil)
 			sentAny = true
 		}
 		if sentAny {
@@ -1735,7 +1737,7 @@ func (b *TelegramBot) deliverGofileZipFromPath(chatID int64, zipPath string, dis
 	}
 
 	msg := fmt.Sprintf("File: %s\nDownload Link: %s", displayName, downloadLink)
-	_ = b.sendMessageWithReply(chatID, msg, nil, replyToID)
+	_ = b.sendMessage(chatID, msg, nil)
 
 	status.Stop()
 	_ = b.deleteMessage(chatID, status.messageID)
@@ -2338,7 +2340,7 @@ func (s *DownloadStatus) setLatestLocked(phase string, done, total int64) {
 }
 
 func (s *DownloadStatus) loop() {
-	ticker := time.NewTicker(1500 * time.Millisecond)
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
@@ -2390,7 +2392,7 @@ func (s *DownloadStatus) flush(force bool) {
 		if text == lastText {
 			return
 		}
-		if !phaseChanged && !percentChanged && now.Sub(lastUpdate) < 2*time.Second {
+		if !phaseChanged && !percentChanged && now.Sub(lastUpdate) < 5*time.Second {
 			return
 		}
 	}
@@ -3291,30 +3293,80 @@ func buildCoverCaption(paths []string) string {
 	if len(paths) == 0 {
 		return ""
 	}
-	// Get artist from first track metadata
 	artist := ""
+	albumName := ""
+	releaseDate := ""
+	contentRating := ""
+	quality := ""
+	codec := ""
+
 	downloadedMetaMu.Lock()
 	for _, p := range paths {
-		if meta, ok := downloadedMeta[p]; ok && meta.Performer != "" {
-			artist = meta.Performer
-			break
+		if meta, ok := downloadedMeta[p]; ok {
+			if artist == "" && meta.Performer != "" {
+				artist = meta.Performer
+			}
+			if albumName == "" && meta.AlbumName != "" {
+				albumName = meta.AlbumName
+			}
+			if releaseDate == "" && meta.ReleaseDate != "" {
+				releaseDate = meta.ReleaseDate
+			}
+			if contentRating == "" && meta.ContentRating != "" {
+				contentRating = meta.ContentRating
+			}
+			if quality == "" && meta.Quality != "" {
+				quality = meta.Quality
+			}
+			if codec == "" && meta.Codec != "" {
+				codec = meta.Codec
+			}
 		}
 	}
 	downloadedMetaMu.Unlock()
 
-	// Album name from parent folder
-	albumDir := filepath.Base(filepath.Dir(paths[0]))
-
-	var parts []string
-	if artist != "" {
-		parts = append(parts, fmt.Sprintf("🎤 %s", artist))
+	if albumName == "" {
+		albumName = filepath.Base(filepath.Dir(paths[0]))
+		if albumName == "." || albumName == "" {
+			albumName = "Unknown"
+		}
 	}
-	if albumDir != "" && albumDir != "." {
-		parts = append(parts, fmt.Sprintf("💿 %s", albumDir))
-	}
-	parts = append(parts, fmt.Sprintf("🎵 %d track(s)", len(paths)))
 
-	return strings.Join(parts, "\n")
+	qualityDisplay := formatQualityDisplay(quality, codec)
+
+	explicit := "False"
+	if contentRating == "explicit" {
+		explicit = "True"
+	}
+
+	return fmt.Sprintf(
+		"ᴀʀᴛɪsᴛ : %s\nᴀʟʙᴜᴍ : %s\nʀᴇʟᴇᴀsᴇ ᴅᴀᴛᴇ : %s\nᴛᴏᴛᴀʟ ᴛʀᴀᴄᴋs : %d\nǫᴜᴀʟɪᴛʏ : %s\nᴇxᴘʟɪᴄɪᴛ : %s",
+		artist,
+		albumName,
+		releaseDate,
+		len(paths),
+		qualityDisplay,
+		explicit,
+	)
+}
+
+func formatQualityDisplay(quality string, codec string) string {
+	if quality == "" {
+		if codec != "" {
+			return codec
+		}
+		return "Unknown"
+	}
+	// ALAC quality format: "24B-48.0kHz" → "24Bit - 48kHz"
+	re := regexp.MustCompile(`^(\d+)B-(\d+(?:\.\d+)?)kHz$`)
+	if m := re.FindStringSubmatch(quality); len(m) == 3 {
+		sampleRate := m[2]
+		if strings.HasSuffix(sampleRate, ".0") {
+			sampleRate = strings.TrimSuffix(sampleRate, ".0")
+		}
+		return fmt.Sprintf("%sBit - %skHz", m[1], sampleRate)
+	}
+	return quality
 }
 
 func buildTransferKeyboard() InlineKeyboardMarkup {
