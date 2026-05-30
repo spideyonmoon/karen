@@ -3340,7 +3340,7 @@ func buildCoverCaption(paths []string) string {
 	}
 
 	return fmt.Sprintf(
-		"ᴀʀᴛɪsᴛ : %s\nᴀʟʙᴜᴍ : %s\nʀᴇʟᴇᴀsᴇ ᴅᴀᴛᴇ : %s\nᴛᴏᴛᴀʟ ᴛʀᴀᴄᴋs : %d\nǫᴜᴀʟɪᴛʏ : %s\nᴇxᴘʟɪᴄɪᴛ : %s",
+		"Artist : %s\nAlbum : %s\nRelease Date : %s\nTotal Tracks : %d\nQuality : %s\nExplicit : %s",
 		artist,
 		albumName,
 		releaseDate,
