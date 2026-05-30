@@ -1567,7 +1567,7 @@ func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, re
 		thumbPath := ""
 		coverPath := findCoverFile(filepath.Dir(path))
 		if coverPath != "" {
-			if tp, err := makeTelegramThumb(coverPath); err == nil {
+			if tp, err := makeTelegramThumb(coverPath); err != nil { fmt.Printf("makeTelegramThumb failed: %v\n", err) } else {
 				thumbPath = tp
 				defer os.Remove(tp)
 			}
@@ -1998,7 +1998,7 @@ func (b *TelegramBot) sendAudioFile(chatID int64, filePath string, replyToID int
 	}
 	coverPath := findCoverFile(filepath.Dir(filePath))
 	if coverPath != "" {
-		if path, err := makeTelegramThumb(coverPath); err == nil {
+		if path, err := makeTelegramThumb(coverPath); err != nil { fmt.Printf("makeTelegramThumb failed: %v\n", err) } else {
 			thumbPath = path
 		}
 	}
