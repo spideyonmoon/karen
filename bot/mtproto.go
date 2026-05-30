@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +14,12 @@ import (
 	"github.com/gotd/td/telegram/uploader"
 	"github.com/gotd/td/tg"
 )
+
+func cryptoRandID() int64 {
+	var b [8]byte
+	_, _ = cryptorand.Read(b[:])
+	return int64(binary.LittleEndian.Uint64(b[:]))
+}
 
 // MTProtoClient wraps the gotd/td client for direct Telegram uploads.
 type MTProtoClient struct {
@@ -227,9 +235,10 @@ func (m *MTProtoClient) UploadAndSendAudio(
 
 	// Build request
 	req := &tg.MessagesSendMediaRequest{
-		Peer:    m.resolveInputPeer(chatID),
-		Media:   media,
-		Message: caption,
+		Peer:     m.resolveInputPeer(chatID),
+		Media:    media,
+		Message:  caption,
+		RandomID: cryptoRandID(),
 	}
 	if replyToID > 0 {
 		req.ReplyTo = &tg.InputReplyToMessage{
@@ -284,9 +293,10 @@ func (m *MTProtoClient) UploadAndSendDocument(
 	}
 
 	req := &tg.MessagesSendMediaRequest{
-		Peer:    m.resolveInputPeer(chatID),
-		Media:   media,
-		Message: caption,
+		Peer:     m.resolveInputPeer(chatID),
+		Media:    media,
+		Message:  caption,
+		RandomID: cryptoRandID(),
 	}
 	if replyToID > 0 {
 		req.ReplyTo = &tg.InputReplyToMessage{
