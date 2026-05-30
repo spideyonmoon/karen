@@ -1584,6 +1584,7 @@ func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, re
 
 		err = b.mtproto.UploadAndSendAudio(chatID, path, title, performer, durationSecs, caption, thumbPath, replyToID, status)
 		if err != nil {
+			fmt.Printf("MTProto audio upload failed for %s (chatID=%d): %v\n", filepath.Base(path), chatID, err)
 			status.Update(fmt.Sprintf("Upload failed: %v", err), 0, 0)
 			// Fallback to Gofile for this file
 			status.UpdateSync("Falling back to Gofile...", 0, 0)
