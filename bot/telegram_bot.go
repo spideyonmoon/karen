@@ -1550,10 +1550,11 @@ func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, re
 	}
 
 	sentAny := false
-	// Send cover art as standalone photo
+	// Send cover art as standalone photo with album info
 	if len(paths) > 0 {
 		if coverPath := findCoverFile(filepath.Dir(paths[0])); coverPath != "" {
-			_ = b.sendPhotoWithReply(chatID, coverPath, "", replyToID)
+			coverCaption := buildCoverCaption(paths)
+			_ = b.sendPhotoWithReply(chatID, coverPath, coverCaption, replyToID)
 		}
 	}
 	for _, path := range paths {
@@ -1615,10 +1616,11 @@ func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, re
 // deliverTelegramIndividualFallback sends tracks via Bot API (limited to maxFileBytes) or Gofile.
 func (b *TelegramBot) deliverTelegramIndividualFallback(chatID int64, paths []string, replyToID int, format string, status *DownloadStatus) {
 	sentAny := false
-	// Send cover art as standalone photo
+	// Send cover art as standalone photo with album info
 	if len(paths) > 0 {
 		if coverPath := findCoverFile(filepath.Dir(paths[0])); coverPath != "" {
-			_ = b.sendPhotoWithReply(chatID, coverPath, "", replyToID)
+			coverCaption := buildCoverCaption(paths)
+			_ = b.sendPhotoWithReply(chatID, coverPath, coverCaption, replyToID)
 		}
 	}
 	for _, path := range paths {
@@ -1685,10 +1687,11 @@ func (b *TelegramBot) deliverGofileZip(chatID int64, paths []string, replyToID i
 	if single {
 		// Single song: upload each file to Gofile
 		sentAny := false
-	// Send cover art as standalone photo
+	// Send cover art as standalone photo with album info
 	if len(paths) > 0 {
 		if coverPath := findCoverFile(filepath.Dir(paths[0])); coverPath != "" {
-			_ = b.sendPhotoWithReply(chatID, coverPath, "", replyToID)
+			coverCaption := buildCoverCaption(paths)
+			_ = b.sendPhotoWithReply(chatID, coverPath, coverCaption, replyToID)
 		}
 	}
 		for _, path := range paths {
@@ -2639,6 +2642,48 @@ func getAudioDurationSeconds(path string) (float64, error) {
 	return hours*3600 + minutes*60 + seconds, nil
 }
 
+// sendPhotoWithReply sends a photo file with an optional caption, replying to a specific message.
+func (b *TelegramBot) sendPhotoWithReply(chatID int64, photoPath string, caption string, replyToID int) error {
+	file, err := os.Open(photoPath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	_ = writer.WriteField("chat_id", strconv.FormatInt(chatID, 10))
+	if replyToID > 0 {
+		_ = writer.WriteField("reply_to_message_id", strconv.Itoa(replyToID))
+	}
+	if caption != "" {
+		_ = writer.WriteField("caption", caption)
+	}
+	part, err := writer.CreateFormFile("photo", filepath.Base(photoPath))
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(part, file); err != nil {
+		return err
+	}
+	_ = writer.Close()
+
+	req, err := http.NewRequest("POST", b.apiURL("sendPhoto"), body)
+	if err != nil {
+		return b.sanitizeTelegramError(err)
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return b.sanitizeTelegramError(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("telegram sendPhoto failed: %s", resp.Status)
+	}
+	return nil
+}
+
 func (b *TelegramBot) sendMessage(chatID int64, text string, markup any) error {
 	return b.sendMessageWithReply(chatID, text, markup, 0)
 }
@@ -3239,6 +3284,37 @@ func buildInlineKeyboard(count int, hasPrev bool, hasNext bool) InlineKeyboardMa
 
 func buildAlbumTransferKeyboard() InlineKeyboardMarkup {
 	return buildTransferKeyboard()
+}
+
+// buildCoverCaption creates a caption for the album cover photo using track metadata.
+func buildCoverCaption(paths []string) string {
+	if len(paths) == 0 {
+		return ""
+	}
+	// Get artist from first track metadata
+	artist := ""
+	downloadedMetaMu.Lock()
+	for _, p := range paths {
+		if meta, ok := downloadedMeta[p]; ok && meta.Performer != "" {
+			artist = meta.Performer
+			break
+		}
+	}
+	downloadedMetaMu.Unlock()
+
+	// Album name from parent folder
+	albumDir := filepath.Base(filepath.Dir(paths[0]))
+
+	var parts []string
+	if artist != "" {
+		parts = append(parts, fmt.Sprintf("🎤 %s", artist))
+	}
+	if albumDir != "" && albumDir != "." {
+		parts = append(parts, fmt.Sprintf("💿 %s", albumDir))
+	}
+	parts = append(parts, fmt.Sprintf("🎵 %d track(s)", len(paths)))
+
+	return strings.Join(parts, "\n")
 }
 
 func buildTransferKeyboard() InlineKeyboardMarkup {
