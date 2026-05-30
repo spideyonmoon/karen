@@ -249,7 +249,7 @@ func (m *MTProtoClient) UploadAndSendAudio(
 		MimeType:   mimeType,
 		Attributes: attrs,
 	}
-	if thumb != nil {
+	if thumb != nil { fmt.Printf("DEBUG: thumb set for %s\n", filepath.Base(filePath))
 		media.Thumb = thumb
 		media.SetFlags()
 	}
