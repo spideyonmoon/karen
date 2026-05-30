@@ -165,7 +165,7 @@ func (m *MTProtoClient) resolveInputPeer(chatID int64) (tg.InputPeerClass, error
 		peer = &tg.InputPeerChat{
 			ChatID: -chatID,
 		}
-	} else {
+	} else { fmt.Printf("DEBUG: thumb uploaded OK\n")
 		// Positive IDs are users
 		peer = &tg.InputPeerUser{
 			UserID: chatID,
@@ -221,9 +221,9 @@ func (m *MTProtoClient) UploadAndSendAudio(
 		thumbUploader := uploader.NewUploader(m.api).WithPartSize(512 * 1024)
 		thumbFile, err := thumbUploader.FromPath(m.ctx, thumbPath)
 		if err != nil {
-			fmt.Printf("Warning: failed to upload thumbnail: %v\n", err)
+			fmt.Printf("WARNING: thumb upload failed: %v\n", err)
 			// Continue without thumbnail
-		} else {
+		} else { fmt.Printf("DEBUG: thumb uploaded OK\n")
 			thumb = thumbFile
 		}
 	}
