@@ -9,10 +9,12 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/uploader"
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 )
 
 func cryptoRandID() int64 {
@@ -275,6 +277,12 @@ func (m *MTProtoClient) UploadAndSendAudio(
 
 	// Send
 	_, err = m.api.MessagesSendMedia(m.ctx, req)
+	if d, ok := tgerr.FloodWait(err); ok {
+		fmt.Printf("FLOOD_WAIT %v for audio, retrying...\n", d)
+		time.Sleep(d)
+		req.RandomID = cryptoRandID()
+		_, err = m.api.MessagesSendMedia(m.ctx, req)
+	}
 	if err != nil {
 		return fmt.Errorf("failed to send audio via MTProto: %w", err)
 	}
@@ -337,6 +345,12 @@ func (m *MTProtoClient) UploadAndSendDocument(
 	}
 
 	_, err = m.api.MessagesSendMedia(m.ctx, req)
+	if d, ok := tgerr.FloodWait(err); ok {
+		fmt.Printf("FLOOD_WAIT %v for document, retrying...\n", d)
+		time.Sleep(d)
+		req.RandomID = cryptoRandID()
+		_, err = m.api.MessagesSendMedia(m.ctx, req)
+	}
 	if err != nil {
 		return fmt.Errorf("failed to send document via MTProto: %w", err)
 	}
