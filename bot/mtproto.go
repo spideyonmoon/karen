@@ -200,7 +200,7 @@ func (m *MTProtoClient) UploadAndSendAudio(
 		return fmt.Errorf("MTProto client not ready")
 	}
 
-	u := uploader.NewUploader(m.api)
+	u := uploader.NewUploader(m.api).WithPartSize(512 * 1024)
 	if status != nil {
 		u = u.WithProgress(&UploadProgress{status: status, phase: "Uploading"})
 	}
@@ -218,7 +218,7 @@ func (m *MTProtoClient) UploadAndSendAudio(
 	var thumb tg.InputFileClass
 	if thumbPath != "" {
 		// Use a separate uploader without progress for the small thumbnail
-		thumbUploader := uploader.NewUploader(m.api)
+		thumbUploader := uploader.NewUploader(m.api).WithPartSize(512 * 1024)
 		thumbFile, err := thumbUploader.FromPath(m.ctx, thumbPath)
 		if err != nil {
 			fmt.Printf("Warning: failed to upload thumbnail: %v\n", err)
@@ -301,7 +301,7 @@ func (m *MTProtoClient) UploadAndSendDocument(
 		return fmt.Errorf("MTProto client not ready")
 	}
 
-	u := uploader.NewUploader(m.api)
+	u := uploader.NewUploader(m.api).WithPartSize(512 * 1024)
 	if status != nil {
 		u = u.WithProgress(&UploadProgress{status: status, phase: "Uploading"})
 	}
