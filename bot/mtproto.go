@@ -118,31 +118,51 @@ func (m *MTProtoClient) IsReady() bool {
 	}
 }
 
-// resolveInputPeer converts a chat ID to an InputPeerClass.
+// resolveInputPeer converts a Bot API chat ID to an MTProto InputPeerClass.
+// For channels/supergroups, it fetches the access hash via ChannelsGetChannels.
 // Results are cached for reuse.
-func (m *MTProtoClient) resolveInputPeer(chatID int64) tg.InputPeerClass {
+func (m *MTProtoClient) resolveInputPeer(chatID int64) (tg.InputPeerClass, error) {
 	m.peerMu.Lock()
 	if peer, ok := m.peers[chatID]; ok {
 		m.peerMu.Unlock()
-		return peer
+		return peer, nil
 	}
 	m.peerMu.Unlock()
 
 	var peer tg.InputPeerClass
+
 	if chatID < 0 {
 		// Negative IDs are groups/channels
-		// Telegram chat IDs for supergroups/channels start with -100
+		// Bot API format for supergroups/channels: -100XXXXXXXXXX
 		if chatID < -1000000000000 {
-			// Supergroup/channel
 			channelID := -chatID - 1000000000000
-			peer = &tg.InputPeerChannel{
-				ChannelID: channelID,
+
+			// Fetch access hash from Telegram
+			res, err := m.api.ChannelsGetChannels(m.ctx, []tg.InputChannelClass{
+				&tg.InputChannel{ChannelID: channelID, AccessHash: 0},
+			})
+			if err != nil {
+				return nil, fmt.Errorf("failed to resolve channel %d: %w", channelID, err)
 			}
-		} else {
-			// Regular group
-			peer = &tg.InputPeerChat{
-				ChatID: -chatID,
+
+			chats := res.GetChats()
+			for _, chat := range chats {
+				if ch, ok := chat.(*tg.Channel); ok && ch.ID == channelID {
+					peer = &tg.InputPeerChannel{
+						ChannelID:  channelID,
+						AccessHash: ch.AccessHash,
+					}
+					m.peerMu.Lock()
+					m.peers[chatID] = peer
+					m.peerMu.Unlock()
+					return peer, nil
+				}
 			}
+			return nil, fmt.Errorf("channel %d not found in API response", channelID)
+		}
+		// Regular group
+		peer = &tg.InputPeerChat{
+			ChatID: -chatID,
 		}
 	} else {
 		// Positive IDs are users
@@ -154,7 +174,7 @@ func (m *MTProtoClient) resolveInputPeer(chatID int64) tg.InputPeerClass {
 	m.peerMu.Lock()
 	m.peers[chatID] = peer
 	m.peerMu.Unlock()
-	return peer
+	return peer, nil
 }
 
 // MTProtoAudioResult holds the result of an audio upload for caching.
@@ -233,9 +253,15 @@ func (m *MTProtoClient) UploadAndSendAudio(
 		media.SetFlags()
 	}
 
+	// Resolve peer
+	peer, err := m.resolveInputPeer(chatID)
+	if err != nil {
+		return fmt.Errorf("failed to resolve peer for chat %d: %w", chatID, err)
+	}
+
 	// Build request
 	req := &tg.MessagesSendMediaRequest{
-		Peer:     m.resolveInputPeer(chatID),
+		Peer:     peer,
 		Media:    media,
 		Message:  caption,
 		RandomID: cryptoRandID(),
@@ -292,8 +318,13 @@ func (m *MTProtoClient) UploadAndSendDocument(
 		},
 	}
 
+	peer, err := m.resolveInputPeer(chatID)
+	if err != nil {
+		return fmt.Errorf("failed to resolve peer for chat %d: %w", chatID, err)
+	}
+
 	req := &tg.MessagesSendMediaRequest{
-		Peer:     m.resolveInputPeer(chatID),
+		Peer:     peer,
 		Media:    media,
 		Message:  caption,
 		RandomID: cryptoRandID(),
