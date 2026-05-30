@@ -165,7 +165,7 @@ func (m *MTProtoClient) resolveInputPeer(chatID int64) (tg.InputPeerClass, error
 		peer = &tg.InputPeerChat{
 			ChatID: -chatID,
 		}
-	} else { fmt.Printf("DEBUG: thumb uploaded OK\n")
+	} else {
 		// Positive IDs are users
 		peer = &tg.InputPeerUser{
 			UserID: chatID,
@@ -217,13 +217,11 @@ func (m *MTProtoClient) UploadAndSendAudio(
 	// Upload thumbnail if available
 	var thumb tg.InputFileClass
 	if thumbPath != "" {
-		// Use a separate uploader without progress for the small thumbnail
 		thumbUploader := uploader.NewUploader(m.api).WithPartSize(512 * 1024)
 		thumbFile, err := thumbUploader.FromPath(m.ctx, thumbPath)
 		if err != nil {
-			fmt.Printf("WARNING: thumb upload failed: %v\n", err)
-			// Continue without thumbnail
-		} else { fmt.Printf("DEBUG: thumb uploaded OK\n")
+			fmt.Printf("Warning: failed to upload thumbnail: %v\n", err)
+		} else {
 			thumb = thumbFile
 		}
 	}
@@ -243,15 +241,15 @@ func (m *MTProtoClient) UploadAndSendAudio(
 	// Determine MIME type
 	mimeType := mimeForAudioExt(filepath.Ext(filePath))
 
-	// Build the media
+	// Build the media — set Thumb before SetFlags so the flag bit is included
 	media := &tg.InputMediaUploadedDocument{
 		File:       audioFile,
 		MimeType:   mimeType,
 		Attributes: attrs,
 	}
-	if thumb != nil { fmt.Printf("DEBUG: thumb set for %s\n", filepath.Base(filePath))
+	if thumb != nil {
 		media.Thumb = thumb
-		media.SetFlags()
+		media.Flags.Set(2) // bit 2 = thumb flag in InputMediaUploadedDocument
 	}
 
 	// Resolve peer
@@ -274,7 +272,7 @@ func (m *MTProtoClient) UploadAndSendAudio(
 		req.SetFlags()
 	}
 
-	// Send
+	// Send with FLOOD_WAIT retry
 	_, err = m.api.MessagesSendMedia(m.ctx, req)
 	if waited, _ := tgerr.FloodWait(m.ctx, err); waited {
 		fmt.Println("FLOOD_WAIT for audio, retrying...")
