@@ -1565,7 +1565,7 @@ func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, re
 
 		// Prepare thumbnail
 		thumbPath := ""
-		coverPath := findCoverFile(filepath.Dir(path))
+		coverPath := findCoverFile(filepath.Dir(path)); fmt.Printf("DEBUG coverPath=%s dir=%s\n", coverPath, filepath.Dir(path))
 		if coverPath != "" {
 			if tp, err := makeTelegramThumb(coverPath); err != nil { fmt.Printf("makeTelegramThumb failed: %v\n", err) } else {
 				thumbPath = tp
