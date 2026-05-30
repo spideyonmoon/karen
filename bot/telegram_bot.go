@@ -1550,6 +1550,12 @@ func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, re
 	}
 
 	sentAny := false
+	// Send cover art as standalone photo
+	if len(paths) > 0 {
+		if coverPath := findCoverFile(filepath.Dir(paths[0])); coverPath != "" {
+			_ = b.sendPhotoWithReply(chatID, coverPath, "", replyToID)
+		}
+	}
 	for _, path := range paths {
 		meta, hasMeta := getDownloadedMeta(path)
 		title := filepath.Base(path)
@@ -1609,6 +1615,12 @@ func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, re
 // deliverTelegramIndividualFallback sends tracks via Bot API (limited to maxFileBytes) or Gofile.
 func (b *TelegramBot) deliverTelegramIndividualFallback(chatID int64, paths []string, replyToID int, format string, status *DownloadStatus) {
 	sentAny := false
+	// Send cover art as standalone photo
+	if len(paths) > 0 {
+		if coverPath := findCoverFile(filepath.Dir(paths[0])); coverPath != "" {
+			_ = b.sendPhotoWithReply(chatID, coverPath, "", replyToID)
+		}
+	}
 	for _, path := range paths {
 		info, err := os.Stat(path)
 		if err != nil {
@@ -1673,6 +1685,12 @@ func (b *TelegramBot) deliverGofileZip(chatID int64, paths []string, replyToID i
 	if single {
 		// Single song: upload each file to Gofile
 		sentAny := false
+	// Send cover art as standalone photo
+	if len(paths) > 0 {
+		if coverPath := findCoverFile(filepath.Dir(paths[0])); coverPath != "" {
+			_ = b.sendPhotoWithReply(chatID, coverPath, "", replyToID)
+		}
+	}
 		for _, path := range paths {
 			status.UpdateSync("Uploading to Gofile...", 0, 0)
 			downloadLink, err := apputils.UploadToGofile(path, Config.GofileToken)
