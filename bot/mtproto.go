@@ -276,7 +276,7 @@ func (m *MTProtoClient) UploadAndSendAudio(
 
 	// Send
 	_, err = m.api.MessagesSendMedia(m.ctx, req)
-	if tgerr.FloodWait(m.ctx, err) {
+	if waited, _ := tgerr.FloodWait(m.ctx, err); waited {
 		fmt.Println("FLOOD_WAIT for audio, retrying...")
 		req.RandomID = cryptoRandID()
 		_, err = m.api.MessagesSendMedia(m.ctx, req)
@@ -343,7 +343,7 @@ func (m *MTProtoClient) UploadAndSendDocument(
 	}
 
 	_, err = m.api.MessagesSendMedia(m.ctx, req)
-	if tgerr.FloodWait(m.ctx, err) {
+	if waited, _ := tgerr.FloodWait(m.ctx, err); waited {
 		fmt.Println("FLOOD_WAIT for document, retrying...")
 		req.RandomID = cryptoRandID()
 		_, err = m.api.MessagesSendMedia(m.ctx, req)
