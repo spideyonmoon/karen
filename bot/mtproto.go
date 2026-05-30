@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/uploader"
@@ -277,9 +276,8 @@ func (m *MTProtoClient) UploadAndSendAudio(
 
 	// Send
 	_, err = m.api.MessagesSendMedia(m.ctx, req)
-	if d, ok := tgerr.FloodWait(err); ok {
-		fmt.Printf("FLOOD_WAIT %v for audio, retrying...\n", d)
-		time.Sleep(d)
+	if tgerr.FloodWait(m.ctx, err) {
+		fmt.Println("FLOOD_WAIT for audio, retrying...")
 		req.RandomID = cryptoRandID()
 		_, err = m.api.MessagesSendMedia(m.ctx, req)
 	}
@@ -345,9 +343,8 @@ func (m *MTProtoClient) UploadAndSendDocument(
 	}
 
 	_, err = m.api.MessagesSendMedia(m.ctx, req)
-	if d, ok := tgerr.FloodWait(err); ok {
-		fmt.Printf("FLOOD_WAIT %v for document, retrying...\n", d)
-		time.Sleep(d)
+	if tgerr.FloodWait(m.ctx, err) {
+		fmt.Println("FLOOD_WAIT for document, retrying...")
 		req.RandomID = cryptoRandID()
 		_, err = m.api.MessagesSendMedia(m.ctx, req)
 	}
