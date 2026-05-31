@@ -3537,7 +3537,6 @@ func buildSettingsKeyboard(current string) InlineKeyboardMarkup {
 			},
 		},
 	}
-	}
 }
 
 // cancelTask cancels a task by its ID.
