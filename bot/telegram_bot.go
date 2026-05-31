@@ -1598,7 +1598,7 @@ func (b *TelegramBot) runDownload(req *downloadRequest) {
 		Config.ConvertFormat = ""
 	}
 
-	status, err := newDownloadStatus(b, chatID, replyToID, req.statusMessageID)
+	status, err := newDownloadStatus(b, chatID, replyToID, req.statusMessageID, req)
 	if err != nil {
 		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Failed to create status message: %v", err), nil, replyToID)
 		dl_song = false
@@ -1710,7 +1710,7 @@ func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, re
 			status.Update(fmt.Sprintf("Upload failed: %v", err), 0, 0)
 			// Fallback to Gofile for this file
 			status.UpdateSync("Falling back to Gofile...", 0, 0)
-			downloadLink, gofileErr := apputils.UploadToGofile(path, Config.GofileToken)
+			downloadLink, gofileErr := apputils.UploadToGofile(ctx, path, Config.GofileToken)
 			if gofileErr == nil {
 				msg := fmt.Sprintf("File: %s\nDownload Link: %s", filepath.Base(path), downloadLink)
 				_ = b.sendMessage(chatID, msg, nil)
@@ -1739,6 +1739,10 @@ func (b *TelegramBot) deliverTelegramIndividualFallback(chatID int64, paths []st
 		}
 	}
 	for _, path := range paths {
+		if ctx != nil && ctx.Err() != nil {
+			status.UpdateSync("Cancelled", 0, 0)
+			return
+		}
 		info, err := os.Stat(path)
 		if err != nil {
 			continue
@@ -1754,7 +1758,7 @@ func (b *TelegramBot) deliverTelegramIndividualFallback(chatID int64, paths []st
 		}
 		// Too large or Bot API failed — use Gofile
 		status.UpdateSync("Uploading to Gofile...", 0, 0)
-		downloadLink, err := apputils.UploadToGofile(path, Config.GofileToken)
+		downloadLink, err := apputils.UploadToGofile(ctx, path, Config.GofileToken)
 		if err != nil {
 			status.Update(fmt.Sprintf("Gofile upload failed: %v", err), 0, 0)
 			continue
@@ -1821,7 +1825,7 @@ func (b *TelegramBot) deliverGofileZip(chatID int64, paths []string, replyToID i
 	}
 		for _, path := range paths {
 			status.UpdateSync("Uploading to Gofile...", 0, 0)
-			downloadLink, err := apputils.UploadToGofile(path, Config.GofileToken)
+			downloadLink, err := apputils.UploadToGofile(ctx, path, Config.GofileToken)
 			if err != nil {
 				status.Update(fmt.Sprintf("Gofile upload failed: %v", err), 0, 0)
 				continue
@@ -1853,7 +1857,7 @@ func (b *TelegramBot) deliverGofileZip(chatID int64, paths []string, replyToID i
 // deliverGofileZipFromPath uploads a pre-created ZIP file to Gofile and sends the link.
 func (b *TelegramBot) deliverGofileZipFromPath(chatID int64, zipPath string, displayName string, replyToID int, status *DownloadStatus, ctx context.Context) {
 	status.UpdateSync("Uploading to Gofile...", 0, 0)
-	downloadLink, err := apputils.UploadToGofile(zipPath, Config.GofileToken)
+	downloadLink, err := apputils.UploadToGofile(ctx, zipPath, Config.GofileToken)
 	if err != nil {
 		status.UpdateSync(fmt.Sprintf("Gofile upload failed: %v", err), 0, 0)
 		return
@@ -2389,6 +2393,9 @@ type DownloadStatus struct {
 	bot         *TelegramBot
 	chatID      int64
 	messageID   int
+	taskID      string
+	mode        string
+	startedAt   time.Time
 	lastPhase   string
 	lastPercent int
 	lastText    string
@@ -2403,28 +2410,23 @@ type DownloadStatus struct {
 	stopOnce    sync.Once
 }
 
-func newDownloadStatus(bot *TelegramBot, chatID int64, replyToID int, existingMsgID int) (*DownloadStatus, error) {
-	if existingMsgID > 0 {
-		status := &DownloadStatus{
-			bot:       bot,
-			chatID:    chatID,
-			messageID: existingMsgID,
-			updateCh:  make(chan struct{}, 1),
-			stopCh:    make(chan struct{}),
-		}
-		go status.loop()
-		return status, nil
-	}
-	messageID, err := bot.sendMessageWithReplyReturn(chatID, "Starting download...", nil, replyToID)
-	if err != nil {
-		return nil, err
-	}
+func newDownloadStatus(bot *TelegramBot, chatID int64, replyToID int, existingMsgID int, req *downloadRequest) (*DownloadStatus, error) {
 	status := &DownloadStatus{
 		bot:       bot,
 		chatID:    chatID,
-		messageID: messageID,
+		messageID: existingMsgID,
+		taskID:    req.taskID,
+		mode:      req.transferMode,
+		startedAt: req.startedAt,
 		updateCh:  make(chan struct{}, 1),
 		stopCh:    make(chan struct{}),
+	}
+	if existingMsgID <= 0 {
+		msgID, err := bot.sendMessageWithReplyReturn(chatID, "Starting download...", nil, replyToID)
+		if err != nil {
+			return nil, err
+		}
+		status.messageID = msgID
 	}
 	go status.loop()
 	return status, nil
@@ -2518,7 +2520,7 @@ func (s *DownloadStatus) flush(force bool) {
 		}
 	}
 
-	text := formatProgressText(phase, done, total, percent)
+	text := s.formatProgressText(phase, done, total, percent)
 	now := time.Now()
 	phaseChanged := phase != lastPhase
 	percentChanged := percent != lastPercent && percent >= 0
@@ -2545,17 +2547,36 @@ func (s *DownloadStatus) flush(force bool) {
 	s.mu.Unlock()
 }
 
-func formatProgressText(phase string, done, total int64, percent int) string {
+func (s *DownloadStatus) formatProgressText(phase string, done, total int64, percent int) string {
+	elapsedStr := "-"
+	if !s.startedAt.IsZero() {
+		elapsedStr = time.Since(s.startedAt).Truncate(time.Second).String()
+	}
+
+	header := fmt.Sprintf("📤 Task: %s\n├ Mode: %s\n├ Elapsed: %s\n╰ Cancel: /cancel_%s\n", s.taskID, s.mode, elapsedStr, s.taskID)
+
 	if total > 0 {
 		if percent < 0 {
 			percent = 0
 		}
-		return fmt.Sprintf("%s: %s / %s (%d%%)", phase, formatBytes(done), formatBytes(total), percent)
+		barLength := 15
+		filledCount := (percent * barLength) / 100
+		var bar string
+		for i := 0; i < barLength; i++ {
+			if i < filledCount {
+				bar += "■"
+			} else if i == filledCount {
+				bar += "▥"
+			} else {
+				bar += "□"
+			}
+		}
+		return fmt.Sprintf("%s\n╭ Status: %s\n├ Progress: [%s] %d%%\n╰ Processed: %s of %s", header, phase, bar, percent, formatBytes(done), formatBytes(total))
 	}
 	if done > 0 {
-		return fmt.Sprintf("%s: %s", phase, formatBytes(done))
+		return fmt.Sprintf("%s\n╭ Status: %s\n╰ Processed: %s", header, phase, formatBytes(done))
 	}
-	return phase
+	return fmt.Sprintf("%s\n╭ Status: %s", header, phase)
 }
 
 func formatBytes(value int64) string {

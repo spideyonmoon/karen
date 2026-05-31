@@ -2,6 +2,7 @@ package utils
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,7 +19,7 @@ type gofileResponse struct {
 	} `json:"data"`
 }
 
-func UploadToGofile(filePath, token string) (string, error) {
+func UploadToGofile(ctx context.Context, filePath, token string) (string, error) {
 	serverURL := "https://upload-ap-sgp.gofile.io/uploadFile"
 	if token != "" {
 		serverURL = "https://upload-ap-sgp.gofile.io/contents/uploadfile"
@@ -46,7 +47,7 @@ func UploadToGofile(filePath, token string) (string, error) {
 		return "", fmt.Errorf("failed to close multipart writer: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", serverURL, body)
+	req, err := http.NewRequestWithContext(ctx, "POST", serverURL, body)
 	if err != nil {
 		return "", fmt.Errorf("failed to create request: %w", err)
 	}
