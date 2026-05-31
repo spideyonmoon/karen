@@ -3,6 +3,9 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"context"
+	cryptorand "crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -103,16 +106,28 @@ type PendingTransfer struct {
 }
 
 type downloadRequest struct {
-	chatID       int64
-	userID       int64
-	replyToID    int
-	single       bool
-	format       string
-	transferMode string
-	albumID      string
-	forceAtmos   bool
-	fn           func() error
-	after        func()
+	taskID          string
+	chatID          int64
+	userID          int64
+	username        string
+	replyToID       int
+	single          bool
+	format          string
+	transferMode    string
+	albumID         string
+	forceAtmos      bool
+	fn              func(ctx context.Context) error
+	after           func()
+	ctx             context.Context
+	cancel          context.CancelFunc
+	statusMessageID int
+	startedAt       time.Time
+}
+
+func generateTaskID() string {
+	b := make([]byte, 4)
+	cryptorand.Read(b)
+	return hex.EncodeToString(b)
 }
 
 type Update struct {
@@ -440,9 +455,10 @@ func (b *TelegramBot) startDownloadWorker() {
 			b.queueMu.Lock()
 			b.inProgress = true
 			b.activeReq = req
+			req.startedAt = time.Now()
 			b.queueMu.Unlock()
 
-			b.runDownload(req.chatID, req.fn, req.single, req.replyToID, req.format, req.transferMode, req.albumID)
+			b.runDownload(req)
 			if req.after != nil {
 				req.after()
 			}
@@ -864,10 +880,18 @@ func (b *TelegramBot) handleCallback(cb *CallbackQuery) {
 		}
 	} else if strings.HasPrefix(data, "album_transfer:") {
 		mode := strings.TrimPrefix(data, "album_transfer:")
-		b.handleTransferMode(cb.Message.Chat.ID, cb.Message.MessageID, mode)
+		username := ""
+		if cb.From != nil {
+			username = cb.From.Username
+		}
+		b.handleTransferMode(cb.Message.Chat.ID, cb.Message.MessageID, mode, username, cb.From.ID)
 	} else if strings.HasPrefix(data, "transfer:") {
 		mode := strings.TrimPrefix(data, "transfer:")
-		b.handleTransferMode(cb.Message.Chat.ID, cb.Message.MessageID, mode)
+		username := ""
+		if cb.From != nil {
+			username = cb.From.Username
+		}
+		b.handleTransferMode(cb.Message.Chat.ID, cb.Message.MessageID, mode, username, cb.From.ID)
 	} else if strings.HasPrefix(data, "page:") {
 		deltaStr := strings.TrimPrefix(data, "page:")
 		if delta, err := strconv.Atoi(deltaStr); err == nil {
@@ -963,18 +987,56 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args
 	switch cmd {
 	case "start", "help":
 		_ = b.sendMessage(chatID, "Send /dl <apple-music-link> to download a song or album.\nSend /status to view the download queue.", nil)
+	case strings.HasPrefix(cmd, "cancel_"):
+		taskID := strings.TrimPrefix(cmd, "cancel_")
+		b.cancelTask(chatID, taskID, replyToID)
+		return
 	case "status", "queue":
 		b.queueMu.Lock()
 		queueLen := len(b.downloadQueue)
 		inProgress := b.inProgress
 		activeReq := b.activeReq
-		b.queueMu.Unlock()
-		
-		msg := fmt.Sprintf("Bot Status\n\nActive Task: %t\n", inProgress)
-		if inProgress && activeReq != nil {
-			msg += fmt.Sprintf("Downloading ID: %s (Single: %t)\n", activeReq.albumID, activeReq.single)
+		// Snapshot queued tasks
+		var queued []*downloadRequest
+		for i := 0; i < queueLen; i++ {
+			select {
+			case req := <-b.downloadQueue:
+				queued = append(queued, req)
+			default:
+			}
 		}
-		msg += fmt.Sprintf("Queued Tasks: %d\n", queueLen)
+		for _, req := range queued {
+			b.downloadQueue <- req
+		}
+		b.queueMu.Unlock()
+
+		msg := "📊 Karen Status Board\n\n"
+		if inProgress && activeReq != nil {
+			elapsed := time.Since(activeReq.startedAt).Truncate(time.Second)
+			user := activeReq.username
+			if user == "" {
+				user = fmt.Sprintf("ID:%d", activeReq.userID)
+			}
+			msg += fmt.Sprintf("📤 Task: %s (by @%s)\n", activeReq.taskID, user)
+			msg += fmt.Sprintf("├ Mode: %s\n", activeReq.transferMode)
+			msg += fmt.Sprintf("├ Elapsed: %s\n", elapsed)
+			msg += fmt.Sprintf("╰ Cancel: /cancel_%s\n", activeReq.taskID)
+		} else {
+			msg += "No active tasks.\n"
+		}
+
+		if len(queued) > 0 {
+			msg += fmt.Sprintf("\n📋 Queue: %d task(s)\n", len(queued))
+			for i, req := range queued {
+				user := req.username
+				if user == "" {
+					user = fmt.Sprintf("ID:%d", req.userID)
+				}
+				msg += fmt.Sprintf("%d. %s (by @%s) — /cancel_%s\n", i+1, req.taskID, user, req.taskID)
+			}
+		} else {
+			msg += "\n📋 Queue: empty"
+		}
 		_ = b.sendMessageWithReply(chatID, msg, nil, replyToID)
 	case "dl":
 		b.queueMu.Lock()
@@ -1135,7 +1197,38 @@ func (b *TelegramBot) showArtistAlbums(chatID int64, artistID string, artistName
 	b.setPending(chatID, "artist_album", artistID, 0, albums, hasNext, replyToID, messageID, artistName)
 }
 
-func (b *TelegramBot) handleTransferMode(chatID int64, messageID int, mode string) {
+func (b *TelegramBot) setLastQueuedMeta(messageID int, username string, userID int64) {
+	b.queueMu.Lock()
+	defer b.queueMu.Unlock()
+	// Set on active req if it just started, or on the last queued item
+	queueLen := len(b.downloadQueue)
+	if queueLen > 0 {
+		// Peek at last item — drain and re-add
+		var items []*downloadRequest
+		for i := 0; i < queueLen; i++ {
+			select {
+			case req := <-b.downloadQueue:
+				items = append(items, req)
+			default:
+			}
+		}
+		if len(items) > 0 {
+			last := items[len(items)-1]
+			last.statusMessageID = messageID
+			last.username = username
+			last.userID = userID
+		}
+		for _, req := range items {
+			b.downloadQueue <- req
+		}
+	} else if b.activeReq != nil && b.activeReq.statusMessageID == 0 {
+		b.activeReq.statusMessageID = messageID
+		b.activeReq.username = username
+		b.activeReq.userID = userID
+	}
+}
+
+func (b *TelegramBot) handleTransferMode(chatID int64, messageID int, mode string, username string, userID int64) {
 	pending, ok := b.getPendingTransfer(chatID)
 	if !ok {
 		return
@@ -1174,8 +1267,8 @@ func (b *TelegramBot) handleTransferMode(chatID int64, messageID int, mode strin
 	}
 
 	if pending.Single && pending.SongID != "" {
-		b.enqueueDownload(chatID, 0, replyToID, true, b.getChatFormat(chatID), mode, "", func() error {
-			return ripSong(pending.SongID, b.appleToken, Config.Storefront, Config.MediaUserToken, pending.ForceAAC)
+		b.enqueueDownload(chatID, userID, replyToID, true, b.getChatFormat(chatID), mode, "", func(ctx context.Context) error {
+			return ripSong(pending.SongID, b.appleToken, Config.Storefront, Config.MediaUserToken, pending.ForceAAC, ctx)
 		})
 	} else if pending.PlaylistID != "" {
 		b.enqueuePlaylistDownload(chatID, pending.PlaylistID, replyToID, mode, pending.ForceAAC, pending.ForceAtmos)
@@ -1188,6 +1281,7 @@ func (b *TelegramBot) handleTransferMode(chatID int64, messageID int, mode strin
 		}
 		b.enqueueAlbumDownload(chatID, pending.AlbumID, replyToID, mode, pending.ForceAAC, pending.ForceAtmos)
 	}
+	b.setLastQueuedMeta(messageID, username, userID)
 }
 
 func (b *TelegramBot) handlePage(chatID int64, messageID int, delta int) {
@@ -1281,8 +1375,8 @@ func (b *TelegramBot) queueInlineSongDownload(chatID int64, songID string, inlin
 		}
 		_ = b.editInlineMessageText(inlineMessageID, "Download failed. Please check bot logs or cache chat permissions.")
 	}
-	ok := b.enqueueDownloadWithAfter(uploadChatID, 0, 0, true, format, transferModeOneByOne, "", func() error {
-		return ripSong(songID, b.appleToken, Config.Storefront, Config.MediaUserToken, false)
+	ok := b.enqueueDownloadWithAfter(uploadChatID, 0, 0, true, format, transferModeOneByOne, "", func(ctx context.Context) error {
+		return ripSong(songID, b.appleToken, Config.Storefront, Config.MediaUserToken, false, ctx)
 	}, after)
 	if !ok && inlineMessageID != "" {
 		_ = b.editInlineMessageText(inlineMessageID, "Download queue is full. Please try again later.")
@@ -1335,11 +1429,11 @@ func (b *TelegramBot) enqueueAlbumDownload(chatID int64, albumID string, replyTo
 		return
 	}
 	format := b.getChatFormat(chatID)
-	b.enqueueDownload(chatID, 0, replyToID, false, format, transferMode, albumID, func() error {
+	b.enqueueDownload(chatID, 0, replyToID, false, format, transferMode, albumID, func(ctx context.Context) error {
 		if forceAtmos {
 			dl_atmos = true
 		}
-		return ripAlbum(albumID, b.appleToken, Config.Storefront, Config.MediaUserToken, "", forceAAC)
+		return ripAlbum(albumID, b.appleToken, Config.Storefront, Config.MediaUserToken, "", forceAAC, ctx)
 	})
 }
 
@@ -1349,22 +1443,26 @@ func (b *TelegramBot) enqueuePlaylistDownload(chatID int64, playlistID string, r
 		return
 	}
 	format := b.getChatFormat(chatID)
-	b.enqueueDownload(chatID, 0, replyToID, false, format, transferMode, playlistID, func() error {
+	b.enqueueDownload(chatID, 0, replyToID, false, format, transferMode, playlistID, func(ctx context.Context) error {
 		if forceAtmos {
 			dl_atmos = true
 		}
-		return ripPlaylist(playlistID, b.appleToken, Config.Storefront, Config.MediaUserToken, forceAAC)
+		return ripPlaylist(playlistID, b.appleToken, Config.Storefront, Config.MediaUserToken, forceAAC, ctx)
 	})
 }
 
-func (b *TelegramBot) enqueueDownload(chatID int64, userID int64, replyToID int, single bool, format string, transferMode string, albumID string, fn func() error) {
+func (b *TelegramBot) enqueueDownload(chatID int64, userID int64, replyToID int, single bool, format string, transferMode string, albumID string, fn func(ctx context.Context) error) {
 	_ = b.enqueueDownloadWithAfter(chatID, userID, replyToID, single, format, transferMode, albumID, fn, nil)
 }
 
-func (b *TelegramBot) enqueueDownloadWithAfter(chatID int64, userID int64, replyToID int, single bool, format string, transferMode string, albumID string, fn func() error, after func()) bool {
+func (b *TelegramBot) enqueueDownloadWithAfter(chatID int64, userID int64, replyToID int, single bool, format string, transferMode string, albumID string, fn func(ctx context.Context) error, after func()) bool {
 	// Accept all valid transfer modes
+	taskID := generateTaskID()
+	ctx, cancelFn := context.WithCancel(context.Background())
 	req := &downloadRequest{
+		taskID:       taskID,
 		chatID:       chatID,
+		userID:       userID,
 		replyToID:    replyToID,
 		single:       single,
 		format:       format,
@@ -1372,6 +1470,8 @@ func (b *TelegramBot) enqueueDownloadWithAfter(chatID int64, userID int64, reply
 		albumID:      albumID,
 		fn:           fn,
 		after:        after,
+		ctx:          ctx,
+		cancel:       cancelFn,
 	}
 	b.queueMu.Lock()
 	inProgress := b.inProgress
@@ -1395,7 +1495,7 @@ func (b *TelegramBot) enqueueDownloadWithAfter(chatID int64, userID int64, reply
 		return false
 	}
 	if inProgress || queueLen > 0 {
-		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Queued. Position: %d", position), nil, replyToID)
+		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Queued (ID: %s). Position: %d\nCancel: /cancel_%s", taskID, position, taskID), nil, replyToID)
 	}
 	
 	if userID != 0 {
@@ -1447,7 +1547,18 @@ func (b *TelegramBot) trySendCachedAlbumZip(chatID int64, albumID string, replyT
 	return true
 }
 
-func (b *TelegramBot) runDownload(chatID int64, fn func() error, single bool, replyToID int, format string, transferMode string, albumID string) {
+func (b *TelegramBot) runDownload(req *downloadRequest) {
+	chatID := req.chatID
+	fn := req.fn
+	single := req.single
+	replyToID := req.replyToID
+	format := req.format
+	transferMode := req.transferMode
+	albumID := req.albumID
+
+	if req.ctx != nil && req.ctx.Err() != nil {
+		return
+	}
 
 	lastDownloadedPaths = nil
 	downloadedMetaMu.Lock()
@@ -1485,7 +1596,7 @@ func (b *TelegramBot) runDownload(chatID int64, fn func() error, single bool, re
 		Config.ConvertFormat = ""
 	}
 
-	status, err := newDownloadStatus(b, chatID, replyToID)
+	status, err := newDownloadStatus(b, chatID, replyToID, req.statusMessageID)
 	if err != nil {
 		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Failed to create status message: %v", err), nil, replyToID)
 		dl_song = false
@@ -1500,7 +1611,7 @@ func (b *TelegramBot) runDownload(chatID int64, fn func() error, single bool, re
 	defer func() { activeProgress = nil }()
 
 	status.Update("Downloading", 0, 0)
-	err = fn()
+	err = fn(req.ctx)
 	if err != nil {
 		status.UpdateSync(fmt.Sprintf("Failed: %v", err), 0, 0)
 		dl_song = false
@@ -1526,26 +1637,26 @@ func (b *TelegramBot) runDownload(chatID int64, fn func() error, single bool, re
 
 	switch transferMode {
 	case transferModeTelegramIndividual:
-		b.deliverTelegramIndividual(chatID, paths, replyToID, format, status)
+		b.deliverTelegramIndividual(chatID, paths, replyToID, format, status, req.ctx)
 	case transferModeTelegramZip:
-		b.deliverTelegramZip(chatID, paths, replyToID, albumID, format, status)
+		b.deliverTelegramZip(chatID, paths, replyToID, albumID, format, status, req.ctx)
 	case transferModeGofileZip:
-		b.deliverGofileZip(chatID, paths, replyToID, single, status)
+		b.deliverGofileZip(chatID, paths, replyToID, single, status, req.ctx)
 	default:
 		// Legacy fallback: one-by-one goes to Telegram, zip goes to Gofile
 		if transferMode == transferModeZip {
-			b.deliverGofileZip(chatID, paths, replyToID, single, status)
+			b.deliverGofileZip(chatID, paths, replyToID, single, status, req.ctx)
 		} else {
-			b.deliverTelegramIndividual(chatID, paths, replyToID, format, status)
+			b.deliverTelegramIndividual(chatID, paths, replyToID, format, status, req.ctx)
 		}
 	}
 }
 
 // deliverTelegramIndividual uploads each track as an audio message via MTProto with cover art.
-func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, replyToID int, format string, status *DownloadStatus) {
+func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, replyToID int, format string, status *DownloadStatus, ctx context.Context) {
 	if b.mtproto == nil || !b.mtproto.IsReady() {
 		// Fallback: try Bot API sendAudioFile for small files, or Gofile for large
-		b.deliverTelegramIndividualFallback(chatID, paths, replyToID, format, status)
+		b.deliverTelegramIndividualFallback(chatID, paths, replyToID, format, status, ctx)
 		return
 	}
 
@@ -1591,7 +1702,7 @@ func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, re
 		bitrateKbps := calcBitrateKbps(sizeBytes, meta.DurationMillis)
 		caption := formatTelegramCaption(sizeBytes, bitrateKbps, format)
 
-		err = b.mtproto.UploadAndSendAudio(chatID, path, title, performer, durationSecs, caption, thumbPath, 0, status)
+		err = b.mtproto.UploadAndSendAudio(chatID, path, title, performer, durationSecs, caption, thumbPath, 0, status, ctx)
 		if err != nil {
 			fmt.Printf("MTProto audio upload failed for %s (chatID=%d): %v\n", filepath.Base(path), chatID, err)
 			status.Update(fmt.Sprintf("Upload failed: %v", err), 0, 0)
@@ -1616,7 +1727,7 @@ func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, re
 }
 
 // deliverTelegramIndividualFallback sends tracks via Bot API (limited to maxFileBytes) or Gofile.
-func (b *TelegramBot) deliverTelegramIndividualFallback(chatID int64, paths []string, replyToID int, format string, status *DownloadStatus) {
+func (b *TelegramBot) deliverTelegramIndividualFallback(chatID int64, paths []string, replyToID int, format string, status *DownloadStatus, ctx context.Context) {
 	sentAny := false
 	// Send cover art as standalone photo with album info
 	if len(paths) > 0 {
@@ -1657,7 +1768,7 @@ func (b *TelegramBot) deliverTelegramIndividualFallback(chatID int64, paths []st
 }
 
 // deliverTelegramZip creates a ZIP and uploads it as a document via MTProto.
-func (b *TelegramBot) deliverTelegramZip(chatID int64, paths []string, replyToID int, albumID string, format string, status *DownloadStatus) {
+func (b *TelegramBot) deliverTelegramZip(chatID int64, paths []string, replyToID int, albumID string, format string, status *DownloadStatus, ctx context.Context) {
 	if status != nil {
 		status.Update("Zipping", 0, 0)
 	}
@@ -1668,24 +1779,34 @@ func (b *TelegramBot) deliverTelegramZip(chatID int64, paths []string, replyToID
 	}
 	defer os.Remove(zipPath)
 
+	// Check ZIP size — Telegram limit is 2GB, use 1.90GB safety margin
+	const maxTelegramZipBytes = int64(1.90 * 1024 * 1024 * 1024) // ~1.90 GB
+	if info, err := os.Stat(zipPath); err == nil && info.Size() > maxTelegramZipBytes {
+		sizeMB := float64(info.Size()) / (1024 * 1024)
+		fmt.Printf("ZIP too large for Telegram (%.0f MB), redirecting to Gofile\n", sizeMB)
+		status.UpdateSync(fmt.Sprintf("ZIP is %.0f MB (>1.90 GB) — uploading to Gofile instead.", sizeMB), 0, 0)
+		b.deliverGofileZipFromPath(chatID, zipPath, displayName, replyToID, status, ctx)
+		return
+	}
+
 	if b.mtproto != nil && b.mtproto.IsReady() {
-		err = b.mtproto.UploadAndSendDocument(chatID, zipPath, displayName, "", 0, status)
+		err = b.mtproto.UploadAndSendDocument(chatID, zipPath, displayName, "", 0, status, ctx)
 		if err != nil {
 			fmt.Printf("MTProto ZIP upload failed, falling back to Gofile: %v\n", err)
 			// Fallback to Gofile
-			b.deliverGofileZipFromPath(chatID, zipPath, displayName, replyToID, status)
+			b.deliverGofileZipFromPath(chatID, zipPath, displayName, replyToID, status, ctx)
 		} else {
 			status.Stop()
 			_ = b.deleteMessage(chatID, status.messageID)
 		}
 	} else {
 		// No MTProto — fallback to Gofile
-		b.deliverGofileZipFromPath(chatID, zipPath, displayName, replyToID, status)
+		b.deliverGofileZipFromPath(chatID, zipPath, displayName, replyToID, status, ctx)
 	}
 }
 
 // deliverGofileZip creates a ZIP and uploads it to Gofile (original behavior).
-func (b *TelegramBot) deliverGofileZip(chatID int64, paths []string, replyToID int, single bool, status *DownloadStatus) {
+func (b *TelegramBot) deliverGofileZip(chatID int64, paths []string, replyToID int, single bool, status *DownloadStatus, ctx context.Context) {
 	if single {
 		// Single song: upload each file to Gofile
 		sentAny := false
@@ -1724,11 +1845,11 @@ func (b *TelegramBot) deliverGofileZip(chatID int64, paths []string, replyToID i
 	}
 	defer os.Remove(zipPath)
 
-	b.deliverGofileZipFromPath(chatID, zipPath, displayName, replyToID, status)
+	b.deliverGofileZipFromPath(chatID, zipPath, displayName, replyToID, status, ctx)
 }
 
 // deliverGofileZipFromPath uploads a pre-created ZIP file to Gofile and sends the link.
-func (b *TelegramBot) deliverGofileZipFromPath(chatID int64, zipPath string, displayName string, replyToID int, status *DownloadStatus) {
+func (b *TelegramBot) deliverGofileZipFromPath(chatID int64, zipPath string, displayName string, replyToID int, status *DownloadStatus, ctx context.Context) {
 	status.UpdateSync("Uploading to Gofile...", 0, 0)
 	downloadLink, err := apputils.UploadToGofile(zipPath, Config.GofileToken)
 	if err != nil {
@@ -2280,7 +2401,18 @@ type DownloadStatus struct {
 	stopOnce    sync.Once
 }
 
-func newDownloadStatus(bot *TelegramBot, chatID int64, replyToID int) (*DownloadStatus, error) {
+func newDownloadStatus(bot *TelegramBot, chatID int64, replyToID int, existingMsgID int) (*DownloadStatus, error) {
+	if existingMsgID > 0 {
+		status := &DownloadStatus{
+			bot:       bot,
+			chatID:    chatID,
+			messageID: existingMsgID,
+			updateCh:  make(chan struct{}, 1),
+			stopCh:    make(chan struct{}),
+		}
+		go status.loop()
+		return status, nil
+	}
 	messageID, err := bot.sendMessageWithReplyReturn(chatID, "Starting download...", nil, replyToID)
 	if err != nil {
 		return nil, err
@@ -2454,8 +2586,7 @@ func calcBitrateKbps(sizeBytes int64, durationMillis int64) float64 {
 }
 
 func formatTelegramCaption(sizeBytes int64, bitrateKbps float64, format string) string {
-	sizeMB := float64(sizeBytes) / (1024 * 1024)
-	return fmt.Sprintf("Size: %.2f MB | %.2f kbps", sizeMB, bitrateKbps)
+	return ""
 }
 
 func findCoverFile(dir string) string {
@@ -3406,8 +3537,50 @@ func buildSettingsKeyboard(current string) InlineKeyboardMarkup {
 			},
 		},
 	}
+	}
 }
 
+// cancelTask cancels a task by its ID.
+func (b *TelegramBot) cancelTask(chatID int64, taskID string, replyToID int) {
+	if taskID == "" {
+		_ = b.sendMessageWithReply(chatID, "Usage: /cancel_<task_id>", nil, replyToID)
+		return
+	}
+	b.queueMu.Lock()
+	// Check active task
+	if b.activeReq != nil && b.activeReq.taskID == taskID {
+		if b.activeReq.cancel != nil {
+			b.activeReq.cancel()
+		}
+		b.queueMu.Unlock()
+		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("⛔ Task %s cancelled.", taskID), nil, replyToID)
+		return
+	}
+	// Check queued tasks — drain and re-enqueue without the target
+	found := false
+	queueLen := len(b.downloadQueue)
+	for i := 0; i < queueLen; i++ {
+		select {
+		case req := <-b.downloadQueue:
+			if req.taskID == taskID {
+				if req.cancel != nil {
+					req.cancel()
+				}
+				found = true
+			} else {
+				b.downloadQueue <- req
+			}
+		default:
+			break
+		}
+	}
+	b.queueMu.Unlock()
+	if found {
+		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("⛔ Queued task %s cancelled.", taskID), nil, replyToID)
+	} else {
+		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Task %s not found.", taskID), nil, replyToID)
+	}
+}
 func botHelpText() string {
 	return strings.TrimSpace(`
 Commands:

@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -605,7 +606,8 @@ func convertIfNeeded(track *task.Track, lrc string) {
 	apputils.ConvertIfNeeded(track, lrc, &Config, coverPath, activeProgress)
 }
 
-func ripTrack(track *task.Track, token string, mediaUserToken string) {
+func ripTrack(track *task.Track, token string, mediaUserToken string, ctx context.Context) {
+	if ctx != nil && ctx.Err() != nil { return }
 	var err error
 	counter.Total++
 	fmt.Printf("Track %d of %d: %s\n", track.TaskNum, track.TaskTotal, track.Type)
@@ -871,7 +873,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 	okDict[track.PreID] = append(okDict[track.PreID], track.TaskNum)
 }
 
-func ripStation(albumId string, token string, storefront string, mediaUserToken string) error {
+func ripStation(albumId string, token string, storefront string, mediaUserToken string, ctx context.Context) error {
 	station := task.NewStation(storefront, albumId)
 	err := station.GetResp(mediaUserToken, token, Config.Language)
 	if err != nil {
@@ -1050,13 +1052,13 @@ func ripStation(albumId string, token string, storefront string, mediaUserToken 
 	for i := range station.Tracks {
 		i++
 		if isInArray(selected, i) {
-			ripTrack(&station.Tracks[i-1], token, mediaUserToken)
+			ripTrack(&station.Tracks[i-1], token, mediaUserToken, ctx)
 		}
 	}
 	return nil
 }
 
-func ripAlbum(albumId string, token string, storefront string, mediaUserToken string, urlArg_i string, forceAAC bool) error {
+func ripAlbum(albumId string, token string, storefront string, mediaUserToken string, urlArg_i string, forceAAC bool, ctx context.Context) error {
 	album := task.NewAlbum(storefront, albumId)
 	err := album.GetResp(token, Config.Language)
 	if err != nil {
@@ -1301,11 +1303,11 @@ func ripAlbum(albumId string, token string, storefront string, mediaUserToken st
 		} else {
 			for i := range album.Tracks {
 				if urlArg_i == album.Tracks[i].ID {
-					ripTrack(&album.Tracks[i], token, mediaUserToken)
+					ripTrack(&album.Tracks[i], token, mediaUserToken, ctx)
 					return nil
 				}
 			}
-			return ripAlbumSongFallback(album, urlArg_i, token, storefront, mediaUserToken, albumFolderPath, covPath, Codec, forceAAC)
+			return ripAlbumSongFallback(album, urlArg_i, token, storefront, mediaUserToken, albumFolderPath, covPath, Codec, forceAAC, ctx)
 		}
 		return nil
 	}
@@ -1323,13 +1325,13 @@ func ripAlbum(albumId string, token string, storefront string, mediaUserToken st
 			continue
 		}
 		if isInArray(selected, i) {
-			ripTrack(&album.Tracks[i-1], token, mediaUserToken)
+			ripTrack(&album.Tracks[i-1], token, mediaUserToken, ctx)
 		}
 	}
 	return nil
 
 }
-func ripPlaylist(playlistId string, token string, storefront string, mediaUserToken string, forceAAC bool) error {
+func ripPlaylist(playlistId string, token string, storefront string, mediaUserToken string, forceAAC bool, ctx context.Context) error {
 	playlist := task.NewPlaylist(storefront, playlistId)
 	err := playlist.GetResp(token, Config.Language)
 	if err != nil {
@@ -1563,7 +1565,7 @@ func ripPlaylist(playlistId string, token string, storefront string, mediaUserTo
 			continue
 		}
 		if isInArray(selected, i) {
-			ripTrack(&playlist.Tracks[i-1], token, mediaUserToken)
+			ripTrack(&playlist.Tracks[i-1], token, mediaUserToken, ctx)
 		}
 	}
 	return nil
@@ -1799,7 +1801,7 @@ func main() {
 					fmt.Println("Invalid song URL format.")
 					continue
 				}
-				err := ripSong(songId, token, storefront, Config.MediaUserToken, false)
+				err := ripSong(songId, token, storefront, Config.MediaUserToken, false, ctx)
 				if err != nil {
 					fmt.Println("Failed to rip song:", err)
 				}
@@ -1814,14 +1816,14 @@ func main() {
 			if strings.Contains(urlRaw, "/album/") {
 				fmt.Println("Album")
 				storefront, albumId = checkUrl(urlRaw)
-				err := ripAlbum(albumId, token, storefront, Config.MediaUserToken, urlArg_i, false)
+				err := ripAlbum(albumId, token, storefront, Config.MediaUserToken, urlArg_i, false, ctx)
 				if err != nil {
 					fmt.Println("Failed to rip album:", err)
 				}
 			} else if strings.Contains(urlRaw, "/playlist/") {
 				fmt.Println("Playlist")
 				storefront, albumId = checkUrlPlaylist(urlRaw)
-				err := ripPlaylist(albumId, token, storefront, Config.MediaUserToken, false)
+				err := ripPlaylist(albumId, token, storefront, Config.MediaUserToken, false, ctx)
 				if err != nil {
 					fmt.Println("Failed to rip playlist:", err)
 				}
@@ -1832,7 +1834,7 @@ func main() {
 					fmt.Println(": meida-user-token is not set, skip station dl")
 					continue
 				}
-				err := ripStation(albumId, token, storefront, Config.MediaUserToken)
+				err := ripStation(albumId, token, storefront, Config.MediaUserToken, ctx)
 				if err != nil {
 					fmt.Println("Failed to rip station:", err)
 				}
@@ -2371,7 +2373,7 @@ func extractVideo(c string) (string, error) {
 	return streamUrl.String(), nil
 }
 
-func ripSong(songId string, token string, storefront string, mediaUserToken string, forceAAC bool) error {
+func ripSong(songId string, token string, storefront string, mediaUserToken string, forceAAC bool, ctx context.Context) error {
 	// Get song info to find album ID
 	manifest, err := ampapi.GetSongResp(storefront, songId, Config.Language, token)
 	if err != nil {
@@ -2390,7 +2392,7 @@ func ripSong(songId string, token string, storefront string, mediaUserToken stri
 
 	// Use album approach but only download the specific song
 	dl_song = true
-	err = ripAlbum(albumId, token, storefront, mediaUserToken, songId, forceAAC)
+	err = ripAlbum(albumId, token, storefront, mediaUserToken, songId, forceAAC, ctx)
 	if err != nil {
 		fmt.Println("Failed to rip song:", err)
 		return err
@@ -2488,7 +2490,7 @@ func buildAlbumTrackFromSongData(song ampapi.SongRespData, album *task.Album, al
 	}, nil
 }
 
-func ripAlbumSongFallback(album *task.Album, songID string, token string, storefront string, mediaUserToken string, albumFolderPath string, coverPath string, codec string, forceAAC bool) error {
+func ripAlbumSongFallback(album *task.Album, songID string, token string, storefront string, mediaUserToken string, albumFolderPath string, coverPath string, codec string, forceAAC bool, ctx context.Context) error {
 	manifest, err := ampapi.GetSongResp(storefront, songID, album.Language, token)
 	if err != nil {
 		recordDownloadFailure("song %s: failed to fetch direct song metadata: %v", songID, err)
@@ -2505,6 +2507,6 @@ func ripAlbumSongFallback(album *task.Album, songID string, token string, storef
 		return err
 	}
 	fmt.Println("Song was not found in album track list, downloading by song metadata.")
-	ripTrack(track, token, mediaUserToken)
+	ripTrack(track, token, mediaUserToken, ctx)
 	return nil
 }

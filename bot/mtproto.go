@@ -195,6 +195,7 @@ func (m *MTProtoClient) UploadAndSendAudio(
 	thumbPath string,
 	replyToID int,
 	status *DownloadStatus,
+	ctx context.Context,
 ) error {
 	if !m.IsReady() {
 		return fmt.Errorf("MTProto client not ready")
@@ -209,7 +210,7 @@ func (m *MTProtoClient) UploadAndSendAudio(
 	if status != nil {
 		status.Update("Uploading", 0, 0)
 	}
-	audioFile, err := u.FromPath(m.ctx, filePath)
+	audioFile, err := u.FromPath(ctx, filePath)
 	if err != nil {
 		return fmt.Errorf("failed to upload audio via MTProto: %w", err)
 	}
@@ -218,7 +219,7 @@ func (m *MTProtoClient) UploadAndSendAudio(
 	var thumb tg.InputFileClass
 	if thumbPath != "" {
 		thumbUploader := uploader.NewUploader(m.api).WithPartSize(512 * 1024)
-		thumbFile, err := thumbUploader.FromPath(m.ctx, thumbPath)
+		thumbFile, err := thumbUploader.FromPath(ctx, thumbPath)
 		if err != nil {
 			fmt.Printf("Warning: failed to upload thumbnail: %v\n", err)
 		} else {
@@ -273,11 +274,11 @@ func (m *MTProtoClient) UploadAndSendAudio(
 	}
 
 	// Send with FLOOD_WAIT retry
-	_, err = m.api.MessagesSendMedia(m.ctx, req)
-	if waited, _ := tgerr.FloodWait(m.ctx, err); waited {
+	_, err = m.api.MessagesSendMedia(ctx, req)
+	if waited, _ := tgerr.FloodWait(ctx, err); waited {
 		fmt.Println("FLOOD_WAIT for audio, retrying...")
 		req.RandomID = cryptoRandID()
-		_, err = m.api.MessagesSendMedia(m.ctx, req)
+		_, err = m.api.MessagesSendMedia(ctx, req)
 	}
 	if err != nil {
 		return fmt.Errorf("failed to send audio via MTProto: %w", err)
@@ -294,6 +295,7 @@ func (m *MTProtoClient) UploadAndSendDocument(
 	caption string,
 	replyToID int,
 	status *DownloadStatus,
+	ctx context.Context,
 ) error {
 	if !m.IsReady() {
 		return fmt.Errorf("MTProto client not ready")
@@ -307,7 +309,7 @@ func (m *MTProtoClient) UploadAndSendDocument(
 	if status != nil {
 		status.Update("Uploading", 0, 0)
 	}
-	docFile, err := u.FromPath(m.ctx, filePath)
+	docFile, err := u.FromPath(ctx, filePath)
 	if err != nil {
 		return fmt.Errorf("failed to upload document via MTProto: %w", err)
 	}
@@ -340,11 +342,11 @@ func (m *MTProtoClient) UploadAndSendDocument(
 		req.SetFlags()
 	}
 
-	_, err = m.api.MessagesSendMedia(m.ctx, req)
-	if waited, _ := tgerr.FloodWait(m.ctx, err); waited {
+	_, err = m.api.MessagesSendMedia(ctx, req)
+	if waited, _ := tgerr.FloodWait(ctx, err); waited {
 		fmt.Println("FLOOD_WAIT for document, retrying...")
 		req.RandomID = cryptoRandID()
-		_, err = m.api.MessagesSendMedia(m.ctx, req)
+		_, err = m.api.MessagesSendMedia(ctx, req)
 	}
 	if err != nil {
 		return fmt.Errorf("failed to send document via MTProto: %w", err)
