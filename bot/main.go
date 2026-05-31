@@ -629,7 +629,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string, ctx contex
 			counter.Success++
 			return
 		}
-		err := mvDownloader(track.ID, track.SaveDir, token, track.Storefront, mediaUserToken, track)
+		err := mvDownloader(ctx, track.ID, track.SaveDir, token, track.Storefront, mediaUserToken, track)
 		if err != nil {
 			fmt.Println("\u26A0 Failed to dl MV:", err)
 			counter.Error++
@@ -1785,7 +1785,7 @@ func main() {
 					mvSaveDir = Config.AlacSaveFolder
 				}
 				storefront, albumId = checkUrlMv(urlRaw)
-				err := mvDownloader(albumId, mvSaveDir, token, storefront, Config.MediaUserToken, nil)
+				err := mvDownloader(context.Background(), albumId, mvSaveDir, token, storefront, Config.MediaUserToken, nil)
 				if err != nil {
 					fmt.Println("\u26A0 Failed to dl MV:", err)
 					counter.Error++
@@ -1853,7 +1853,7 @@ func main() {
 	}
 }
 
-func mvDownloader(adamID string, saveDir string, token string, storefront string, mediaUserToken string, track *task.Track) error {
+func mvDownloader(ctx context.Context, adamID string, saveDir string, token string, storefront string, mediaUserToken string, track *task.Track) error {
 	MVInfo, err := ampapi.GetMusicVideoResp(storefront, adamID, Config.Language, token)
 	if err != nil {
 		fmt.Println("\u26A0 Failed to get MV manifest:", err)
