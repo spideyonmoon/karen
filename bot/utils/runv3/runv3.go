@@ -243,8 +243,13 @@ func extractKidBase64(b string, mvmode bool) (string, string, string, error) {
 	}
 	return kidbase64, urlBuilder.String(), uriPrefix, nil
 }
-func extsong(b string, progress ProgressFunc) bytes.Buffer {
-	resp, err := http.Get(b)
+func extsong(ctx context.Context, b string, progress ProgressFunc) bytes.Buffer {
+	req, err := http.NewRequestWithContext(ctx, "GET", b, nil)
+	if err != nil {
+		fmt.Printf("创建请求失败: %v\n", err)
+		return bytes.Buffer{}
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		fmt.Printf("下载文件失败: %v\n", err)
 	}
@@ -280,7 +285,7 @@ func extsong(b string, progress ProgressFunc) bytes.Buffer {
 	}
 	return buffer
 }
-func Run(adamId string, trackpath string, authtoken string, mutoken string, mvmode bool, serverUrl string, progress ProgressFunc) (string, error) {
+func Run(ctx context.Context, adamId string, trackpath string, authtoken string, mutoken string, mvmode bool, serverUrl string, progress ProgressFunc) (string, error) {
 	var keystr string //for mv key
 	var fileurl string
 	var kidBase64 string
@@ -297,7 +302,6 @@ func Run(adamId string, trackpath string, authtoken string, mutoken string, mvmo
 			return "", err
 		}
 	}
-	ctx := context.Background()
 	ctx = context.WithValue(ctx, "pssh", kidBase64)
 	ctx = context.WithValue(ctx, "adamId", adamId)
 	ctx = context.WithValue(ctx, "uriPrefix", uriPrefix)
@@ -337,7 +341,7 @@ func Run(adamId string, trackpath string, authtoken string, mutoken string, mvmo
 		keyAndUrls := "1:" + keystr + ";" + fileurl
 		return keyAndUrls, nil
 	}
-	body := extsong(fileurl, progress)
+	body := extsong(ctx, fileurl, progress)
 	fmt.Print("Downloaded\n")
 
 	if progress != nil {
@@ -368,14 +372,14 @@ type Segment struct {
 	Data  []byte
 }
 
-func downloadSegment(url string, index int, wg *sync.WaitGroup, segmentsChan chan<- Segment, client *http.Client, limiter chan struct{}) {
+func downloadSegment(ctx context.Context, url string, index int, wg *sync.WaitGroup, segmentsChan chan<- Segment, client *http.Client, limiter chan struct{}) {
 	// 函数退出时，从 limiter 中接收一个值，释放一个并发槽位
 	defer func() {
 		<-limiter
 		wg.Done()
 	}()
 
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		fmt.Printf("错误(分段 %d): 创建请求失败: %v\n", index, err)
 		return
@@ -451,7 +455,7 @@ func fileWriter(wg *sync.WaitGroup, segmentsChan <-chan Segment, outputFile io.W
 	}
 }
 
-func ExtMvData(keyAndUrls string, savePath string) error {
+func ExtMvData(ctx context.Context, keyAndUrls string, savePath string) error {
 	segments := strings.Split(keyAndUrls, ";")
 	key := segments[0]
 	//fmt.Println(key)
@@ -490,7 +494,7 @@ func ExtMvData(keyAndUrls string, savePath string) error {
 
 		downloadWg.Add(1)
 		// 将 limiter 传递给下载函数
-		go downloadSegment(url, i, &downloadWg, segmentsChan, client, limiter)
+		go downloadSegment(ctx, url, i, &downloadWg, segmentsChan, client, limiter)
 	}
 
 	// 等待所有下载任务完成
@@ -508,7 +512,7 @@ func ExtMvData(keyAndUrls string, savePath string) error {
 	}
 	fmt.Println("\nDownloaded.")
 
-	cmd1 := exec.Command("mp4decrypt", "--key", key, tempFile.Name(), filepath.Base(savePath))
+	cmd1 := exec.CommandContext(ctx, "mp4decrypt", "--key", key, tempFile.Name(), filepath.Base(savePath))
 	cmd1.Dir = filepath.Dir(savePath) //设置mp4decrypt的工作目录以解决中文路径错误
 	outlog, err := cmd1.CombinedOutput()
 	if err != nil {

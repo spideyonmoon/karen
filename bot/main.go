@@ -799,7 +799,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string, ctx contex
 			counter.Error++
 			return
 		}
-		_, err := runv3.Run(track.ID, trackPath, token, mediaUserToken, false, "", activeProgress)
+		_, err := runv3.Run(ctx, track.ID, trackPath, token, mediaUserToken, false, "", activeProgress)
 		if err != nil {
 			fmt.Println("Failed to dl aac-lc:", err)
 			recordDownloadFailure("%s: failed to download AAC-LC: %v", track.Name, err)
@@ -842,7 +842,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string, ctx contex
 		tags = append(tags, fmt.Sprintf("cover=%s", track.CoverPath))
 	}
 	tagsString := strings.Join(tags, ":")
-	cmd := exec.Command("MP4Box", "-itags", tagsString, trackPath)
+	cmd := exec.CommandContext(ctx, "MP4Box", "-itags", tagsString, trackPath)
 	if err := cmd.Run(); err != nil {
 		fmt.Printf("Embed failed: %v\n", err)
 		recordDownloadFailure("%s: MP4Box tagging failed: %v", track.Name, err)
@@ -952,7 +952,7 @@ func ripStation(albumId string, token string, storefront string, mediaUserToken 
 				fmt.Println("Animated artwork square already exists locally.")
 			} else {
 				fmt.Println("Animation Artwork Square Downloading...")
-				cmd := exec.Command("ffmpeg", "-loglevel", "quiet", "-y", "-i", motionvideoUrlSquare, "-c", "copy", filepath.Join(playlistFolderPath, "square_animated_artwork.mp4"))
+				cmd := exec.CommandContext(ctx, "ffmpeg", "-loglevel", "quiet", "-y", "-i", motionvideoUrlSquare, "-c", "copy", filepath.Join(playlistFolderPath, "square_animated_artwork.mp4"))
 				if err := cmd.Run(); err != nil {
 					fmt.Printf("animated artwork square dl err: %v\n", err)
 				} else {
@@ -962,7 +962,7 @@ func ripStation(albumId string, token string, storefront string, mediaUserToken 
 		}
 
 		if Config.EmbyAnimatedArtwork {
-			cmd3 := exec.Command("ffmpeg", "-i", filepath.Join(playlistFolderPath, "square_animated_artwork.mp4"), "-vf", "scale=440:-1", "-r", "24", "-f", "gif", filepath.Join(playlistFolderPath, "folder.jpg"))
+			cmd3 := exec.CommandContext(ctx, "ffmpeg", "-i", filepath.Join(playlistFolderPath, "square_animated_artwork.mp4"), "-vf", "scale=440:-1", "-r", "24", "-f", "gif", filepath.Join(playlistFolderPath, "folder.jpg"))
 			if err := cmd3.Run(); err != nil {
 				fmt.Printf("animated artwork square to gif err: %v\n", err)
 			}
@@ -1002,8 +1002,8 @@ func ripStation(albumId string, token string, storefront string, mediaUserToken 
 			return err
 		}
 		trackM3U8 := strings.ReplaceAll(assetsUrl, "index.m3u8", "256/prog_index.m3u8")
-		keyAndUrls, _ := runv3.Run(station.ID, trackM3U8, token, mediaUserToken, true, serverUrl, nil)
-		err = runv3.ExtMvData(keyAndUrls, trackPath)
+		keyAndUrls, _ := runv3.Run(ctx, station.ID, trackM3U8, token, mediaUserToken, true, serverUrl, nil)
+		err = runv3.ExtMvData(ctx, keyAndUrls, trackPath)
 		if err != nil {
 			fmt.Println("Failed to download station stream.", err)
 			counter.Error++
@@ -1024,7 +1024,7 @@ func ripStation(albumId string, token string, storefront string, mediaUserToken 
 			tags = append(tags, fmt.Sprintf("cover=%s", station.CoverPath))
 		}
 		tagsString := strings.Join(tags, ":")
-		cmd := exec.Command("MP4Box", "-itags", tagsString, trackPath)
+		cmd := exec.CommandContext(ctx, "MP4Box", "-itags", tagsString, trackPath)
 		if err := cmd.Run(); err != nil {
 			fmt.Printf("Embed failed: %v\n", err)
 		}
@@ -1250,7 +1250,7 @@ func ripAlbum(albumId string, token string, storefront string, mediaUserToken st
 				fmt.Println("Animated artwork square already exists locally.")
 			} else {
 				fmt.Println("Animation Artwork Square Downloading...")
-				cmd := exec.Command("ffmpeg", "-loglevel", "quiet", "-y", "-i", motionvideoUrlSquare, "-c", "copy", filepath.Join(albumFolderPath, "square_animated_artwork.mp4"))
+				cmd := exec.CommandContext(ctx, "ffmpeg", "-loglevel", "quiet", "-y", "-i", motionvideoUrlSquare, "-c", "copy", filepath.Join(albumFolderPath, "square_animated_artwork.mp4"))
 				if err := cmd.Run(); err != nil {
 					fmt.Printf("animated artwork square dl err: %v\n", err)
 				} else {
@@ -1260,7 +1260,7 @@ func ripAlbum(albumId string, token string, storefront string, mediaUserToken st
 		}
 
 		if Config.EmbyAnimatedArtwork {
-			cmd3 := exec.Command("ffmpeg", "-i", filepath.Join(albumFolderPath, "square_animated_artwork.mp4"), "-vf", "scale=440:-1", "-r", "24", "-f", "gif", filepath.Join(albumFolderPath, "folder.jpg"))
+			cmd3 := exec.CommandContext(ctx, "ffmpeg", "-i", filepath.Join(albumFolderPath, "square_animated_artwork.mp4"), "-vf", "scale=440:-1", "-r", "24", "-f", "gif", filepath.Join(albumFolderPath, "folder.jpg"))
 			if err := cmd3.Run(); err != nil {
 				fmt.Printf("animated artwork square to gif err: %v\n", err)
 			}
@@ -1278,7 +1278,7 @@ func ripAlbum(albumId string, token string, storefront string, mediaUserToken st
 				fmt.Println("Animated artwork tall already exists locally.")
 			} else {
 				fmt.Println("Animation Artwork Tall Downloading...")
-				cmd := exec.Command("ffmpeg", "-loglevel", "quiet", "-y", "-i", motionvideoUrlTall, "-c", "copy", filepath.Join(albumFolderPath, "tall_animated_artwork.mp4"))
+				cmd := exec.CommandContext(ctx, "ffmpeg", "-loglevel", "quiet", "-y", "-i", motionvideoUrlTall, "-c", "copy", filepath.Join(albumFolderPath, "tall_animated_artwork.mp4"))
 				if err := cmd.Run(); err != nil {
 					fmt.Printf("animated artwork tall dl err: %v\n", err)
 				} else {
@@ -1508,7 +1508,7 @@ func ripPlaylist(playlistId string, token string, storefront string, mediaUserTo
 				fmt.Println("Animated artwork square already exists locally.")
 			} else {
 				fmt.Println("Animation Artwork Square Downloading...")
-				cmd := exec.Command("ffmpeg", "-loglevel", "quiet", "-y", "-i", motionvideoUrlSquare, "-c", "copy", filepath.Join(playlistFolderPath, "square_animated_artwork.mp4"))
+				cmd := exec.CommandContext(ctx, "ffmpeg", "-loglevel", "quiet", "-y", "-i", motionvideoUrlSquare, "-c", "copy", filepath.Join(playlistFolderPath, "square_animated_artwork.mp4"))
 				if err := cmd.Run(); err != nil {
 					fmt.Printf("animated artwork square dl err: %v\n", err)
 				} else {
@@ -1518,7 +1518,7 @@ func ripPlaylist(playlistId string, token string, storefront string, mediaUserTo
 		}
 
 		if Config.EmbyAnimatedArtwork {
-			cmd3 := exec.Command("ffmpeg", "-i", filepath.Join(playlistFolderPath, "square_animated_artwork.mp4"), "-vf", "scale=440:-1", "-r", "24", "-f", "gif", filepath.Join(playlistFolderPath, "folder.jpg"))
+			cmd3 := exec.CommandContext(ctx, "ffmpeg", "-i", filepath.Join(playlistFolderPath, "square_animated_artwork.mp4"), "-vf", "scale=440:-1", "-r", "24", "-f", "gif", filepath.Join(playlistFolderPath, "folder.jpg"))
 			if err := cmd3.Run(); err != nil {
 				fmt.Printf("animated artwork square to gif err: %v\n", err)
 			}
@@ -1536,7 +1536,7 @@ func ripPlaylist(playlistId string, token string, storefront string, mediaUserTo
 				fmt.Println("Animated artwork tall already exists locally.")
 			} else {
 				fmt.Println("Animation Artwork Tall Downloading...")
-				cmd := exec.Command("ffmpeg", "-loglevel", "quiet", "-y", "-i", motionvideoUrlTall, "-c", "copy", filepath.Join(playlistFolderPath, "tall_animated_artwork.mp4"))
+				cmd := exec.CommandContext(ctx, "ffmpeg", "-loglevel", "quiet", "-y", "-i", motionvideoUrlTall, "-c", "copy", filepath.Join(playlistFolderPath, "tall_animated_artwork.mp4"))
 				if err := cmd.Run(); err != nil {
 					fmt.Printf("animated artwork tall dl err: %v\n", err)
 				} else {
@@ -1889,12 +1889,12 @@ func mvDownloader(adamID string, saveDir string, token string, storefront string
 
 	os.MkdirAll(saveDir, os.ModePerm)
 	videom3u8url, _ := extractVideo(mvm3u8url)
-	videokeyAndUrls, _ := runv3.Run(adamID, videom3u8url, token, mediaUserToken, true, "", nil)
-	_ = runv3.ExtMvData(videokeyAndUrls, vidPath)
+	videokeyAndUrls, _ := runv3.Run(ctx, adamID, videom3u8url, token, mediaUserToken, true, "", nil)
+	_ = runv3.ExtMvData(ctx, videokeyAndUrls, vidPath)
 	defer os.Remove(vidPath)
 	audiom3u8url, _ := extractMvAudio(mvm3u8url)
-	audiokeyAndUrls, _ := runv3.Run(adamID, audiom3u8url, token, mediaUserToken, true, "", nil)
-	_ = runv3.ExtMvData(audiokeyAndUrls, audPath)
+	audiokeyAndUrls, _ := runv3.Run(ctx, adamID, audiom3u8url, token, mediaUserToken, true, "", nil)
+	_ = runv3.ExtMvData(ctx, audiokeyAndUrls, audPath)
 	defer os.Remove(audPath)
 
 	tags := []string{
@@ -1963,7 +1963,7 @@ func mvDownloader(adamID string, saveDir string, token string, storefront string
 	defer os.Remove(covPath)
 
 	tagsString := strings.Join(tags, ":")
-	muxCmd := exec.Command("MP4Box", "-itags", tagsString, "-quiet", "-add", vidPath, "-add", audPath, "-keep-utc", "-new", mvOutPath)
+	muxCmd := exec.CommandContext(ctx, "MP4Box", "-itags", tagsString, "-quiet", "-add", vidPath, "-add", audPath, "-keep-utc", "-new", mvOutPath)
 	fmt.Printf("MV Remuxing...")
 	if err := muxCmd.Run(); err != nil {
 		fmt.Printf("MV mux failed: %v\n", err)

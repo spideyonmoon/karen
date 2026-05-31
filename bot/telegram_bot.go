@@ -1406,7 +1406,8 @@ func (b *TelegramBot) queueDownloadPlaylistWithReply(chatID int64, playlistID st
 }
 
 func (b *TelegramBot) promptTransferMode(chatID int64, albumID string, songID string, playlistID string, replyToID int, single bool, forceAAC bool, forceAtmos bool) {
-	messageID, err := b.sendMessageWithReplyReturn(chatID, "Choose transfer method:", buildTransferKeyboard(), replyToID)
+	mtprotoReady := b.mtproto != nil && b.mtproto.IsReady()
+	messageID, err := b.sendMessageWithReplyReturn(chatID, "Choose transfer method:", buildTransferKeyboard(mtprotoReady), replyToID)
 	if err != nil {
 		return
 	}
@@ -3438,9 +3439,6 @@ func buildInlineKeyboard(count int, hasPrev bool, hasNext bool) InlineKeyboardMa
 	}
 }
 
-func buildAlbumTransferKeyboard() InlineKeyboardMarkup {
-	return buildTransferKeyboard()
-}
 
 // buildCoverCaption creates a caption for the album cover photo using track metadata.
 func buildCoverCaption(paths []string) string {
@@ -3523,18 +3521,21 @@ func formatQualityDisplay(quality string, codec string) string {
 	return quality
 }
 
-func buildTransferKeyboard() InlineKeyboardMarkup {
+func buildTransferKeyboard(mtprotoReady bool) InlineKeyboardMarkup {
+	var row1 []InlineKeyboardButton
+	row1 = append(row1, InlineKeyboardButton{Text: "🎵 Telegram", CallbackData: "transfer:tg_individual"})
+	if mtprotoReady {
+		row1 = append(row1, InlineKeyboardButton{Text: "📦 Telegram (ZIP)", CallbackData: "transfer:tg_zip"})
+	}
+
 	return InlineKeyboardMarkup{
 		InlineKeyboard: [][]InlineKeyboardButton{
+			row1,
 			{
-				{Text: "\U0001F3B5 Telegram", CallbackData: "transfer:tg_individual"},
-				{Text: "\U0001F4E6 Telegram (ZIP)", CallbackData: "transfer:tg_zip"},
+				{Text: "📁 Gofile (ZIP)", CallbackData: "transfer:gofile_zip"},
 			},
 			{
-				{Text: "\U0001F4C1 Gofile (ZIP)", CallbackData: "transfer:gofile_zip"},
-			},
-			{
-				{Text: "\u274C Cancel", CallbackData: "transfer:cancel"},
+				{Text: "❌ Cancel", CallbackData: "transfer:cancel"},
 			},
 		},
 	}
