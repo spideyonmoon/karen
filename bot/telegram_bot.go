@@ -984,13 +984,15 @@ func (b *TelegramBot) handleChosenInlineResult(result *ChosenInlineResult) {
 }
 
 func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args []string, replyToID int) {
-	switch cmd {
-	case "start", "help":
-		_ = b.sendMessage(chatID, "Send /dl <apple-music-link> to download a song or album.\nSend /status to view the download queue.", nil)
-	case strings.HasPrefix(cmd, "cancel_"):
+	if strings.HasPrefix(cmd, "cancel_") {
 		taskID := strings.TrimPrefix(cmd, "cancel_")
 		b.cancelTask(chatID, taskID, replyToID)
 		return
+	}
+
+	switch cmd {
+	case "start", "help":
+		_ = b.sendMessage(chatID, "Send /dl <apple-music-link> to download a song or album.\nSend /status to view the download queue.", nil)
 	case "status", "queue":
 		b.queueMu.Lock()
 		queueLen := len(b.downloadQueue)
@@ -1780,7 +1782,7 @@ func (b *TelegramBot) deliverTelegramZip(chatID int64, paths []string, replyToID
 	defer os.Remove(zipPath)
 
 	// Check ZIP size — Telegram limit is 2GB, use 1.90GB safety margin
-	const maxTelegramZipBytes = int64(1.90 * 1024 * 1024 * 1024) // ~1.90 GB
+	const maxTelegramZipBytes = int64(1900 * 1024 * 1024) // ~1.90 GB
 	if info, err := os.Stat(zipPath); err == nil && info.Size() > maxTelegramZipBytes {
 		sizeMB := float64(info.Size()) / (1024 * 1024)
 		fmt.Printf("ZIP too large for Telegram (%.0f MB), redirecting to Gofile\n", sizeMB)

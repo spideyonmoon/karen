@@ -1801,7 +1801,7 @@ func main() {
 					fmt.Println("Invalid song URL format.")
 					continue
 				}
-				err := ripSong(songId, token, storefront, Config.MediaUserToken, false, ctx)
+				err := ripSong(songId, token, storefront, Config.MediaUserToken, false, nil)
 				if err != nil {
 					fmt.Println("Failed to rip song:", err)
 				}
@@ -1816,14 +1816,14 @@ func main() {
 			if strings.Contains(urlRaw, "/album/") {
 				fmt.Println("Album")
 				storefront, albumId = checkUrl(urlRaw)
-				err := ripAlbum(albumId, token, storefront, Config.MediaUserToken, urlArg_i, false, ctx)
+				err := ripAlbum(albumId, token, storefront, Config.MediaUserToken, urlArg_i, false, nil)
 				if err != nil {
 					fmt.Println("Failed to rip album:", err)
 				}
 			} else if strings.Contains(urlRaw, "/playlist/") {
 				fmt.Println("Playlist")
 				storefront, albumId = checkUrlPlaylist(urlRaw)
-				err := ripPlaylist(albumId, token, storefront, Config.MediaUserToken, false, ctx)
+				err := ripPlaylist(albumId, token, storefront, Config.MediaUserToken, false, nil)
 				if err != nil {
 					fmt.Println("Failed to rip playlist:", err)
 				}
@@ -1834,7 +1834,7 @@ func main() {
 					fmt.Println(": meida-user-token is not set, skip station dl")
 					continue
 				}
-				err := ripStation(albumId, token, storefront, Config.MediaUserToken, ctx)
+				err := ripStation(albumId, token, storefront, Config.MediaUserToken, nil)
 				if err != nil {
 					fmt.Println("Failed to rip station:", err)
 				}
