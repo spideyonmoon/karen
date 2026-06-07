@@ -2,6 +2,7 @@ version: '3.8'
 
 services:
   wrapper:
+    build: ./wrapper
     image: karen-wrapper:local
     privileged: true
     container_name: karen-wrapper
