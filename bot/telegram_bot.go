@@ -2615,8 +2615,6 @@ func (s *DownloadStatus) flush(force bool) {
 	done := s.latestDone
 	total := s.latestTotal
 	s.dirty = false
-	lastPhase := s.lastPhase
-	lastPercent := s.lastPercent
 	lastText := s.lastText
 	lastUpdate := s.lastUpdate
 	s.mu.Unlock()
