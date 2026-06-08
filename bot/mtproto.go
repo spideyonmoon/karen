@@ -323,6 +323,119 @@ func (m *MTProtoClient) UploadAndSendAudio(
 	return nil
 }
 
+// AudioGroupItem holds the information for a single audio file in a media group.
+type AudioGroupItem struct {
+	FilePath     string
+	Title        string
+	Performer    string
+	DurationSecs int
+	Caption      string
+	ThumbPath    string
+}
+
+// UploadAndSendAudioGroup uploads and sends a group of audio files as a media group/album via MTProto.
+func (m *MTProtoClient) UploadAndSendAudioGroup(
+	chatID int64,
+	items []AudioGroupItem,
+	replyToID int,
+	status *DownloadStatus,
+	ctx context.Context,
+) error {
+	if !m.IsReady() {
+		return fmt.Errorf("MTProto client not ready")
+	}
+
+	u := uploader.NewUploader(m.api).WithPartSize(512 * 1024)
+
+	var multiMedia []tg.InputSingleMediaClass
+
+	for i, item := range items {
+		if ctx != nil && ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		if status != nil {
+			status.Update(fmt.Sprintf("Uploading %d/%d", i+1, len(items)), 0, 0)
+		}
+
+		// Upload audio file
+		audioFile, err := u.WithProgress(&UploadProgress{status: status, phase: fmt.Sprintf("Uploading %d/%d", i+1, len(items))}).FromPath(ctx, item.FilePath)
+		if err != nil {
+			return fmt.Errorf("failed to upload audio %d (%s) via MTProto: %w", i+1, filepath.Base(item.FilePath), err)
+		}
+
+		// Upload thumbnail if available
+		var thumb tg.InputFileClass
+		if item.ThumbPath != "" {
+			thumbUploader := uploader.NewUploader(m.api).WithPartSize(512 * 1024)
+			thumbFile, err := thumbUploader.FromPath(ctx, item.ThumbPath)
+			if err != nil {
+				fmt.Printf("Warning: failed to upload thumbnail: %v\n", err)
+			} else {
+				thumb = thumbFile
+			}
+		}
+
+		// Build attributes
+		attrs := []tg.DocumentAttributeClass{
+			&tg.DocumentAttributeAudio{
+				Title:     item.Title,
+				Performer: item.Performer,
+				Duration:  item.DurationSecs,
+			},
+			&tg.DocumentAttributeFilename{
+				FileName: filepath.Base(item.FilePath),
+			},
+		}
+
+		// Determine MIME type
+		mimeType := mimeForAudioExt(filepath.Ext(item.FilePath))
+
+		// Build the media
+		media := &tg.InputMediaUploadedDocument{
+			File:       audioFile,
+			MimeType:   mimeType,
+			Attributes: attrs,
+		}
+		if thumb != nil {
+			media.Thumb = thumb
+			media.Flags.Set(2) // bit 2 = thumb flag
+		}
+
+		multiMedia = append(multiMedia, &tg.InputSingleMedia{
+			Media:    media,
+			RandomID: cryptoRandID(),
+			Message:  item.Caption,
+		})
+	}
+
+	// Resolve peer
+	peer, err := m.resolveInputPeer(chatID)
+	if err != nil {
+		return fmt.Errorf("failed to resolve peer for chat %d: %w", chatID, err)
+	}
+
+	// Build request
+	req := &tg.MessagesSendMultiMediaRequest{
+		Peer:       peer,
+		MultiMedia: multiMedia,
+	}
+	if replyToID > 0 {
+		req.ReplyTo = &tg.InputReplyToMessage{
+			ReplyToMsgID: replyToID,
+		}
+		req.SetFlags()
+	}
+
+	// Send request (retries on FLOOD_WAIT are handled by middleware)
+	_, err = m.api.MessagesSendMultiMedia(ctx, req)
+	if err != nil {
+		return fmt.Errorf("failed to send multi-media group via MTProto: %w", err)
+	}
+
+	return nil
+}
+
 // UploadAndSendDocument uploads a file as a document (e.g., ZIP) via MTProto.
 func (m *MTProtoClient) UploadAndSendDocument(
 	chatID int64,

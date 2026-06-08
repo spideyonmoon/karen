@@ -984,8 +984,8 @@ func (b *TelegramBot) handleChosenInlineResult(result *ChosenInlineResult) {
 }
 
 func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args []string, replyToID int) {
-	if strings.HasPrefix(cmd, "cancel_") {
-		taskID := strings.TrimPrefix(cmd, "cancel_")
+	if strings.HasPrefix(cmd, "stop_") {
+		taskID := strings.TrimPrefix(cmd, "stop_")
 		b.cancelTask(chatID, taskID, replyToID)
 		return
 	}
@@ -1022,7 +1022,7 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args
 			msg += fmt.Sprintf("📤 Task: %s (by @%s)\n", activeReq.taskID, user)
 			msg += fmt.Sprintf("├ Mode: %s\n", activeReq.transferMode)
 			msg += fmt.Sprintf("├ Elapsed: %s\n", elapsed)
-			msg += fmt.Sprintf("╰ Cancel: /cancel_%s\n", activeReq.taskID)
+			msg += fmt.Sprintf("╰ Stop: /stop_%s\n", activeReq.taskID)
 		} else {
 			msg += "No active tasks.\n"
 		}
@@ -1034,7 +1034,7 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args
 				if user == "" {
 					user = fmt.Sprintf("ID:%d", req.userID)
 				}
-				msg += fmt.Sprintf("%d. %s (by @%s) — /cancel_%s\n", i+1, req.taskID, user, req.taskID)
+				msg += fmt.Sprintf("%d. %s (by @%s) — /stop_%s\n", i+1, req.taskID, user, req.taskID)
 			}
 		} else {
 			msg += "\n📋 Queue: empty"
@@ -1498,7 +1498,7 @@ func (b *TelegramBot) enqueueDownloadWithAfter(chatID int64, userID int64, reply
 		return false
 	}
 	if inProgress || queueLen > 0 {
-		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Queued (ID: %s). Position: %d\nCancel: /cancel_%s", taskID, position, taskID), nil, replyToID)
+		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Queued (ID: %s). Position: %d\nStop: /stop_%s", taskID, position, taskID), nil, replyToID)
 	}
 	
 	if userID != 0 {
@@ -1654,7 +1654,7 @@ func (b *TelegramBot) runDownload(req *downloadRequest) {
 	}
 }
 
-// deliverTelegramIndividual uploads each track as an audio message via MTProto with cover art.
+// deliverTelegramIndividual uploads tracks as audio messages in groups of up to 10 via MTProto with cover art.
 func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, replyToID int, format string, status *DownloadStatus, ctx context.Context) {
 	if ctx != nil && ctx.Err() != nil {
 		status.UpdateSync("Cancelled", 0, 0)
@@ -1674,66 +1674,99 @@ func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, re
 			_ = b.sendPhotoWithReply(chatID, coverPath, coverCaption, replyToID)
 		}
 	}
-	for _, path := range paths {
+
+	// Chunk paths into groups of up to 10
+	const maxGroupSize = 10
+	for i := 0; i < len(paths); i += maxGroupSize {
 		if ctx != nil && ctx.Err() != nil {
 			status.UpdateSync("Cancelled", 0, 0)
 			return
 		}
-		meta, hasMeta := getDownloadedMeta(path)
-		title := filepath.Base(path)
-		performer := ""
-		durationSecs := 0
-		if hasMeta {
-			title = meta.Title
-			performer = meta.Performer
-			if meta.DurationMillis > 0 {
-				durationSecs = int(meta.DurationMillis / 1000)
+		end := i + maxGroupSize
+		if end > len(paths) {
+			end = len(paths)
+		}
+		chunk := paths[i:end]
+
+		// Prepare AudioGroupItem slice
+		var groupItems []AudioGroupItem
+		for _, path := range chunk {
+			meta, hasMeta := getDownloadedMeta(path)
+			title := filepath.Base(path)
+			performer := ""
+			durationSecs := 0
+			if hasMeta {
+				title = meta.Title
+				performer = meta.Performer
+				if meta.DurationMillis > 0 {
+					durationSecs = int(meta.DurationMillis / 1000)
+				}
+			}
+
+			// Prepare thumbnail
+			thumbPath := ""
+			coverPath := findCoverFile(filepath.Dir(path))
+			if coverPath != "" {
+				if tp, err := makeTelegramThumb(coverPath); err == nil {
+					thumbPath = tp
+				}
+			}
+
+			info, err := os.Stat(path)
+			var sizeBytes int64
+			if err == nil {
+				sizeBytes = info.Size()
+			}
+			bitrateKbps := calcBitrateKbps(sizeBytes, meta.DurationMillis)
+			caption := formatTelegramCaption(sizeBytes, bitrateKbps, format)
+
+			groupItems = append(groupItems, AudioGroupItem{
+				FilePath:     path,
+				Title:        title,
+				Performer:    performer,
+				DurationSecs: durationSecs,
+				Caption:      caption,
+				ThumbPath:    thumbPath,
+			})
+		}
+
+		// Send as group
+		err := b.mtproto.UploadAndSendAudioGroup(chatID, groupItems, 0, status, ctx)
+
+		// Clean up thumbnails
+		for _, item := range groupItems {
+			if item.ThumbPath != "" {
+				_ = os.Remove(item.ThumbPath)
 			}
 		}
 
-		// Prepare thumbnail
-		thumbPath := ""
-		coverPath := findCoverFile(filepath.Dir(path))
-		if coverPath != "" {
-			if tp, err := makeTelegramThumb(coverPath); err != nil {
-				fmt.Printf("makeTelegramThumb failed: %v\n", err)
-			} else {
-				thumbPath = tp
-				defer os.Remove(tp)
-			}
-		}
-
-		info, err := os.Stat(path)
-		if err != nil {
-			status.Update(fmt.Sprintf("File not found: %s", filepath.Base(path)), 0, 0)
-			continue
-		}
-		sizeBytes := info.Size()
-		bitrateKbps := calcBitrateKbps(sizeBytes, meta.DurationMillis)
-		caption := formatTelegramCaption(sizeBytes, bitrateKbps, format)
-
-		err = b.mtproto.UploadAndSendAudio(chatID, path, title, performer, durationSecs, caption, thumbPath, 0, status, ctx)
 		if err != nil {
 			if ctx != nil && ctx.Err() != nil {
 				status.UpdateSync("Cancelled", 0, 0)
 				return
 			}
-			fmt.Printf("MTProto audio upload failed for %s (chatID=%d): %v\n", filepath.Base(path), chatID, err)
-			status.Update(fmt.Sprintf("Upload failed: %v", err), 0, 0)
-			// Fallback to Gofile for this file
-			status.UpdateSync("Falling back to Gofile...", 0, 0)
-			downloadLink, gofileErr := apputils.UploadToGofile(ctx, path, Config.GofileToken)
-			if gofileErr == nil {
-				msg := fmt.Sprintf("File: %s\nDownload Link: %s", filepath.Base(path), downloadLink)
-				_ = b.sendMessage(chatID, msg, nil)
-				sentAny = true
+			fmt.Printf("MTProto group upload failed (chatID=%d): %v. Falling back to Gofile...\n", chatID, err)
+			status.Update(fmt.Sprintf("Group upload failed, falling back to Gofile..."), 0, 0)
+
+			// Fallback: upload each file in the group individually to Gofile
+			for _, item := range groupItems {
+				if ctx != nil && ctx.Err() != nil {
+					status.UpdateSync("Cancelled", 0, 0)
+					return
+				}
+				downloadLink, gofileErr := apputils.UploadToGofile(ctx, item.FilePath, Config.GofileToken)
+				if gofileErr == nil {
+					msg := fmt.Sprintf("File: %s\nDownload Link: %s", filepath.Base(item.FilePath), downloadLink)
+					_ = b.sendMessage(chatID, msg, nil)
+					sentAny = true
+				}
 			}
 			continue
 		}
 
-		// Cache the track for future re-sends (using the Bot API sendAudioFile path if needed)
 		sentAny = true
 	}
+
 	if sentAny {
 		status.Stop()
 		_ = b.deleteMessage(chatID, status.messageID)
@@ -2601,7 +2634,7 @@ func (s *DownloadStatus) formatProgressText(phase string, done, total int64, per
 		elapsedStr = time.Since(s.startedAt).Truncate(time.Second).String()
 	}
 
-	header := fmt.Sprintf("📤 Task: %s\n├ Mode: %s\n├ Elapsed: %s\n╰ Cancel: /cancel_%s\n", s.taskID, s.mode, elapsedStr, s.taskID)
+	header := fmt.Sprintf("📤 Task: %s\n├ Mode: %s\n├ Elapsed: %s\n╰ Stop: /stop_%s\n", s.taskID, s.mode, elapsedStr, s.taskID)
 
 	if total > 0 {
 		if percent < 0 {
@@ -3613,7 +3646,7 @@ func buildSettingsKeyboard(current string) InlineKeyboardMarkup {
 // cancelTask cancels a task by its ID.
 func (b *TelegramBot) cancelTask(chatID int64, taskID string, replyToID int) {
 	if taskID == "" {
-		_ = b.sendMessageWithReply(chatID, "Usage: /cancel_<task_id>", nil, replyToID)
+		_ = b.sendMessageWithReply(chatID, "Usage: /stop_<task_id>", nil, replyToID)
 		return
 	}
 	b.queueMu.Lock()
@@ -3623,7 +3656,7 @@ func (b *TelegramBot) cancelTask(chatID int64, taskID string, replyToID int) {
 			b.activeReq.cancel()
 		}
 		b.queueMu.Unlock()
-		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("⛔ Task %s cancelled.", taskID), nil, replyToID)
+		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("⛔ Task %s stopped.", taskID), nil, replyToID)
 		return
 	}
 	// Check queued tasks — drain and re-enqueue without the target
@@ -3646,7 +3679,7 @@ func (b *TelegramBot) cancelTask(chatID int64, taskID string, replyToID int) {
 	}
 	b.queueMu.Unlock()
 	if found {
-		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("⛔ Queued task %s cancelled.", taskID), nil, replyToID)
+		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("⛔ Queued task %s stopped.", taskID), nil, replyToID)
 	} else {
 		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Task %s not found.", taskID), nil, replyToID)
 	}
