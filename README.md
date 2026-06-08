@@ -48,7 +48,6 @@ cd ~/karen
 ### 2. Configure the Bot
 Configure your bot's settings by editing the config file:
 ```bash
-mkdir -p bot
 nano bot/config.yaml
 ```
 
