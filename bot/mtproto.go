@@ -345,6 +345,12 @@ func (m *MTProtoClient) UploadAndSendAudioGroup(
 		return fmt.Errorf("MTProto client not ready")
 	}
 
+	// Resolve peer
+	peer, err := m.resolveInputPeer(chatID)
+	if err != nil {
+		return fmt.Errorf("failed to resolve peer for chat %d: %w", chatID, err)
+	}
+
 	u := uploader.NewUploader(m.api).WithPartSize(512 * 1024)
 
 	var multiMedia []tg.InputSingleMedia
@@ -405,7 +411,7 @@ func (m *MTProtoClient) UploadAndSendAudioGroup(
 		// Register the media with Telegram using MessagesUploadMedia to get a persistent document reference.
 		// Using raw InputMediaUploadedDocument inside MessagesSendMultiMedia is not supported by Telegram.
 		uploadedMedia, err := m.api.MessagesUploadMedia(ctx, &tg.MessagesUploadMediaRequest{
-			Peer:  &tg.InputPeerEmpty{},
+			Peer:  peer,
 			Media: media,
 		})
 		if err != nil {
@@ -430,12 +436,6 @@ func (m *MTProtoClient) UploadAndSendAudioGroup(
 			RandomID: cryptoRandID(),
 			Message:  item.Caption,
 		})
-	}
-
-	// Resolve peer
-	peer, err := m.resolveInputPeer(chatID)
-	if err != nil {
-		return fmt.Errorf("failed to resolve peer for chat %d: %w", chatID, err)
 	}
 
 	// Build request
