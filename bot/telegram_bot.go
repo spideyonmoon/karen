@@ -1250,23 +1250,24 @@ func (b *TelegramBot) handleTransferMode(chatID int64, messageID int, mode strin
 	case transferModeCancel:
 		_ = b.editMessageText(chatID, messageID, "Download cancelled.", nil)
 		return
-	case transferModeTelegramIndividual:
-		_ = b.editMessageText(chatID, messageID, "\U0001F3B5 Transfer mode: Telegram (individual tracks).", nil)
-	case transferModeTelegramZip:
-		_ = b.editMessageText(chatID, messageID, "\U0001F4E6 Transfer mode: Telegram (ZIP).", nil)
-	case transferModeGofileZip:
-		_ = b.editMessageText(chatID, messageID, "\U0001F4C1 Transfer mode: Gofile (ZIP).", nil)
-	// Legacy support
 	case transferModeOneByOne:
 		mode = transferModeTelegramIndividual
-		_ = b.editMessageText(chatID, messageID, "\U0001F3B5 Transfer mode: Telegram (individual tracks).", nil)
 	case transferModeZip:
 		mode = transferModeGofileZip
-		_ = b.editMessageText(chatID, messageID, "\U0001F4C1 Transfer mode: Gofile (ZIP).", nil)
-	default:
-		_ = b.editMessageText(chatID, messageID, "Unknown transfer mode.", nil)
-		return
 	}
+
+	b.queueMu.Lock()
+	inProgress := b.inProgress
+	queueLen := len(b.downloadQueue)
+	b.queueMu.Unlock()
+
+	var statusText string
+	if inProgress || queueLen > 0 {
+		statusText = fmt.Sprintf("Queued. Position: %d", queueLen+1)
+	} else {
+		statusText = "Starting download..."
+	}
+	_ = b.editMessageText(chatID, messageID, statusText, nil)
 
 	if pending.Single && pending.SongID != "" {
 		b.enqueueDownload(chatID, userID, replyToID, true, b.getChatFormat(chatID), mode, "", func(ctx context.Context) error {
@@ -1731,7 +1732,7 @@ func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, re
 		}
 
 		// Send as group
-		err := b.mtproto.UploadAndSendAudioGroup(chatID, groupItems, 0, status, ctx)
+		err := b.mtproto.UploadAndSendAudioGroup(chatID, groupItems, replyToID, status, ctx)
 
 		if err != nil {
 			if ctx != nil && ctx.Err() != nil {
@@ -1768,7 +1769,7 @@ func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, re
 					item.DurationSecs,
 					item.Caption,
 					item.ThumbPath,
-					0,
+					replyToID,
 					status,
 					ctx,
 				)
@@ -1779,7 +1780,7 @@ func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, re
 					downloadLink, gofileErr := apputils.UploadToGofile(ctx, item.FilePath, Config.GofileToken)
 					if gofileErr == nil {
 						msg := fmt.Sprintf("File: %s\nDownload Link: %s", filepath.Base(item.FilePath), downloadLink)
-						_ = b.sendMessage(chatID, msg, nil)
+						_ = b.sendMessageWithReply(chatID, msg, nil, replyToID)
 						sentAny = true
 					}
 				} else {
@@ -1888,7 +1889,7 @@ func (b *TelegramBot) deliverTelegramZip(chatID int64, paths []string, replyToID
 	}
 
 	if b.mtproto != nil && b.mtproto.IsReady() {
-		err = b.mtproto.UploadAndSendDocument(chatID, zipPath, displayName, "", 0, status, ctx)
+		err = b.mtproto.UploadAndSendDocument(chatID, zipPath, displayName, "", replyToID, status, ctx)
 		if err != nil {
 			if ctx != nil && ctx.Err() != nil {
 				status.UpdateSync("Cancelled", 0, 0)
@@ -1937,7 +1938,7 @@ func (b *TelegramBot) deliverGofileZip(chatID int64, paths []string, replyToID i
 				continue
 			}
 			msg := fmt.Sprintf("File: %s\nDownload Link: %s", filepath.Base(path), downloadLink)
-			_ = b.sendMessage(chatID, msg, nil)
+			_ = b.sendMessageWithReply(chatID, msg, nil, replyToID)
 			sentAny = true
 		}
 		if sentAny {
@@ -1976,7 +1977,7 @@ func (b *TelegramBot) deliverGofileZipFromPath(chatID int64, zipPath string, dis
 	}
 
 	msg := fmt.Sprintf("File: %s\nDownload Link: %s", displayName, downloadLink)
-	_ = b.sendMessage(chatID, msg, nil)
+	_ = b.sendMessageWithReply(chatID, msg, nil, replyToID)
 
 	status.Stop()
 	_ = b.deleteMessage(chatID, status.messageID)
@@ -2520,6 +2521,8 @@ type DownloadStatus struct {
 	updateCh    chan struct{}
 	stopCh      chan struct{}
 	stopOnce    sync.Once
+	userID      int64
+	username    string
 }
 
 func newDownloadStatus(bot *TelegramBot, chatID int64, replyToID int, existingMsgID int, req *downloadRequest) (*DownloadStatus, error) {
@@ -2530,6 +2533,8 @@ func newDownloadStatus(bot *TelegramBot, chatID int64, replyToID int, existingMs
 		taskID:    req.taskID,
 		mode:      req.transferMode,
 		startedAt: req.startedAt,
+		userID:    req.userID,
+		username:  req.username,
 		updateCh:  make(chan struct{}, 1),
 		stopCh:    make(chan struct{}),
 	}
@@ -2658,36 +2663,58 @@ func (s *DownloadStatus) flush(force bool) {
 	s.mu.Unlock()
 }
 
+func formatUploadMode(mode string) string {
+	switch mode {
+	case transferModeTelegramIndividual:
+		return "Telegram (individual)"
+	case transferModeTelegramZip:
+		return "Telegram (ZIP)"
+	case transferModeGofileZip:
+		return "Gofile"
+	default:
+		return mode
+	}
+}
+
 func (s *DownloadStatus) formatProgressText(phase string, done, total int64, percent int) string {
 	elapsedStr := "-"
 	if !s.startedAt.IsZero() {
 		elapsedStr = time.Since(s.startedAt).Truncate(time.Second).String()
 	}
 
-	header := fmt.Sprintf("📤 Task: %s\n├ Mode: %s\n├ Elapsed: %s\n╰ Stop: /stop_%s\n", s.taskID, s.mode, elapsedStr, s.taskID)
+	userIdent := ""
+	if s.username != "" {
+		userIdent = fmt.Sprintf(" (by @%s)", s.username)
+	} else if s.userID != 0 {
+		userIdent = fmt.Sprintf(" (by ID:%d)", s.userID)
+	}
+
+	header := fmt.Sprintf("📥 Task ID: %s%s\n╭ Status: %s", s.taskID, userIdent, phase)
+	modeName := formatUploadMode(s.mode)
 
 	if total > 0 {
 		if percent < 0 {
 			percent = 0
 		}
-		barLength := 15
+		barLength := 10
 		filledCount := (percent * barLength) / 100
 		var bar string
 		for i := 0; i < barLength; i++ {
 			if i < filledCount {
-				bar += "■"
-			} else if i == filledCount {
-				bar += "▥"
+				bar += "🟢"
 			} else {
-				bar += "□"
+				bar += "⭕"
 			}
 		}
-		return fmt.Sprintf("%s\n╭ Status: %s\n├ Progress: [%s] %d%%\n╰ Processed: %s of %s", header, phase, bar, percent, formatBytes(done), formatBytes(total))
+		return fmt.Sprintf("%s\n├ %s\n├ Progress: %d%% (%s / %s)\n├ Elapsed: %s\n├ Mode: %s\n╰ Stop: /stop_%s", 
+			header, bar, percent, formatBytes(done), formatBytes(total), elapsedStr, modeName, s.taskID)
 	}
 	if done > 0 {
-		return fmt.Sprintf("%s\n╭ Status: %s\n╰ Processed: %s", header, phase, formatBytes(done))
+		return fmt.Sprintf("%s\n├ Processed: %s\n├ Elapsed: %s\n├ Mode: %s\n╰ Stop: /stop_%s", 
+			header, formatBytes(done), elapsedStr, modeName, s.taskID)
 	}
-	return fmt.Sprintf("%s\n╭ Status: %s", header, phase)
+	return fmt.Sprintf("%s\n├ Elapsed: %s\n├ Mode: %s\n╰ Stop: /stop_%s", 
+		header, elapsedStr, modeName, s.taskID)
 }
 
 func formatBytes(value int64) string {
