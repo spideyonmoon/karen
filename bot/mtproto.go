@@ -347,7 +347,7 @@ func (m *MTProtoClient) UploadAndSendAudioGroup(
 
 	u := uploader.NewUploader(m.api).WithPartSize(512 * 1024)
 
-	var multiMedia []tg.InputSingleMediaClass
+	var multiMedia []tg.InputSingleMedia
 
 	for i, item := range items {
 		if ctx != nil && ctx.Err() != nil {
@@ -402,7 +402,7 @@ func (m *MTProtoClient) UploadAndSendAudioGroup(
 			media.Flags.Set(2) // bit 2 = thumb flag
 		}
 
-		multiMedia = append(multiMedia, &tg.InputSingleMedia{
+		multiMedia = append(multiMedia, tg.InputSingleMedia{
 			Media:    media,
 			RandomID: cryptoRandID(),
 			Message:  item.Caption,
