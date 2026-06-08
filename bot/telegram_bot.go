@@ -2588,7 +2588,7 @@ func (s *DownloadStatus) setLatestLocked(phase string, done, total int64) {
 }
 
 func (s *DownloadStatus) loop() {
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
@@ -2634,13 +2634,14 @@ func (s *DownloadStatus) flush(force bool) {
 
 	text := s.formatProgressText(phase, done, total, percent)
 	now := time.Now()
-	phaseChanged := phase != lastPhase
-	percentChanged := percent != lastPercent && percent >= 0
 	if !force {
 		if text == lastText {
 			return
 		}
-		if !phaseChanged && !percentChanged && now.Sub(lastUpdate) < 5*time.Second {
+		if now.Sub(lastUpdate) < 3*time.Second {
+			s.mu.Lock()
+			s.dirty = true
+			s.mu.Unlock()
 			return
 		}
 	}
