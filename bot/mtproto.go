@@ -402,8 +402,31 @@ func (m *MTProtoClient) UploadAndSendAudioGroup(
 			media.Flags.Set(2) // bit 2 = thumb flag
 		}
 
+		// Register the media with Telegram using MessagesUploadMedia to get a persistent document reference.
+		// Using raw InputMediaUploadedDocument inside MessagesSendMultiMedia is not supported by Telegram.
+		uploadedMedia, err := m.api.MessagesUploadMedia(ctx, &tg.MessagesUploadMediaRequest{
+			Peer:  &tg.InputPeerEmpty{},
+			Media: media,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to register audio %d (%s) via MessagesUploadMedia: %w", i+1, filepath.Base(item.FilePath), err)
+		}
+
+		var inputMedia tg.InputMediaClass
+		if mmDoc, ok := uploadedMedia.(*tg.MessageMediaDocument); ok {
+			if doc, ok := mmDoc.Document.(*tg.Document); ok {
+				inputMedia = &tg.InputMediaDocument{
+					ID: doc.AsInput(),
+				}
+			}
+		}
+
+		if inputMedia == nil {
+			return fmt.Errorf("failed to extract document for item %d (%s) from UploadMedia response", i+1, filepath.Base(item.FilePath))
+		}
+
 		multiMedia = append(multiMedia, tg.InputSingleMedia{
-			Media:    media,
+			Media:    inputMedia,
 			RandomID: cryptoRandID(),
 			Message:  item.Caption,
 		})
