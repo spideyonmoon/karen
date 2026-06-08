@@ -1733,38 +1733,69 @@ func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, re
 		// Send as group
 		err := b.mtproto.UploadAndSendAudioGroup(chatID, groupItems, 0, status, ctx)
 
+		if err != nil {
+			if ctx != nil && ctx.Err() != nil {
+				// Clean up thumbnails
+				for _, item := range groupItems {
+					if item.ThumbPath != "" {
+						_ = os.Remove(item.ThumbPath)
+					}
+				}
+				status.UpdateSync("Cancelled", 0, 0)
+				return
+			}
+			fmt.Printf("MTProto group upload failed (chatID=%d): %v. Falling back to individual upload...\n", chatID, err)
+			status.Update(fmt.Sprintf("⚠️ Group upload failed: %v. Sending individually via MTProto...", err), 0, 0)
+
+			// Fallback: send each file in the group individually via MTProto first
+			for _, item := range groupItems {
+				if ctx != nil && ctx.Err() != nil {
+					// Clean up thumbnails
+					for _, it := range groupItems {
+						if it.ThumbPath != "" {
+							_ = os.Remove(it.ThumbPath)
+						}
+					}
+					status.UpdateSync("Cancelled", 0, 0)
+					return
+				}
+
+				errIndiv := b.mtproto.UploadAndSendAudio(
+					chatID,
+					item.FilePath,
+					item.Title,
+					item.Performer,
+					item.DurationSecs,
+					item.Caption,
+					item.ThumbPath,
+					0,
+					status,
+					ctx,
+				)
+				if errIndiv != nil {
+					fmt.Printf("MTProto individual upload failed for %s: %v. Falling back to Gofile...\n", filepath.Base(item.FilePath), errIndiv)
+					status.Update(fmt.Sprintf("Upload failed for %s: %v. Uploading to Gofile...", item.Title, errIndiv), 0, 0)
+					
+					downloadLink, gofileErr := apputils.UploadToGofile(ctx, item.FilePath, Config.GofileToken)
+					if gofileErr == nil {
+						msg := fmt.Sprintf("File: %s\nDownload Link: %s", filepath.Base(item.FilePath), downloadLink)
+						_ = b.sendMessage(chatID, msg, nil)
+						sentAny = true
+					}
+				} else {
+					sentAny = true
+				}
+			}
+		} else {
+			sentAny = true
+		}
+
 		// Clean up thumbnails
 		for _, item := range groupItems {
 			if item.ThumbPath != "" {
 				_ = os.Remove(item.ThumbPath)
 			}
 		}
-
-		if err != nil {
-			if ctx != nil && ctx.Err() != nil {
-				status.UpdateSync("Cancelled", 0, 0)
-				return
-			}
-			fmt.Printf("MTProto group upload failed (chatID=%d): %v. Falling back to Gofile...\n", chatID, err)
-			status.Update(fmt.Sprintf("Group upload failed, falling back to Gofile..."), 0, 0)
-
-			// Fallback: upload each file in the group individually to Gofile
-			for _, item := range groupItems {
-				if ctx != nil && ctx.Err() != nil {
-					status.UpdateSync("Cancelled", 0, 0)
-					return
-				}
-				downloadLink, gofileErr := apputils.UploadToGofile(ctx, item.FilePath, Config.GofileToken)
-				if gofileErr == nil {
-					msg := fmt.Sprintf("File: %s\nDownload Link: %s", filepath.Base(item.FilePath), downloadLink)
-					_ = b.sendMessage(chatID, msg, nil)
-					sentAny = true
-				}
-			}
-			continue
-		}
-
-		sentAny = true
 	}
 
 	if sentAny {
