@@ -8,7 +8,9 @@ COPY go.mod go.sum ./
 RUN apk add --no-cache git
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /bin/apple-music-dl .
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg/mod \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /bin/apple-music-dl .
 
 FROM gpac/ubuntu
 ENV DEBIAN_FRONTEND=noninteractive
