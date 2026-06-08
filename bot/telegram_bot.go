@@ -2473,40 +2473,42 @@ func (b *TelegramBot) sendDocumentByFileID(chatID int64, entry CachedDocument, r
 }
 
 type DownloadStatus struct {
-	bot         *TelegramBot
-	chatID      int64
-	messageID   int
-	taskID      string
-	mode        string
-	startedAt   time.Time
-	lastPhase   string
-	lastPercent int
-	lastText    string
-	lastUpdate  time.Time
-	mu          sync.Mutex
-	latestPhase string
-	latestDone  int64
-	latestTotal int64
-	dirty       bool
-	updateCh    chan struct{}
-	stopCh      chan struct{}
-	stopOnce    sync.Once
-	userID      int64
-	username    string
+	bot            *TelegramBot
+	chatID         int64
+	messageID      int
+	taskID         string
+	mode           string
+	startedAt      time.Time
+	phaseStartedAt time.Time
+	lastPhase      string
+	lastPercent    int
+	lastText       string
+	lastUpdate     time.Time
+	mu             sync.Mutex
+	latestPhase    string
+	latestDone     int64
+	latestTotal    int64
+	dirty          bool
+	updateCh       chan struct{}
+	stopCh         chan struct{}
+	stopOnce       sync.Once
+	userID         int64
+	username       string
 }
 
 func newDownloadStatus(bot *TelegramBot, chatID int64, replyToID int, existingMsgID int, req *downloadRequest) (*DownloadStatus, error) {
 	status := &DownloadStatus{
-		bot:       bot,
-		chatID:    chatID,
-		messageID: existingMsgID,
-		taskID:    req.taskID,
-		mode:      req.transferMode,
-		startedAt: req.startedAt,
-		userID:    req.userID,
-		username:  req.username,
-		updateCh:  make(chan struct{}, 1),
-		stopCh:    make(chan struct{}),
+		bot:            bot,
+		chatID:         chatID,
+		messageID:      existingMsgID,
+		taskID:         req.taskID,
+		mode:           req.transferMode,
+		startedAt:      req.startedAt,
+		phaseStartedAt: req.startedAt,
+		userID:         req.userID,
+		username:       req.username,
+		updateCh:       make(chan struct{}, 1),
+		stopCh:         make(chan struct{}),
 	}
 	if existingMsgID <= 0 {
 		msgID, err := bot.sendMessageWithReplyReturn(chatID, "Starting download...", nil, replyToID)
@@ -2555,6 +2557,11 @@ func (s *DownloadStatus) setLatestLocked(phase string, done, total int64) {
 	normalizedPhase := strings.TrimSpace(phase)
 	if normalizedPhase == "" {
 		normalizedPhase = "Working"
+	}
+	if normalizedPhase != s.latestPhase {
+		s.phaseStartedAt = time.Now()
+	} else if s.phaseStartedAt.IsZero() {
+		s.phaseStartedAt = time.Now()
 	}
 	s.latestPhase = normalizedPhase
 	s.latestDone = done
@@ -2646,12 +2653,24 @@ func formatUploadMode(mode string) string {
 	}
 }
 
-func (s *DownloadStatus) formatProgressText(phase string, done, total int64, percent int) string {
-	elapsedStr := "-"
-	if !s.startedAt.IsZero() {
-		elapsedStr = time.Since(s.startedAt).Truncate(time.Second).String()
-	}
+func formatDuration(d time.Duration) string {
+	d = d.Truncate(time.Second)
+	h := d / time.Hour
+	d -= h * time.Hour
+	m := d / time.Minute
+	d -= m * time.Minute
+	s := d / time.Second
 
+	if h > 0 {
+		return fmt.Sprintf("%dh %dm %ds", h, m, s)
+	}
+	if m > 0 {
+		return fmt.Sprintf("%dm %ds", m, s)
+	}
+	return fmt.Sprintf("%ds", s)
+}
+
+func (s *DownloadStatus) formatProgressText(phase string, done, total int64, percent int) string {
 	userIdent := ""
 	if s.username != "" {
 		userIdent = fmt.Sprintf(" (by @%s)", s.username)
@@ -2662,29 +2681,64 @@ func (s *DownloadStatus) formatProgressText(phase string, done, total int64, per
 	header := fmt.Sprintf("📥 Task ID: %s%s\n╭ Status: %s", s.taskID, userIdent, phase)
 	modeName := formatUploadMode(s.mode)
 
+	// Phase elapsed time for speed / ETA
+	phaseElapsed := time.Duration(0)
+	if !s.phaseStartedAt.IsZero() {
+		phaseElapsed = time.Since(s.phaseStartedAt)
+	}
+
+	// Total elapsed time since the task started
+	totalElapsedStr := "-"
+	if !s.startedAt.IsZero() {
+		totalElapsedStr = formatDuration(time.Since(s.startedAt))
+	}
+
+	speedStr := "-"
+	etaStr := "-"
+	if phaseElapsed >= 1*time.Second && done > 0 {
+		speedBytesPerSec := float64(done) / phaseElapsed.Seconds()
+		speedStr = fmt.Sprintf("%s/s", formatBytes(int64(speedBytesPerSec)))
+		if total > done {
+			etaSecs := float64(total-done) / speedBytesPerSec
+			etaDuration := time.Duration(etaSecs) * time.Second
+			etaStr = formatDuration(etaDuration)
+		}
+	}
+
 	if total > 0 {
 		if percent < 0 {
 			percent = 0
 		}
-		barLength := 10
+		if percent > 100 {
+			percent = 100
+		}
+		barLength := 15
 		filledCount := (percent * barLength) / 100
 		var bar string
 		for i := 0; i < barLength; i++ {
 			if i < filledCount {
-				bar += "🟢"
+				bar += "█"
+			} else if i == filledCount {
+				bar += "▒"
 			} else {
-				bar += "⭕"
+				bar += "░"
 			}
 		}
-		return fmt.Sprintf("%s\n├ %s\n├ Progress: %d%% (%s / %s)\n├ Elapsed: %s\n├ Mode: %s\n╰ Stop: /stop_%s", 
-			header, bar, percent, formatBytes(done), formatBytes(total), elapsedStr, modeName, s.taskID)
+
+		// Progress bar wrapped in monospace format
+		barFormatted := fmt.Sprintf("`[%s]`", bar)
+
+		return fmt.Sprintf("%s\n├ %s %d%%\n├ Progress: %s / %s\n├ Speed: %s\n├ ETA (Elapsed): %s (%s)\n├ Mode: %s\n╰ Stop: /stop_%s",
+			header, barFormatted, percent, formatBytes(done), formatBytes(total), speedStr, etaStr, totalElapsedStr, modeName, s.taskID)
 	}
+
 	if done > 0 {
-		return fmt.Sprintf("%s\n├ Processed: %s\n├ Elapsed: %s\n├ Mode: %s\n╰ Stop: /stop_%s", 
-			header, formatBytes(done), elapsedStr, modeName, s.taskID)
+		return fmt.Sprintf("%s\n├ Processed: %s\n├ Speed: %s\n├ Elapsed: %s\n├ Mode: %s\n╰ Stop: /stop_%s",
+			header, formatBytes(done), speedStr, totalElapsedStr, modeName, s.taskID)
 	}
-	return fmt.Sprintf("%s\n├ Elapsed: %s\n├ Mode: %s\n╰ Stop: /stop_%s", 
-		header, elapsedStr, modeName, s.taskID)
+
+	return fmt.Sprintf("%s\n├ Elapsed: %s\n├ Mode: %s\n╰ Stop: /stop_%s",
+		header, totalElapsedStr, modeName, s.taskID)
 }
 
 func formatBytes(value int64) string {
