@@ -36,6 +36,9 @@ Before starting, ensure you have:
 
 Karen is deployed in two parts: the **Decryption Wrapper** (which handles Apple Music API auth and DRM) and the **Bot Core**.
 
+> [!WARNING]
+> The wrapper is an upstream dependency and is **not maintained in this repository**. If a new Apple Music update rolls out or the wrapper breaks, you should pull the latest version directly from the [WorldObservationLog/wrapper](https://github.com/WorldObservationLog/wrapper/) repository.
+
 ### 1. Clone the Repository
 ```bash
 git clone https://github.com/spideyonmoon/karen.git ~/karen
@@ -63,7 +66,7 @@ get-m3u8-port: "wrapper:20020"
 ```
 
 > [!NOTE]
-> To configure MTProto, you will also need to provide your `telegram-api-id`, `telegram-api-hash`, and run the bot locally to generate a session string, which is then placed in your config.
+> To configure MTProto, you will also need to provide your `telegram-api-id` and `telegram-api-hash` (which can be obtained from [my.telegram.org](https://my.telegram.org)). Run the bot locally once to generate a session string, which is then placed in your config. No OTP or extra verification is needed for this workflow!
 
 ### 3. Initialize the Apple Music Wrapper
 Before launching the background services, the wrapper must be authenticated with your Apple ID. This is a one-time interactive step.
