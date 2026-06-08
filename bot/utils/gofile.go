@@ -19,41 +19,11 @@ type gofileResponse struct {
 	} `json:"data"`
 }
 
-func getGofileServer(ctx context.Context) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", "https://api.gofile.io/servers", nil)
-	if err != nil {
-		return "", err
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	var result struct {
-		Status string `json:"status"`
-		Data   struct {
-			Servers []struct {
-				Name string `json:"name"`
-			} `json:"servers"`
-		} `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", err
-	}
-	if result.Status != "ok" || len(result.Data.Servers) == 0 {
-		return "", fmt.Errorf("failed to get gofile servers, status: %s", result.Status)
-	}
-	return result.Data.Servers[0].Name, nil
-}
-
 func UploadToGofile(ctx context.Context, filePath, token string) (string, error) {
-	serverName, err := getGofileServer(ctx)
-	if err != nil {
-		return "", fmt.Errorf("failed to fetch optimal gofile server: %w", err)
+	serverURL := "https://upload-ap-sgp.gofile.io/uploadFile"
+	if token != "" {
+		serverURL = "https://upload-ap-sgp.gofile.io/contents/uploadfile"
 	}
-
-	serverURL := fmt.Sprintf("https://%s.gofile.io/uploadFile", serverName)
 
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -63,11 +33,6 @@ func UploadToGofile(ctx context.Context, filePath, token string) (string, error)
 
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
-	
-	if token != "" {
-		_ = writer.WriteField("token", token)
-	}
-
 	part, err := writer.CreateFormFile("file", filepath.Base(filePath))
 	if err != nil {
 		return "", fmt.Errorf("failed to create form file: %w", err)
@@ -88,6 +53,9 @@ func UploadToGofile(ctx context.Context, filePath, token string) (string, error)
 	}
 
 	req.Header.Set("Content-Type", writer.FormDataContentType())
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
