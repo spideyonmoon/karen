@@ -72,10 +72,15 @@ type TelegramBot struct {
 
 	queueMu       sync.Mutex
 	downloadQueue chan *downloadRequest
+	queuedReqs    []*downloadRequest // display-only mirror of downloadQueue for status board (guarded by queueMu)
 	inProgress    bool
 	userTaskCount map[int64]int
 	activeReq     *downloadRequest
 	activeStatus  *DownloadStatus // live status board for the running task; nil when idle
+	// idleStatus* track the single board shown by /status when nothing is running,
+	// so each /status replaces the previous one instead of stacking messages.
+	idleStatusMsgID  int
+	idleStatusChatID int64
 
 	cacheMu   sync.Mutex
 	cacheFile string
@@ -458,6 +463,7 @@ func (b *TelegramBot) startDownloadWorker() {
 			b.inProgress = true
 			b.activeReq = req
 			req.startedAt = time.Now()
+			b.removeQueuedReqLocked(req.taskID)
 			b.queueMu.Unlock()
 
 			b.runDownload(req)
@@ -996,76 +1002,22 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args
 	case "start", "help":
 		_ = b.sendMessage(chatID, "Send /dl <apple-music-link> to download a song or album.\nSend /status to view the download queue.", nil)
 	case "status", "queue":
-		// statusEntry is a lock-free copy of the fields we render, so we never touch
-		// a live *downloadRequest (mutated/cleared by the worker) after unlocking.
-		type statusEntry struct {
-			taskID       string
-			username     string
-			userID       int64
-			transferMode string
-			startedAt    time.Time
-		}
 		b.queueMu.Lock()
-		queueLen := len(b.downloadQueue)
+		active := b.activeStatus
 		inProgress := b.inProgress
-		activeStatus := b.activeStatus
-		var active *statusEntry
-		if b.inProgress && b.activeReq != nil {
-			active = &statusEntry{
-				taskID:       b.activeReq.taskID,
-				username:     b.activeReq.username,
-				userID:       b.activeReq.userID,
-				transferMode: b.activeReq.transferMode,
-				startedAt:    b.activeReq.startedAt,
-			}
-		}
-		// Snapshot queued tasks, copying out fields under the lock.
-		var queued []statusEntry
-		for i := 0; i < queueLen; i++ {
-			select {
-			case req := <-b.downloadQueue:
-				queued = append(queued, statusEntry{
-					taskID:       req.taskID,
-					username:     req.username,
-					userID:       req.userID,
-					transferMode: req.transferMode,
-					startedAt:    req.startedAt,
-				})
-				b.downloadQueue <- req
-			default:
-			}
-		}
 		b.queueMu.Unlock()
-
-		var msg string
-		if inProgress && activeStatus != nil {
-			// Render the same rich board as the live download message.
-			msg = activeStatus.RenderSnapshot()
-		} else if inProgress && active != nil {
-			// Worker has claimed the task but the status board isn't up yet.
-			user := active.username
-			if user == "" {
-				user = fmt.Sprintf("ID:%d", active.userID)
-			}
-			msg = fmt.Sprintf("📥 Task ID: %s (by @%s)\n╭ Status: Starting\n├ Mode: %s\n╰ Stop: /stop_%s",
-				active.taskID, user, formatUploadMode(active.transferMode), active.taskID)
-		} else {
-			msg = "📊 Karen Status Board\n\nNo active tasks."
+		switch {
+		case inProgress && active != nil && active.chatID == chatID:
+			// Single board: drop the old message and resurface it at the bottom.
+			active.Relocate(replyToID)
+		case inProgress && active != nil:
+			// Active task lives in another chat — give this chat a plain snapshot
+			// without disturbing the live board.
+			_ = b.sendMessageWithReply(chatID, active.RenderSnapshot(), nil, replyToID)
+		default:
+			// Idle: keep exactly one board, replacing any previous /status message.
+			b.replaceIdleStatusBoard(chatID, replyToID, "📊 Karen Status Board\n\nNo active tasks."+b.queueBoardSuffix())
 		}
-
-		if len(queued) > 0 {
-			msg += fmt.Sprintf("\n\n📋 Queue: %d task(s)\n", len(queued))
-			for i, req := range queued {
-				user := req.username
-				if user == "" {
-					user = fmt.Sprintf("ID:%d", req.userID)
-				}
-				msg += fmt.Sprintf("%d. %s (by @%s) — /stop_%s\n", i+1, req.taskID, user, req.taskID)
-			}
-		} else {
-			msg += "\n\n📋 Queue: empty"
-		}
-		_ = b.sendMessageWithReply(chatID, msg, nil, replyToID)
 	case "dl":
 		b.queueMu.Lock()
 		count := b.userTaskCount[userID]
@@ -1481,25 +1433,34 @@ func (b *TelegramBot) enqueueDownloadWithAfter(chatID int64, userID int64, usern
 	if inProgress {
 		position++
 	}
-	queueFull := queueLen >= queueCap
-	b.queueMu.Unlock()
-
-	if queueFull {
+	if queueLen >= queueCap {
+		b.queueMu.Unlock()
 		_ = b.sendMessageWithReply(chatID, "Download queue is full. Please try again later.", nil, replyToID)
 		return false
 	}
+	// Non-blocking send + mirror append happen atomically under queueMu so the
+	// display queue can never drift from the channel.
 	select {
 	case b.downloadQueue <- req:
+		b.queuedReqs = append(b.queuedReqs, req)
 	default:
+		b.queueMu.Unlock()
 		_ = b.sendMessageWithReply(chatID, "Download queue is full. Please try again later.", nil, replyToID)
 		return false
 	}
-	if inProgress || queueLen > 0 {
-		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Queued (ID: %s). Position: %d\nStop: /stop_%s", taskID, position, taskID), nil, replyToID)
-	}
-	
 	if userID != 0 {
 		b.userTaskCount[userID]++
+	}
+	active := b.activeStatus
+	b.queueMu.Unlock()
+
+	// A new task was added. Instead of a separate "Queued" message, refresh the
+	// single live board (its queue section now lists this task) and resurface it.
+	// If nothing is running, the worker will create the board momentarily.
+	if active != nil && active.chatID == chatID {
+		active.Relocate(replyToID)
+	} else if inProgress || queueLen > 0 {
+		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Queued (ID: %s). Position: %d\nStop: /stop_%s", taskID, position, taskID), nil, replyToID)
 	}
 	return true
 }
@@ -1604,10 +1565,17 @@ func (b *TelegramBot) runDownload(req *downloadRequest) {
 	}
 	defer status.Stop()
 
-	// Expose the live status board so /status can render the same rich view.
+	// Expose the live status board so /status can render the same rich view, and
+	// retire any idle board left by a previous /status so only one board remains.
 	b.queueMu.Lock()
 	b.activeStatus = status
+	idleID := b.idleStatusMsgID
+	idleChat := b.idleStatusChatID
+	b.idleStatusMsgID = 0
 	b.queueMu.Unlock()
+	if idleID != 0 {
+		_ = b.deleteMessage(idleChat, idleID)
+	}
 	defer func() {
 		b.queueMu.Lock()
 		b.activeStatus = nil
@@ -1807,7 +1775,7 @@ func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, re
 
 	if sentAny {
 		status.Stop()
-		_ = b.deleteMessage(chatID, status.messageID)
+		_ = b.deleteMessage(chatID, status.MessageID())
 	}
 }
 
@@ -1860,7 +1828,7 @@ func (b *TelegramBot) deliverTelegramIndividualFallback(chatID int64, paths []st
 	}
 	if sentAny {
 		status.Stop()
-		_ = b.deleteMessage(chatID, status.messageID)
+		_ = b.deleteMessage(chatID, status.MessageID())
 		return
 	}
 	b.reportDeliveryFailure(chatID, replyToID, status, lastErr)
@@ -1911,7 +1879,7 @@ func (b *TelegramBot) deliverTelegramZip(chatID int64, paths []string, replyToID
 			b.deliverGofileZipFromPath(chatID, zipPath, displayName, replyToID, status, ctx)
 		} else {
 			status.Stop()
-			_ = b.deleteMessage(chatID, status.messageID)
+			_ = b.deleteMessage(chatID, status.MessageID())
 		}
 	} else {
 		// No MTProto — fallback to Gofile
@@ -1956,7 +1924,7 @@ func (b *TelegramBot) deliverGofileZip(chatID int64, paths []string, replyToID i
 		}
 		if sentAny {
 			status.Stop()
-			_ = b.deleteMessage(chatID, status.messageID)
+			_ = b.deleteMessage(chatID, status.MessageID())
 			return
 		}
 		b.reportDeliveryFailure(chatID, replyToID, status, lastErr)
@@ -1995,7 +1963,7 @@ func (b *TelegramBot) deliverGofileZipFromPath(chatID int64, zipPath string, dis
 	_ = b.sendMessageWithReply(chatID, msg, nil, replyToID)
 
 	status.Stop()
-	_ = b.deleteMessage(chatID, status.messageID)
+	_ = b.deleteMessage(chatID, status.MessageID())
 }
 
 // reportDeliveryFailure gives the user a clear terminal message when nothing could be
@@ -2539,6 +2507,60 @@ func (b *TelegramBot) sendDocumentByFileID(chatID int64, entry CachedDocument, r
 	return nil
 }
 
+// queueBoardSuffix returns the queued-tasks listing appended to a status board, or
+// "" when the queue is empty (so a clean single download shows no queue section).
+// It reads the display-only queuedReqs mirror so it never touches the live channel
+// (no draining/blocking) even when called every few seconds from the update loop.
+func (b *TelegramBot) queueBoardSuffix() string {
+	b.queueMu.Lock()
+	reqs := make([]*downloadRequest, len(b.queuedReqs))
+	copy(reqs, b.queuedReqs)
+	b.queueMu.Unlock()
+	if len(reqs) == 0 {
+		return ""
+	}
+	out := fmt.Sprintf("\n\n📋 Queue: %d task(s)\n", len(reqs))
+	for i, r := range reqs {
+		user := r.username
+		if user == "" {
+			user = fmt.Sprintf("ID:%d", r.userID)
+		}
+		out += fmt.Sprintf("%d. %s (by @%s) — /stop_%s\n", i+1, r.taskID, user, r.taskID)
+	}
+	return out
+}
+
+// removeQueuedReqLocked drops a task from the display-only queue mirror.
+// The caller must hold queueMu.
+func (b *TelegramBot) removeQueuedReqLocked(taskID string) {
+	for i, r := range b.queuedReqs {
+		if r.taskID == taskID {
+			b.queuedReqs = append(b.queuedReqs[:i], b.queuedReqs[i+1:]...)
+			return
+		}
+	}
+}
+
+// replaceIdleStatusBoard shows a single idle/queue board, deleting any previous one
+// so /status never stacks duplicate messages when no download is running.
+func (b *TelegramBot) replaceIdleStatusBoard(chatID int64, replyToID int, text string) {
+	b.queueMu.Lock()
+	oldID := b.idleStatusMsgID
+	oldChat := b.idleStatusChatID
+	b.queueMu.Unlock()
+	if oldID != 0 {
+		_ = b.deleteMessage(oldChat, oldID)
+	}
+	newID, err := b.sendMessageWithReplyReturn(chatID, text, nil, replyToID)
+	if err != nil {
+		return
+	}
+	b.queueMu.Lock()
+	b.idleStatusMsgID = newID
+	b.idleStatusChatID = chatID
+	b.queueMu.Unlock()
+}
+
 type DownloadStatus struct {
 	bot            *TelegramBot
 	chatID         int64
@@ -2620,9 +2642,20 @@ func (s *DownloadStatus) UpdateSync(phase string, done, total int64) {
 	s.flush(true)
 }
 
+// MessageID returns the board's current Telegram message ID under lock, so callers
+// (delivery cleanup, etc.) stay correct even if Relocate moved the board concurrently.
+func (s *DownloadStatus) MessageID() int {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.messageID
+}
+
 // RenderSnapshot returns the current status board text using the same renderer
 // as the live message, so /status shows the identical rich view (progress bar,
-// speed, ETA, mode) rather than a separate bland summary.
+// speed, ETA, mode) plus the queue section when the queue is non-empty.
 func (s *DownloadStatus) RenderSnapshot() string {
 	if s == nil {
 		return ""
@@ -2645,7 +2678,30 @@ func (s *DownloadStatus) RenderSnapshot() string {
 			percent = 100
 		}
 	}
-	return s.formatProgressText(phase, done, total, percent)
+	return s.formatProgressText(phase, done, total, percent) + s.bot.queueBoardSuffix()
+}
+
+// Relocate deletes the current board message and re-sends it at the bottom of the
+// chat, keeping a single up-to-date board (no stale duplicates) when /status is run
+// or a new task is enqueued. The live update loop continues on the new message.
+func (s *DownloadStatus) Relocate(replyToID int) {
+	if s == nil || s.bot == nil {
+		return
+	}
+	text := s.RenderSnapshot()
+	newID, err := s.bot.sendMessageWithReplyReturn(s.chatID, text, nil, replyToID)
+	if err != nil {
+		return
+	}
+	s.mu.Lock()
+	oldID := s.messageID
+	s.messageID = newID
+	s.lastText = text
+	s.lastUpdate = time.Now()
+	s.mu.Unlock()
+	if oldID != 0 && oldID != newID {
+		_ = s.bot.deleteMessage(s.chatID, oldID)
+	}
 }
 
 func (s *DownloadStatus) setLatestLocked(phase string, done, total int64) {
@@ -2694,6 +2750,7 @@ func (s *DownloadStatus) flush(force bool) {
 	s.dirty = false
 	lastText := s.lastText
 	lastUpdate := s.lastUpdate
+	msgID := s.messageID
 	s.mu.Unlock()
 
 	percent := -1
@@ -2707,7 +2764,7 @@ func (s *DownloadStatus) flush(force bool) {
 		}
 	}
 
-	text := s.formatProgressText(phase, done, total, percent)
+	text := s.formatProgressText(phase, done, total, percent) + s.bot.queueBoardSuffix()
 	now := time.Now()
 	if !force {
 		if text == lastText {
@@ -2721,7 +2778,7 @@ func (s *DownloadStatus) flush(force bool) {
 		}
 	}
 
-	if err := s.bot.editMessageText(s.chatID, s.messageID, text, nil); err != nil {
+	if err := s.bot.editMessageText(s.chatID, msgID, text, nil); err != nil {
 		s.mu.Lock()
 		s.dirty = true
 		s.mu.Unlock()
@@ -3845,6 +3902,7 @@ func (b *TelegramBot) cancelTask(chatID int64, taskID string, replyToID int) {
 				if req.cancel != nil {
 					req.cancel()
 				}
+				b.removeQueuedReqLocked(req.taskID)
 				found = true
 			} else {
 				b.downloadQueue <- req
