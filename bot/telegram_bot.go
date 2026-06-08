@@ -1646,7 +1646,6 @@ func (b *TelegramBot) runDownload(req *downloadRequest) {
 	case transferModeGofileZip:
 		b.deliverGofileZip(chatID, paths, replyToID, single, status, req.ctx)
 	default:
-		// Legacy fallback: one-by-one goes to Telegram, zip goes to Gofile
 		if transferMode == transferModeZip {
 			b.deliverGofileZip(chatID, paths, replyToID, single, status, req.ctx)
 		} else {
@@ -1657,6 +1656,10 @@ func (b *TelegramBot) runDownload(req *downloadRequest) {
 
 // deliverTelegramIndividual uploads each track as an audio message via MTProto with cover art.
 func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, replyToID int, format string, status *DownloadStatus, ctx context.Context) {
+	if ctx != nil && ctx.Err() != nil {
+		status.UpdateSync("Cancelled", 0, 0)
+		return
+	}
 	if b.mtproto == nil || !b.mtproto.IsReady() {
 		// Fallback: try Bot API sendAudioFile for small files, or Gofile for large
 		b.deliverTelegramIndividualFallback(chatID, paths, replyToID, format, status, ctx)
@@ -1672,6 +1675,10 @@ func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, re
 		}
 	}
 	for _, path := range paths {
+		if ctx != nil && ctx.Err() != nil {
+			status.UpdateSync("Cancelled", 0, 0)
+			return
+		}
 		meta, hasMeta := getDownloadedMeta(path)
 		title := filepath.Base(path)
 		performer := ""
@@ -1707,6 +1714,10 @@ func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, re
 
 		err = b.mtproto.UploadAndSendAudio(chatID, path, title, performer, durationSecs, caption, thumbPath, 0, status, ctx)
 		if err != nil {
+			if ctx != nil && ctx.Err() != nil {
+				status.UpdateSync("Cancelled", 0, 0)
+				return
+			}
 			fmt.Printf("MTProto audio upload failed for %s (chatID=%d): %v\n", filepath.Base(path), chatID, err)
 			status.Update(fmt.Sprintf("Upload failed: %v", err), 0, 0)
 			// Fallback to Gofile for this file
@@ -1757,6 +1768,11 @@ func (b *TelegramBot) deliverTelegramIndividualFallback(chatID int64, paths []st
 			}
 			fmt.Printf("Bot API audio upload failed, falling back to Gofile: %v\n", err)
 		}
+		
+		if ctx != nil && ctx.Err() != nil {
+			status.UpdateSync("Cancelled", 0, 0)
+			return
+		}
 		// Too large or Bot API failed — use Gofile
 		status.UpdateSync("Uploading to Gofile...", 0, 0)
 		downloadLink, err := apputils.UploadToGofile(ctx, path, Config.GofileToken)
@@ -1776,6 +1792,12 @@ func (b *TelegramBot) deliverTelegramIndividualFallback(chatID int64, paths []st
 
 // deliverTelegramZip creates a ZIP and uploads it as a document via MTProto.
 func (b *TelegramBot) deliverTelegramZip(chatID int64, paths []string, replyToID int, albumID string, format string, status *DownloadStatus, ctx context.Context) {
+	if ctx != nil && ctx.Err() != nil {
+		if status != nil {
+			status.UpdateSync("Cancelled", 0, 0)
+		}
+		return
+	}
 	if status != nil {
 		status.Update("Zipping", 0, 0)
 	}
@@ -1796,9 +1818,18 @@ func (b *TelegramBot) deliverTelegramZip(chatID int64, paths []string, replyToID
 		return
 	}
 
+	if ctx != nil && ctx.Err() != nil {
+		status.UpdateSync("Cancelled", 0, 0)
+		return
+	}
+
 	if b.mtproto != nil && b.mtproto.IsReady() {
 		err = b.mtproto.UploadAndSendDocument(chatID, zipPath, displayName, "", 0, status, ctx)
 		if err != nil {
+			if ctx != nil && ctx.Err() != nil {
+				status.UpdateSync("Cancelled", 0, 0)
+				return
+			}
 			fmt.Printf("MTProto ZIP upload failed, falling back to Gofile: %v\n", err)
 			// Fallback to Gofile
 			b.deliverGofileZipFromPath(chatID, zipPath, displayName, replyToID, status, ctx)
@@ -1814,17 +1845,27 @@ func (b *TelegramBot) deliverTelegramZip(chatID int64, paths []string, replyToID
 
 // deliverGofileZip creates a ZIP and uploads it to Gofile (original behavior).
 func (b *TelegramBot) deliverGofileZip(chatID int64, paths []string, replyToID int, single bool, status *DownloadStatus, ctx context.Context) {
+	if ctx != nil && ctx.Err() != nil {
+		if status != nil {
+			status.UpdateSync("Cancelled", 0, 0)
+		}
+		return
+	}
 	if single {
 		// Single song: upload each file to Gofile
 		sentAny := false
-	// Send cover art as standalone photo with album info
-	if len(paths) > 0 {
-		if coverPath := findCoverFile(filepath.Dir(paths[0])); coverPath != "" {
-			coverCaption := buildCoverCaption(paths)
-			_ = b.sendPhotoWithReply(chatID, coverPath, coverCaption, replyToID)
+		// Send cover art as standalone photo with album info
+		if len(paths) > 0 {
+			if coverPath := findCoverFile(filepath.Dir(paths[0])); coverPath != "" {
+				coverCaption := buildCoverCaption(paths)
+				_ = b.sendPhotoWithReply(chatID, coverPath, coverCaption, replyToID)
+			}
 		}
-	}
 		for _, path := range paths {
+			if ctx != nil && ctx.Err() != nil {
+				status.UpdateSync("Cancelled", 0, 0)
+				return
+			}
 			status.UpdateSync("Uploading to Gofile...", 0, 0)
 			downloadLink, err := apputils.UploadToGofile(ctx, path, Config.GofileToken)
 			if err != nil {
@@ -1857,6 +1898,12 @@ func (b *TelegramBot) deliverGofileZip(chatID int64, paths []string, replyToID i
 
 // deliverGofileZipFromPath uploads a pre-created ZIP file to Gofile and sends the link.
 func (b *TelegramBot) deliverGofileZipFromPath(chatID int64, zipPath string, displayName string, replyToID int, status *DownloadStatus, ctx context.Context) {
+	if ctx != nil && ctx.Err() != nil {
+		if status != nil {
+			status.UpdateSync("Cancelled", 0, 0)
+		}
+		return
+	}
 	status.UpdateSync("Uploading to Gofile...", 0, 0)
 	downloadLink, err := apputils.UploadToGofile(ctx, zipPath, Config.GofileToken)
 	if err != nil {

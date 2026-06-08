@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/gotd/td/bin"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/uploader"
 	"github.com/gotd/td/tg"
@@ -24,14 +25,35 @@ func cryptoRandID() int64 {
 
 // MTProtoClient wraps the gotd/td client for direct Telegram uploads.
 type MTProtoClient struct {
-	client *telegram.Client
-	api    *tg.Client
-	ctx    context.Context
-	cancel context.CancelFunc
-	ready  chan struct{}
+	client  *telegram.Client
+	api     *tg.Client
+	ctx     context.Context
+	cancel  context.CancelFunc
+	ready   chan struct{}
+	running bool
+	runMu   sync.RWMutex
 
 	peerMu sync.Mutex
 	peers  map[int64]tg.InputPeerClass
+}
+
+// FloodWaitMiddleware automatically catches FLOOD_WAIT errors, sleeps for the required duration, and retries the RPC call.
+type FloodWaitMiddleware struct{}
+
+func (f FloodWaitMiddleware) Handle(next tg.Invoker) telegram.InvokeFunc {
+	return func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+		for {
+			err := next.Invoke(ctx, input, output)
+			if err == nil {
+				return nil
+			}
+			if waited, _ := tgerr.FloodWait(ctx, err); waited {
+				fmt.Println("FLOOD_WAIT encountered in MTProto client. Automatically slept and retrying...")
+				continue
+			}
+			return err
+		}
+	}
 }
 
 // UploadProgress reports upload progress to a DownloadStatus message.
@@ -61,14 +83,18 @@ func NewMTProtoClient(apiID int, apiHash string, botToken string, sessionDir str
 
 	client := telegram.NewClient(apiID, apiHash, telegram.Options{
 		SessionStorage: &FileSessionStorage{Path: sessionPath},
+		Middlewares: []telegram.Middleware{
+			FloodWaitMiddleware{},
+		},
 	})
 
 	m := &MTProtoClient{
-		client: client,
-		ctx:    ctx,
-		cancel: cancel,
-		ready:  make(chan struct{}),
-		peers:  make(map[int64]tg.InputPeerClass),
+		client:  client,
+		ctx:     ctx,
+		cancel:  cancel,
+		ready:   make(chan struct{}),
+		peers:   make(map[int64]tg.InputPeerClass),
+		running: true,
 	}
 
 	errCh := make(chan error, 1)
@@ -87,6 +113,11 @@ func NewMTProtoClient(apiID int, apiHash string, botToken string, sessionDir str
 			<-ctx.Done()
 			return ctx.Err()
 		})
+
+		m.runMu.Lock()
+		m.running = false
+		m.runMu.Unlock()
+
 		if err != nil && ctx.Err() == nil {
 			errCh <- err
 		}
@@ -111,6 +142,11 @@ func (m *MTProtoClient) Close() {
 
 // IsReady returns true if the client is authenticated and ready.
 func (m *MTProtoClient) IsReady() bool {
+	m.runMu.RLock()
+	defer m.runMu.RUnlock()
+	if !m.running {
+		return false
+	}
 	select {
 	case <-m.ready:
 		return true
