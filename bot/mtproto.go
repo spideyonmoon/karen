@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/telegram"
@@ -24,30 +25,69 @@ func cryptoRandID() int64 {
 }
 
 // MTProtoClient wraps the gotd/td client for direct Telegram uploads.
+//
+// A single supervisor goroutine keeps the connection alive: when client.Run
+// returns (a terminal disconnect — gotd handles transient blips internally), it
+// rebuilds a fresh client and re-runs with capped exponential backoff. The
+// connection-dependent fields (client/api/runCtx/ready) are rebuilt each cycle
+// and guarded by stateMu so readers never touch a torn-down client.
 type MTProtoClient struct {
+	// Immutable after construction.
+	apiID       int
+	apiHash     string
+	botToken    string
+	sessionPath string
+	storage     *FileSessionStorage
+	parentCtx   context.Context
+	cancel      context.CancelFunc
+
+	// Guarded by stateMu, rebuilt each connection cycle.
+	stateMu sync.RWMutex
 	client  *telegram.Client
 	api     *tg.Client
-	ctx     context.Context
-	cancel  context.CancelFunc
-	ready   chan struct{}
-	running bool
-	runMu   sync.RWMutex
+	runCtx  context.Context
+	ready   bool
 
 	peerMu sync.Mutex
 	peers  map[int64]tg.InputPeerClass
 }
 
+// snapshot returns the current api client, its per-cycle context, and readiness
+// under a read lock so callers operate on a consistent view even while the
+// supervisor is rebuilding the client mid-reconnect.
+func (m *MTProtoClient) snapshot() (*tg.Client, context.Context, bool) {
+	m.stateMu.RLock()
+	defer m.stateMu.RUnlock()
+	return m.api, m.runCtx, m.ready
+}
+
 // FloodWaitMiddleware automatically catches FLOOD_WAIT errors, sleeps for the required duration, and retries the RPC call.
 type FloodWaitMiddleware struct{}
 
+// maxFloodWaitTotal caps the cumulative time a single RPC will spend sleeping on
+// FLOOD_WAIT before giving up. Without it, one large FLOOD_WAIT (Telegram can hand
+// out hours) would block the single download worker indefinitely. Beyond the cap
+// the error propagates so the caller falls back to Gofile.
+const maxFloodWaitTotal = 5 * time.Minute
+
 func (f FloodWaitMiddleware) Handle(next tg.Invoker) telegram.InvokeFunc {
 	return func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+		var slept time.Duration
 		for {
+			before := time.Now()
 			err := next.Invoke(ctx, input, output)
 			if err == nil {
 				return nil
 			}
+			// tgerr.FloodWait sleeps internally (respecting ctx) and reports whether
+			// the error was a FLOOD_WAIT. We approximate the slept duration from the
+			// time spent in this Invoke call and stop once it exceeds the cap.
 			if waited, _ := tgerr.FloodWait(ctx, err); waited {
+				slept += time.Since(before)
+				if slept >= maxFloodWaitTotal {
+					fmt.Printf("FLOOD_WAIT exceeded cap (%s slept); aborting RPC so caller can fall back.\n", slept.Truncate(time.Second))
+					return err
+				}
 				fmt.Println("FLOOD_WAIT encountered in MTProto client. Automatically slept and retrying...")
 				continue
 			}
@@ -71,94 +111,137 @@ func (p *UploadProgress) Chunk(ctx context.Context, state uploader.ProgressState
 }
 
 // NewMTProtoClient creates and authenticates a new MTProto client using the bot token.
-// It blocks until authentication is complete.
+// It blocks until the first authentication completes (or initially fails), then keeps
+// the connection alive via a supervisor goroutine that reconnects on disconnect.
 func NewMTProtoClient(apiID int, apiHash string, botToken string, sessionDir string) (*MTProtoClient, error) {
 	if apiID == 0 || apiHash == "" {
 		return nil, fmt.Errorf("telegram-api-id and telegram-api-hash must be set for MTProto uploads")
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	parentCtx, cancel := context.WithCancel(context.Background())
 
 	sessionPath := filepath.Join(sessionDir, "mtproto-session.json")
 
-	client := telegram.NewClient(apiID, apiHash, telegram.Options{
-		SessionStorage: &FileSessionStorage{Path: sessionPath},
-		Middlewares: []telegram.Middleware{
-			FloodWaitMiddleware{},
-		},
-	})
-
 	m := &MTProtoClient{
-		client:  client,
-		ctx:     ctx,
-		cancel:  cancel,
-		ready:   make(chan struct{}),
-		peers:   make(map[int64]tg.InputPeerClass),
-		running: true,
+		apiID:       apiID,
+		apiHash:     apiHash,
+		botToken:    botToken,
+		sessionPath: sessionPath,
+		storage:     &FileSessionStorage{Path: sessionPath},
+		parentCtx:   parentCtx,
+		cancel:      cancel,
+		peers:       make(map[int64]tg.InputPeerClass),
 	}
 
-	errCh := make(chan error, 1)
+	// firstResult delivers the outcome of the FIRST connection cycle only, so
+	// NewMTProtoClient keeps its original contract: block until first auth.
+	firstResult := make(chan error, 1)
+	go m.supervise(firstResult)
 
-	go func() {
-		err := client.Run(ctx, func(ctx context.Context) error {
-			// Authenticate as bot
-			if _, err := client.Auth().Bot(ctx, botToken); err != nil {
-				return fmt.Errorf("MTProto bot auth failed: %w", err)
-			}
-			m.api = tg.NewClient(client)
-			close(m.ready)
-			fmt.Println("MTProto client authenticated successfully (2GB upload limit)")
-
-			// Block until context is cancelled (keeps the client alive)
-			<-ctx.Done()
-			return ctx.Err()
-		})
-
-		m.runMu.Lock()
-		m.running = false
-		m.runMu.Unlock()
-
-		if err != nil && ctx.Err() == nil {
-			errCh <- err
-		}
-	}()
-
-	// Wait for auth to complete or fail
-	select {
-	case <-m.ready:
-		return m, nil
-	case err := <-errCh:
+	if err := <-firstResult; err != nil {
 		cancel()
 		return nil, err
 	}
+	return m, nil
 }
 
-// Close shuts down the MTProto client.
+// supervise keeps the MTProto connection alive across disconnects. Each cycle builds
+// a fresh telegram.Client (gotd does not allow re-running client.Run on the same
+// instance) reusing the same on-disk session, so re-auth is cheap. The first cycle's
+// outcome is reported on firstResult; later cycles reconnect with capped backoff.
+func (m *MTProtoClient) supervise(firstResult chan error) {
+	const baseBackoff = 1 * time.Second
+	const maxBackoff = 60 * time.Second
+	backoff := baseBackoff
+	first := true
+
+	for {
+		if m.parentCtx.Err() != nil {
+			return
+		}
+
+		// Fresh client + api each cycle — Run cannot be called twice on one client.
+		client := telegram.NewClient(m.apiID, m.apiHash, telegram.Options{
+			SessionStorage: m.storage,
+			Middlewares: []telegram.Middleware{
+				FloodWaitMiddleware{},
+			},
+		})
+
+		runErr := client.Run(m.parentCtx, func(runCtx context.Context) error {
+			if _, err := client.Auth().Bot(runCtx, m.botToken); err != nil {
+				return fmt.Errorf("MTProto bot auth failed: %w", err)
+			}
+
+			m.stateMu.Lock()
+			m.client = client
+			m.api = tg.NewClient(client)
+			m.runCtx = runCtx
+			m.ready = true
+			m.stateMu.Unlock()
+
+			fmt.Println("MTProto client authenticated successfully (2GB upload limit)")
+			if first {
+				first = false
+				firstResult <- nil
+			}
+			backoff = baseBackoff // healthy cycle — reset backoff
+
+			// Block until disconnect or deliberate Close().
+			<-runCtx.Done()
+			return runCtx.Err()
+		})
+
+		// Cycle ended — mark not ready and drop the torn-down api/ctx.
+		m.stateMu.Lock()
+		m.ready = false
+		m.api = nil
+		m.runCtx = nil
+		m.stateMu.Unlock()
+
+		if m.parentCtx.Err() != nil {
+			return // deliberate Close() — do not reconnect
+		}
+
+		// First cycle failed before auth: report and stop (preserves startup contract).
+		if first {
+			first = false
+			firstResult <- runErr
+			return
+		}
+
+		fmt.Printf("MTProto disconnected (%v); reconnecting in %s\n", runErr, backoff)
+		select {
+		case <-time.After(backoff):
+		case <-m.parentCtx.Done():
+			return
+		}
+		backoff *= 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+	}
+}
+
+// Close shuts down the MTProto client and stops the supervisor.
 func (m *MTProtoClient) Close() {
 	if m.cancel != nil {
 		m.cancel()
 	}
 }
 
-// IsReady returns true if the client is authenticated and ready.
+// IsReady returns true if the client is authenticated and ready. During a reconnect
+// window it returns false, so uploads fall back to Gofile until the connection recovers.
 func (m *MTProtoClient) IsReady() bool {
-	m.runMu.RLock()
-	defer m.runMu.RUnlock()
-	if !m.running {
-		return false
-	}
-	select {
-	case <-m.ready:
-		return true
-	default:
-		return false
-	}
+	m.stateMu.RLock()
+	defer m.stateMu.RUnlock()
+	return m.ready
 }
 
 // resolveInputPeer converts a Bot API chat ID to an MTProto InputPeerClass.
 // For channels/supergroups, it fetches the access hash via ChannelsGetChannels.
 // Results are cached for reuse.
-func (m *MTProtoClient) resolveInputPeer(chatID int64) (tg.InputPeerClass, error) {
+func (m *MTProtoClient) resolveInputPeer(ctx context.Context, chatID int64) (tg.InputPeerClass, error) {
 	m.peerMu.Lock()
 	if peer, ok := m.peers[chatID]; ok {
 		m.peerMu.Unlock()
@@ -174,8 +257,12 @@ func (m *MTProtoClient) resolveInputPeer(chatID int64) (tg.InputPeerClass, error
 		if chatID < -1000000000000 {
 			channelID := -chatID - 1000000000000
 
+			api, _, ready := m.snapshot()
+			if !ready || api == nil {
+				return nil, fmt.Errorf("MTProto client not ready")
+			}
 			// Fetch access hash from Telegram
-			res, err := m.api.ChannelsGetChannels(m.ctx, []tg.InputChannelClass{
+			res, err := api.ChannelsGetChannels(ctx, []tg.InputChannelClass{
 				&tg.InputChannel{ChannelID: channelID, AccessHash: 0},
 			})
 			if err != nil {
@@ -233,11 +320,12 @@ func (m *MTProtoClient) UploadAndSendAudio(
 	status *DownloadStatus,
 	ctx context.Context,
 ) error {
-	if !m.IsReady() {
+	api, _, ready := m.snapshot()
+	if !ready || api == nil {
 		return fmt.Errorf("MTProto client not ready")
 	}
 
-	u := uploader.NewUploader(m.api).WithPartSize(512 * 1024).WithThreads(8)
+	u := uploader.NewUploader(api).WithPartSize(512 * 1024).WithThreads(8)
 	if status != nil {
 		u = u.WithProgress(&UploadProgress{status: status, phase: "Uploading"})
 	}
@@ -254,7 +342,7 @@ func (m *MTProtoClient) UploadAndSendAudio(
 	// Upload thumbnail if available
 	var thumb tg.InputFileClass
 	if thumbPath != "" {
-		thumbUploader := uploader.NewUploader(m.api).WithPartSize(512 * 1024)
+		thumbUploader := uploader.NewUploader(api).WithPartSize(512 * 1024)
 		thumbFile, err := thumbUploader.FromPath(ctx, thumbPath)
 		if err != nil {
 			fmt.Printf("Warning: failed to upload thumbnail: %v\n", err)
@@ -290,7 +378,7 @@ func (m *MTProtoClient) UploadAndSendAudio(
 	}
 
 	// Resolve peer
-	peer, err := m.resolveInputPeer(chatID)
+	peer, err := m.resolveInputPeer(ctx, chatID)
 	if err != nil {
 		return fmt.Errorf("failed to resolve peer for chat %d: %w", chatID, err)
 	}
@@ -310,11 +398,11 @@ func (m *MTProtoClient) UploadAndSendAudio(
 	}
 
 	// Send with FLOOD_WAIT retry
-	_, err = m.api.MessagesSendMedia(ctx, req)
+	_, err = api.MessagesSendMedia(ctx, req)
 	if waited, _ := tgerr.FloodWait(ctx, err); waited {
 		fmt.Println("FLOOD_WAIT for audio, retrying...")
 		req.RandomID = cryptoRandID()
-		_, err = m.api.MessagesSendMedia(ctx, req)
+		_, err = api.MessagesSendMedia(ctx, req)
 	}
 	if err != nil {
 		return fmt.Errorf("failed to send audio via MTProto: %w", err)
@@ -341,17 +429,18 @@ func (m *MTProtoClient) UploadAndSendAudioGroup(
 	status *DownloadStatus,
 	ctx context.Context,
 ) error {
-	if !m.IsReady() {
+	api, _, ready := m.snapshot()
+	if !ready || api == nil {
 		return fmt.Errorf("MTProto client not ready")
 	}
 
 	// Resolve peer
-	peer, err := m.resolveInputPeer(chatID)
+	peer, err := m.resolveInputPeer(ctx, chatID)
 	if err != nil {
 		return fmt.Errorf("failed to resolve peer for chat %d: %w", chatID, err)
 	}
 
-	u := uploader.NewUploader(m.api).WithPartSize(512 * 1024).WithThreads(8)
+	u := uploader.NewUploader(api).WithPartSize(512 * 1024).WithThreads(8)
 
 	var multiMedia []tg.InputSingleMedia
 
@@ -373,7 +462,7 @@ func (m *MTProtoClient) UploadAndSendAudioGroup(
 		// Upload thumbnail if available
 		var thumb tg.InputFileClass
 		if item.ThumbPath != "" {
-			thumbUploader := uploader.NewUploader(m.api).WithPartSize(512 * 1024)
+			thumbUploader := uploader.NewUploader(api).WithPartSize(512 * 1024)
 			thumbFile, err := thumbUploader.FromPath(ctx, item.ThumbPath)
 			if err != nil {
 				fmt.Printf("Warning: failed to upload thumbnail: %v\n", err)
@@ -410,7 +499,7 @@ func (m *MTProtoClient) UploadAndSendAudioGroup(
 
 		// Register the media with Telegram using MessagesUploadMedia to get a persistent document reference.
 		// Using raw InputMediaUploadedDocument inside MessagesSendMultiMedia is not supported by Telegram.
-		uploadedMedia, err := m.api.MessagesUploadMedia(ctx, &tg.MessagesUploadMediaRequest{
+		uploadedMedia, err := api.MessagesUploadMedia(ctx, &tg.MessagesUploadMediaRequest{
 			Peer:  peer,
 			Media: media,
 		})
@@ -451,7 +540,7 @@ func (m *MTProtoClient) UploadAndSendAudioGroup(
 	}
 
 	// Send request (retries on FLOOD_WAIT are handled by middleware)
-	_, err = m.api.MessagesSendMultiMedia(ctx, req)
+	_, err = api.MessagesSendMultiMedia(ctx, req)
 	if err != nil {
 		return fmt.Errorf("failed to send multi-media group via MTProto: %w", err)
 	}
@@ -469,11 +558,12 @@ func (m *MTProtoClient) UploadAndSendDocument(
 	status *DownloadStatus,
 	ctx context.Context,
 ) error {
-	if !m.IsReady() {
+	api, _, ready := m.snapshot()
+	if !ready || api == nil {
 		return fmt.Errorf("MTProto client not ready")
 	}
 
-	u := uploader.NewUploader(m.api).WithPartSize(512 * 1024).WithThreads(8)
+	u := uploader.NewUploader(api).WithPartSize(512 * 1024).WithThreads(8)
 	if status != nil {
 		u = u.WithProgress(&UploadProgress{status: status, phase: "Uploading"})
 	}
@@ -496,7 +586,7 @@ func (m *MTProtoClient) UploadAndSendDocument(
 		},
 	}
 
-	peer, err := m.resolveInputPeer(chatID)
+	peer, err := m.resolveInputPeer(ctx, chatID)
 	if err != nil {
 		return fmt.Errorf("failed to resolve peer for chat %d: %w", chatID, err)
 	}
@@ -514,11 +604,11 @@ func (m *MTProtoClient) UploadAndSendDocument(
 		req.SetFlags()
 	}
 
-	_, err = m.api.MessagesSendMedia(ctx, req)
+	_, err = api.MessagesSendMedia(ctx, req)
 	if waited, _ := tgerr.FloodWait(ctx, err); waited {
 		fmt.Println("FLOOD_WAIT for document, retrying...")
 		req.RandomID = cryptoRandID()
-		_, err = m.api.MessagesSendMedia(ctx, req)
+		_, err = api.MessagesSendMedia(ctx, req)
 	}
 	if err != nil {
 		return fmt.Errorf("failed to send document via MTProto: %w", err)

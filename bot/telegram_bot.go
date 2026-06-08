@@ -7,6 +7,7 @@ import (
 	cryptorand "crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -994,35 +995,57 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args
 	case "start", "help":
 		_ = b.sendMessage(chatID, "Send /dl <apple-music-link> to download a song or album.\nSend /status to view the download queue.", nil)
 	case "status", "queue":
+		// statusEntry is a lock-free copy of the fields we render, so we never touch
+		// a live *downloadRequest (mutated/cleared by the worker) after unlocking.
+		type statusEntry struct {
+			taskID       string
+			username     string
+			userID       int64
+			transferMode string
+			startedAt    time.Time
+		}
 		b.queueMu.Lock()
 		queueLen := len(b.downloadQueue)
 		inProgress := b.inProgress
-		activeReq := b.activeReq
-		// Snapshot queued tasks
-		var queued []*downloadRequest
+		var active *statusEntry
+		if b.inProgress && b.activeReq != nil {
+			active = &statusEntry{
+				taskID:       b.activeReq.taskID,
+				username:     b.activeReq.username,
+				userID:       b.activeReq.userID,
+				transferMode: b.activeReq.transferMode,
+				startedAt:    b.activeReq.startedAt,
+			}
+		}
+		// Snapshot queued tasks, copying out fields under the lock.
+		var queued []statusEntry
 		for i := 0; i < queueLen; i++ {
 			select {
 			case req := <-b.downloadQueue:
-				queued = append(queued, req)
+				queued = append(queued, statusEntry{
+					taskID:       req.taskID,
+					username:     req.username,
+					userID:       req.userID,
+					transferMode: req.transferMode,
+					startedAt:    req.startedAt,
+				})
+				b.downloadQueue <- req
 			default:
 			}
-		}
-		for _, req := range queued {
-			b.downloadQueue <- req
 		}
 		b.queueMu.Unlock()
 
 		msg := "📊 Karen Status Board\n\n"
-		if inProgress && activeReq != nil {
-			elapsed := time.Since(activeReq.startedAt).Truncate(time.Second)
-			user := activeReq.username
+		if inProgress && active != nil {
+			elapsed := time.Since(active.startedAt).Truncate(time.Second)
+			user := active.username
 			if user == "" {
-				user = fmt.Sprintf("ID:%d", activeReq.userID)
+				user = fmt.Sprintf("ID:%d", active.userID)
 			}
-			msg += fmt.Sprintf("📤 Task: %s (by @%s)\n", activeReq.taskID, user)
-			msg += fmt.Sprintf("├ Mode: %s\n", activeReq.transferMode)
+			msg += fmt.Sprintf("📤 Task: %s (by @%s)\n", active.taskID, user)
+			msg += fmt.Sprintf("├ Mode: %s\n", active.transferMode)
 			msg += fmt.Sprintf("├ Elapsed: %s\n", elapsed)
-			msg += fmt.Sprintf("╰ Stop: /stop_%s\n", activeReq.taskID)
+			msg += fmt.Sprintf("╰ Stop: /stop_%s\n", active.taskID)
 		} else {
 			msg += "No active tasks.\n"
 		}
@@ -1778,6 +1801,7 @@ func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, re
 // deliverTelegramIndividualFallback sends tracks via Bot API (limited to maxFileBytes) or Gofile.
 func (b *TelegramBot) deliverTelegramIndividualFallback(chatID int64, paths []string, replyToID int, format string, status *DownloadStatus, ctx context.Context) {
 	sentAny := false
+	var lastErr error
 	// Send cover art as standalone photo with album info
 	if len(paths) > 0 {
 		if coverPath := findCoverFile(filepath.Dir(paths[0])); coverPath != "" {
@@ -1792,6 +1816,7 @@ func (b *TelegramBot) deliverTelegramIndividualFallback(chatID int64, paths []st
 		}
 		info, err := os.Stat(path)
 		if err != nil {
+			lastErr = err
 			continue
 		}
 		if info.Size() <= b.maxFileBytes {
@@ -1803,7 +1828,7 @@ func (b *TelegramBot) deliverTelegramIndividualFallback(chatID int64, paths []st
 			}
 			fmt.Printf("Bot API audio upload failed, falling back to Gofile: %v\n", err)
 		}
-		
+
 		if ctx != nil && ctx.Err() != nil {
 			status.UpdateSync("Cancelled", 0, 0)
 			return
@@ -1812,7 +1837,8 @@ func (b *TelegramBot) deliverTelegramIndividualFallback(chatID int64, paths []st
 		status.UpdateSync("Uploading to Gofile...", 0, 0)
 		downloadLink, err := apputils.UploadToGofile(ctx, path, Config.GofileToken)
 		if err != nil {
-			status.Update(fmt.Sprintf("Gofile upload failed: %v", err), 0, 0)
+			lastErr = err
+			status.UpdateSync(fmt.Sprintf("Gofile upload failed: %v", err), 0, 0)
 			continue
 		}
 		msg := fmt.Sprintf("File: %s\nDownload Link: %s", filepath.Base(path), downloadLink)
@@ -1822,7 +1848,9 @@ func (b *TelegramBot) deliverTelegramIndividualFallback(chatID int64, paths []st
 	if sentAny {
 		status.Stop()
 		_ = b.deleteMessage(chatID, status.messageID)
+		return
 	}
+	b.reportDeliveryFailure(chatID, replyToID, status, lastErr)
 }
 
 // deliverTelegramZip creates a ZIP and uploads it as a document via MTProto.
@@ -1889,6 +1917,7 @@ func (b *TelegramBot) deliverGofileZip(chatID int64, paths []string, replyToID i
 	if single {
 		// Single song: upload each file to Gofile
 		sentAny := false
+		var lastErr error
 		// Send cover art as standalone photo with album info
 		if len(paths) > 0 {
 			if coverPath := findCoverFile(filepath.Dir(paths[0])); coverPath != "" {
@@ -1904,7 +1933,8 @@ func (b *TelegramBot) deliverGofileZip(chatID int64, paths []string, replyToID i
 			status.UpdateSync("Uploading to Gofile...", 0, 0)
 			downloadLink, err := apputils.UploadToGofile(ctx, path, Config.GofileToken)
 			if err != nil {
-				status.Update(fmt.Sprintf("Gofile upload failed: %v", err), 0, 0)
+				lastErr = err
+				status.UpdateSync(fmt.Sprintf("Gofile upload failed: %v", err), 0, 0)
 				continue
 			}
 			msg := fmt.Sprintf("File: %s\nDownload Link: %s", filepath.Base(path), downloadLink)
@@ -1914,7 +1944,9 @@ func (b *TelegramBot) deliverGofileZip(chatID int64, paths []string, replyToID i
 		if sentAny {
 			status.Stop()
 			_ = b.deleteMessage(chatID, status.messageID)
+			return
 		}
+		b.reportDeliveryFailure(chatID, replyToID, status, lastErr)
 		return
 	}
 
@@ -1942,7 +1974,7 @@ func (b *TelegramBot) deliverGofileZipFromPath(chatID int64, zipPath string, dis
 	status.UpdateSync("Uploading to Gofile...", 0, 0)
 	downloadLink, err := apputils.UploadToGofile(ctx, zipPath, Config.GofileToken)
 	if err != nil {
-		status.UpdateSync(fmt.Sprintf("Gofile upload failed: %v", err), 0, 0)
+		b.reportDeliveryFailure(chatID, replyToID, status, err)
 		return
 	}
 
@@ -1951,6 +1983,28 @@ func (b *TelegramBot) deliverGofileZipFromPath(chatID int64, zipPath string, dis
 
 	status.Stop()
 	_ = b.deleteMessage(chatID, status.messageID)
+}
+
+// reportDeliveryFailure gives the user a clear terminal message when nothing could be
+// delivered, and freezes the status board on a definitive "failed" state (rather than
+// leaving a stale "Uploading..." that never resolves). If the failure was a context
+// cancellation, it reports that instead of a generic error.
+func (b *TelegramBot) reportDeliveryFailure(chatID int64, replyToID int, status *DownloadStatus, lastErr error) {
+	if lastErr != nil && errors.Is(lastErr, context.Canceled) {
+		if status != nil {
+			status.UpdateSync("Cancelled", 0, 0)
+		}
+		return
+	}
+	detail := "delivery failed"
+	if lastErr != nil {
+		detail = lastErr.Error()
+	}
+	if status != nil {
+		status.UpdateSync(fmt.Sprintf("Failed: %s", detail), 0, 0)
+		status.Stop()
+	}
+	_ = b.sendMessageWithReply(chatID, fmt.Sprintf("❌ Upload failed — no files could be delivered.\n%s", detail), nil, replyToID)
 }
 
 
