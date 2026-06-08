@@ -4,4 +4,4 @@ bot/downloads/
 wrapper/wrapper-data/
 *.zip
 .env
-CONTEXT.md
+context.md
