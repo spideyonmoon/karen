@@ -1199,37 +1199,6 @@ func (b *TelegramBot) showArtistAlbums(chatID int64, artistID string, artistName
 	b.setPending(chatID, "artist_album", artistID, 0, albums, hasNext, replyToID, messageID, artistName)
 }
 
-func (b *TelegramBot) setLastQueuedMeta(messageID int, username string, userID int64) {
-	b.queueMu.Lock()
-	defer b.queueMu.Unlock()
-	// Set on active req if it just started, or on the last queued item
-	queueLen := len(b.downloadQueue)
-	if queueLen > 0 {
-		// Peek at last item — drain and re-add
-		var items []*downloadRequest
-		for i := 0; i < queueLen; i++ {
-			select {
-			case req := <-b.downloadQueue:
-				items = append(items, req)
-			default:
-			}
-		}
-		if len(items) > 0 {
-			last := items[len(items)-1]
-			last.statusMessageID = messageID
-			last.username = username
-			last.userID = userID
-		}
-		for _, req := range items {
-			b.downloadQueue <- req
-		}
-	} else if b.activeReq != nil && b.activeReq.statusMessageID == 0 {
-		b.activeReq.statusMessageID = messageID
-		b.activeReq.username = username
-		b.activeReq.userID = userID
-	}
-}
-
 func (b *TelegramBot) handleTransferMode(chatID int64, messageID int, mode string, username string, userID int64) {
 	pending, ok := b.getPendingTransfer(chatID)
 	if !ok {
@@ -1270,11 +1239,11 @@ func (b *TelegramBot) handleTransferMode(chatID int64, messageID int, mode strin
 	_ = b.editMessageText(chatID, messageID, statusText, nil)
 
 	if pending.Single && pending.SongID != "" {
-		b.enqueueDownload(chatID, userID, replyToID, true, b.getChatFormat(chatID), mode, "", func(ctx context.Context) error {
+		b.enqueueDownload(chatID, userID, username, replyToID, messageID, true, b.getChatFormat(chatID), mode, "", func(ctx context.Context) error {
 			return ripSong(pending.SongID, b.appleToken, Config.Storefront, Config.MediaUserToken, pending.ForceAAC, ctx)
 		})
 	} else if pending.PlaylistID != "" {
-		b.enqueuePlaylistDownload(chatID, pending.PlaylistID, replyToID, mode, pending.ForceAAC, pending.ForceAtmos)
+		b.enqueuePlaylistDownload(chatID, pending.PlaylistID, replyToID, messageID, mode, pending.ForceAAC, pending.ForceAtmos, userID, username)
 	} else if pending.AlbumID != "" {
 		format := b.getChatFormat(chatID)
 		if mode == transferModeGofileZip {
@@ -1282,9 +1251,8 @@ func (b *TelegramBot) handleTransferMode(chatID int64, messageID int, mode strin
 				return
 			}
 		}
-		b.enqueueAlbumDownload(chatID, pending.AlbumID, replyToID, mode, pending.ForceAAC, pending.ForceAtmos)
+		b.enqueueAlbumDownload(chatID, pending.AlbumID, replyToID, messageID, mode, pending.ForceAAC, pending.ForceAtmos, userID, username)
 	}
-	b.setLastQueuedMeta(messageID, username, userID)
 }
 
 func (b *TelegramBot) handlePage(chatID int64, messageID int, delta int) {
@@ -1378,7 +1346,7 @@ func (b *TelegramBot) queueInlineSongDownload(chatID int64, songID string, inlin
 		}
 		_ = b.editInlineMessageText(inlineMessageID, "Download failed. Please check bot logs or cache chat permissions.")
 	}
-	ok := b.enqueueDownloadWithAfter(uploadChatID, 0, 0, true, format, transferModeOneByOne, "", func(ctx context.Context) error {
+	ok := b.enqueueDownloadWithAfter(uploadChatID, 0, "", 0, 0, true, format, transferModeOneByOne, "", func(ctx context.Context) error {
 		return ripSong(songID, b.appleToken, Config.Storefront, Config.MediaUserToken, false, ctx)
 	}, after)
 	if !ok && inlineMessageID != "" {
@@ -1427,13 +1395,13 @@ func (b *TelegramBot) promptTransferMode(chatID int64, albumID string, songID st
 	b.transferMu.Unlock()
 }
 
-func (b *TelegramBot) enqueueAlbumDownload(chatID int64, albumID string, replyToID int, transferMode string, forceAAC bool, forceAtmos bool) {
+func (b *TelegramBot) enqueueAlbumDownload(chatID int64, albumID string, replyToID int, statusMessageID int, transferMode string, forceAAC bool, forceAtmos bool, userID int64, username string) {
 	if albumID == "" {
 		_ = b.sendMessage(chatID, "Album ID is empty.", nil)
 		return
 	}
 	format := b.getChatFormat(chatID)
-	b.enqueueDownload(chatID, 0, replyToID, false, format, transferMode, albumID, func(ctx context.Context) error {
+	b.enqueueDownload(chatID, userID, username, replyToID, statusMessageID, false, format, transferMode, albumID, func(ctx context.Context) error {
 		if forceAtmos {
 			dl_atmos = true
 		}
@@ -1441,13 +1409,13 @@ func (b *TelegramBot) enqueueAlbumDownload(chatID int64, albumID string, replyTo
 	})
 }
 
-func (b *TelegramBot) enqueuePlaylistDownload(chatID int64, playlistID string, replyToID int, transferMode string, forceAAC bool, forceAtmos bool) {
+func (b *TelegramBot) enqueuePlaylistDownload(chatID int64, playlistID string, replyToID int, statusMessageID int, transferMode string, forceAAC bool, forceAtmos bool, userID int64, username string) {
 	if playlistID == "" {
 		_ = b.sendMessage(chatID, "Playlist ID is empty.", nil)
 		return
 	}
 	format := b.getChatFormat(chatID)
-	b.enqueueDownload(chatID, 0, replyToID, false, format, transferMode, playlistID, func(ctx context.Context) error {
+	b.enqueueDownload(chatID, userID, username, replyToID, statusMessageID, false, format, transferMode, playlistID, func(ctx context.Context) error {
 		if forceAtmos {
 			dl_atmos = true
 		}
@@ -1455,27 +1423,29 @@ func (b *TelegramBot) enqueuePlaylistDownload(chatID int64, playlistID string, r
 	})
 }
 
-func (b *TelegramBot) enqueueDownload(chatID int64, userID int64, replyToID int, single bool, format string, transferMode string, albumID string, fn func(ctx context.Context) error) {
-	_ = b.enqueueDownloadWithAfter(chatID, userID, replyToID, single, format, transferMode, albumID, fn, nil)
+func (b *TelegramBot) enqueueDownload(chatID int64, userID int64, username string, replyToID int, statusMessageID int, single bool, format string, transferMode string, albumID string, fn func(ctx context.Context) error) {
+	_ = b.enqueueDownloadWithAfter(chatID, userID, username, replyToID, statusMessageID, single, format, transferMode, albumID, fn, nil)
 }
 
-func (b *TelegramBot) enqueueDownloadWithAfter(chatID int64, userID int64, replyToID int, single bool, format string, transferMode string, albumID string, fn func(ctx context.Context) error, after func()) bool {
+func (b *TelegramBot) enqueueDownloadWithAfter(chatID int64, userID int64, username string, replyToID int, statusMessageID int, single bool, format string, transferMode string, albumID string, fn func(ctx context.Context) error, after func()) bool {
 	// Accept all valid transfer modes
 	taskID := generateTaskID()
 	ctx, cancelFn := context.WithCancel(context.Background())
 	req := &downloadRequest{
-		taskID:       taskID,
-		chatID:       chatID,
-		userID:       userID,
-		replyToID:    replyToID,
-		single:       single,
-		format:       format,
-		transferMode: transferMode,
-		albumID:      albumID,
-		fn:           fn,
-		after:        after,
-		ctx:          ctx,
-		cancel:       cancelFn,
+		taskID:          taskID,
+		chatID:          chatID,
+		userID:          userID,
+		username:        username,
+		replyToID:       replyToID,
+		single:          single,
+		format:          format,
+		transferMode:    transferMode,
+		albumID:         albumID,
+		fn:              fn,
+		after:           after,
+		ctx:             ctx,
+		cancel:          cancelFn,
+		statusMessageID: statusMessageID,
 	}
 	b.queueMu.Lock()
 	inProgress := b.inProgress
