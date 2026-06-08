@@ -54,9 +54,6 @@ func UploadToGofile(ctx context.Context, filePath, token string) (string, error)
 	}
 
 	serverURL := fmt.Sprintf("https://%s.gofile.io/uploadFile", serverName)
-	if token != "" {
-		serverURL = fmt.Sprintf("https://%s.gofile.io/contents/uploadfile", serverName)
-	}
 
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -66,6 +63,11 @@ func UploadToGofile(ctx context.Context, filePath, token string) (string, error)
 
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
+	
+	if token != "" {
+		_ = writer.WriteField("token", token)
+	}
+
 	part, err := writer.CreateFormFile("file", filepath.Base(filePath))
 	if err != nil {
 		return "", fmt.Errorf("failed to create form file: %w", err)
@@ -86,9 +88,6 @@ func UploadToGofile(ctx context.Context, filePath, token string) (string, error)
 	}
 
 	req.Header.Set("Content-Type", writer.FormDataContentType())
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
