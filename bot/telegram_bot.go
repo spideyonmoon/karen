@@ -75,6 +75,7 @@ type TelegramBot struct {
 	inProgress    bool
 	userTaskCount map[int64]int
 	activeReq     *downloadRequest
+	activeStatus  *DownloadStatus // live status board for the running task; nil when idle
 
 	cacheMu   sync.Mutex
 	cacheFile string
@@ -1007,6 +1008,7 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args
 		b.queueMu.Lock()
 		queueLen := len(b.downloadQueue)
 		inProgress := b.inProgress
+		activeStatus := b.activeStatus
 		var active *statusEntry
 		if b.inProgress && b.activeReq != nil {
 			active = &statusEntry{
@@ -1035,23 +1037,24 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args
 		}
 		b.queueMu.Unlock()
 
-		msg := "📊 Karen Status Board\n\n"
-		if inProgress && active != nil {
-			elapsed := time.Since(active.startedAt).Truncate(time.Second)
+		var msg string
+		if inProgress && activeStatus != nil {
+			// Render the same rich board as the live download message.
+			msg = activeStatus.RenderSnapshot()
+		} else if inProgress && active != nil {
+			// Worker has claimed the task but the status board isn't up yet.
 			user := active.username
 			if user == "" {
 				user = fmt.Sprintf("ID:%d", active.userID)
 			}
-			msg += fmt.Sprintf("📤 Task: %s (by @%s)\n", active.taskID, user)
-			msg += fmt.Sprintf("├ Mode: %s\n", active.transferMode)
-			msg += fmt.Sprintf("├ Elapsed: %s\n", elapsed)
-			msg += fmt.Sprintf("╰ Stop: /stop_%s\n", active.taskID)
+			msg = fmt.Sprintf("📥 Task ID: %s (by @%s)\n╭ Status: Starting\n├ Mode: %s\n╰ Stop: /stop_%s",
+				active.taskID, user, formatUploadMode(active.transferMode), active.taskID)
 		} else {
-			msg += "No active tasks.\n"
+			msg = "📊 Karen Status Board\n\nNo active tasks."
 		}
 
 		if len(queued) > 0 {
-			msg += fmt.Sprintf("\n📋 Queue: %d task(s)\n", len(queued))
+			msg += fmt.Sprintf("\n\n📋 Queue: %d task(s)\n", len(queued))
 			for i, req := range queued {
 				user := req.username
 				if user == "" {
@@ -1060,7 +1063,7 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args
 				msg += fmt.Sprintf("%d. %s (by @%s) — /stop_%s\n", i+1, req.taskID, user, req.taskID)
 			}
 		} else {
-			msg += "\n📋 Queue: empty"
+			msg += "\n\n📋 Queue: empty"
 		}
 		_ = b.sendMessageWithReply(chatID, msg, nil, replyToID)
 	case "dl":
@@ -1600,6 +1603,16 @@ func (b *TelegramBot) runDownload(req *downloadRequest) {
 		return
 	}
 	defer status.Stop()
+
+	// Expose the live status board so /status can render the same rich view.
+	b.queueMu.Lock()
+	b.activeStatus = status
+	b.queueMu.Unlock()
+	defer func() {
+		b.queueMu.Lock()
+		b.activeStatus = nil
+		b.queueMu.Unlock()
+	}()
 
 	progress := func(phase string, done, total int64) {
 		status.Update(phase, done, total)
@@ -2605,6 +2618,34 @@ func (s *DownloadStatus) UpdateSync(phase string, done, total int64) {
 	s.setLatestLocked(phase, done, total)
 	s.mu.Unlock()
 	s.flush(true)
+}
+
+// RenderSnapshot returns the current status board text using the same renderer
+// as the live message, so /status shows the identical rich view (progress bar,
+// speed, ETA, mode) rather than a separate bland summary.
+func (s *DownloadStatus) RenderSnapshot() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.Lock()
+	phase := s.latestPhase
+	done := s.latestDone
+	total := s.latestTotal
+	s.mu.Unlock()
+	if strings.TrimSpace(phase) == "" {
+		phase = "Working"
+	}
+	percent := -1
+	if total > 0 {
+		percent = int(float64(done) / float64(total) * 100)
+		if percent < 0 {
+			percent = 0
+		}
+		if percent > 100 {
+			percent = 100
+		}
+	}
+	return s.formatProgressText(phase, done, total, percent)
 }
 
 func (s *DownloadStatus) setLatestLocked(phase string, done, total int64) {
