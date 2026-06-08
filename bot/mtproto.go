@@ -237,7 +237,7 @@ func (m *MTProtoClient) UploadAndSendAudio(
 		return fmt.Errorf("MTProto client not ready")
 	}
 
-	u := uploader.NewUploader(m.api).WithPartSize(512 * 1024)
+	u := uploader.NewUploader(m.api).WithPartSize(512 * 1024).WithThreads(8)
 	if status != nil {
 		u = u.WithProgress(&UploadProgress{status: status, phase: "Uploading"})
 	}
@@ -351,7 +351,7 @@ func (m *MTProtoClient) UploadAndSendAudioGroup(
 		return fmt.Errorf("failed to resolve peer for chat %d: %w", chatID, err)
 	}
 
-	u := uploader.NewUploader(m.api).WithPartSize(512 * 1024)
+	u := uploader.NewUploader(m.api).WithPartSize(512 * 1024).WithThreads(8)
 
 	var multiMedia []tg.InputSingleMedia
 
@@ -473,7 +473,7 @@ func (m *MTProtoClient) UploadAndSendDocument(
 		return fmt.Errorf("MTProto client not ready")
 	}
 
-	u := uploader.NewUploader(m.api).WithPartSize(512 * 1024)
+	u := uploader.NewUploader(m.api).WithPartSize(512 * 1024).WithThreads(8)
 	if status != nil {
 		u = u.WithProgress(&UploadProgress{status: status, phase: "Uploading"})
 	}
