@@ -4,6 +4,7 @@ import (
 	"context"
 	cryptorand "crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -59,6 +60,93 @@ func (m *MTProtoClient) snapshot() (*tg.Client, context.Context, bool) {
 	m.stateMu.RLock()
 	defer m.stateMu.RUnlock()
 	return m.api, m.runCtx, m.ready
+}
+
+// uploadMaxAttempts bounds how many times an upload is retried across reconnects
+// before the caller falls back to Gofile. uploadReadyWait bounds how long each
+// attempt waits for the supervisor to bring the connection back.
+const (
+	uploadMaxAttempts = 3
+	uploadReadyWait   = 45 * time.Second
+)
+
+// awaitReady blocks until the supervisor has a live, authenticated client again and
+// returns the fresh api. It returns (nil, false) if the caller's ctx ends, the client
+// is shutting down, or the wait times out — letting an upload ride out a reconnect
+// window instead of bailing straight to Gofile.
+func (m *MTProtoClient) awaitReady(ctx context.Context, timeout time.Duration) (*tg.Client, bool) {
+	if api, _, ready := m.snapshot(); ready && api != nil {
+		return api, true
+	}
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, false
+		case <-m.parentCtx.Done():
+			return nil, false
+		case <-ticker.C:
+			if api, _, ready := m.snapshot(); ready && api != nil {
+				return api, true
+			}
+			if time.Now().After(deadline) {
+				return nil, false
+			}
+		}
+	}
+}
+
+// isTransientConnErr reports whether err is a gotd connection/engine teardown caused
+// by a reconnect (gotd's "engine was closed" / "engine forcibly closed" / "connection
+// dead"), rather than a permanent failure. The forcibly-closed variant unwraps to
+// context.Canceled, so callers MUST first confirm their own ctx is still alive — a real
+// /stop unwraps to the same error and must not be retried.
+func isTransientConnErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "engine was closed") ||
+		strings.Contains(msg, "engine forcibly closed") ||
+		strings.Contains(msg, "connection dead")
+}
+
+// withUploadRetry runs fn against a live client, retrying transient connection
+// teardowns after waiting for the supervisor to reconnect. It aborts immediately if
+// the caller's ctx is done (a real /stop or shutdown), so cancellation still
+// propagates. After exhausting attempts it returns the last error so the caller can
+// fall back to Gofile. fn must be safe to re-run: it should not post a Telegram message
+// until its uploads succeed (all callers register media first and send once at the end).
+func (m *MTProtoClient) withUploadRetry(ctx context.Context, op string, fn func(api *tg.Client) error) error {
+	var lastErr error
+	for attempt := 1; attempt <= uploadMaxAttempts; attempt++ {
+		api, ok := m.awaitReady(ctx, uploadReadyWait)
+		if !ok {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("MTProto client not ready")
+		}
+		err := fn(api)
+		if err == nil {
+			return nil
+		}
+		// A real caller cancellation is terminal — never retry past /stop or shutdown.
+		if ctx.Err() != nil {
+			return err
+		}
+		if !isTransientConnErr(err) {
+			return err
+		}
+		lastErr = err
+		fmt.Printf("MTProto %s hit transient connection error (attempt %d/%d): %v; waiting for reconnect...\n", op, attempt, uploadMaxAttempts, err)
+	}
+	return lastErr
 }
 
 // FloodWaitMiddleware automatically catches FLOOD_WAIT errors, sleeps for the required duration, and retries the RPC call.
@@ -308,6 +396,8 @@ type MTProtoAudioResult struct {
 }
 
 // UploadAndSendAudio uploads an audio file with metadata and thumbnail via MTProto.
+// It rides out reconnects: a connection teardown mid-upload is retried on a fresh
+// client before the caller falls back to Gofile.
 func (m *MTProtoClient) UploadAndSendAudio(
 	chatID int64,
 	filePath string,
@@ -320,11 +410,25 @@ func (m *MTProtoClient) UploadAndSendAudio(
 	status *DownloadStatus,
 	ctx context.Context,
 ) error {
-	api, _, ready := m.snapshot()
-	if !ready || api == nil {
-		return fmt.Errorf("MTProto client not ready")
-	}
+	return m.withUploadRetry(ctx, "audio upload", func(api *tg.Client) error {
+		return m.uploadAndSendAudioOnce(api, chatID, filePath, title, performer, durationSecs, caption, thumbPath, replyToID, status, ctx)
+	})
+}
 
+// uploadAndSendAudioOnce performs a single audio upload+send attempt against api.
+func (m *MTProtoClient) uploadAndSendAudioOnce(
+	api *tg.Client,
+	chatID int64,
+	filePath string,
+	title string,
+	performer string,
+	durationSecs int,
+	caption string,
+	thumbPath string,
+	replyToID int,
+	status *DownloadStatus,
+	ctx context.Context,
+) error {
 	u := uploader.NewUploader(api).WithPartSize(512 * 1024).WithThreads(8)
 	if status != nil {
 		u = u.WithProgress(&UploadProgress{status: status, phase: "Uploading"})
@@ -422,6 +526,8 @@ type AudioGroupItem struct {
 }
 
 // UploadAndSendAudioGroup uploads and sends a group of audio files as a media group/album via MTProto.
+// A connection teardown mid-upload is retried on a fresh client before the caller falls back.
+// Each attempt re-registers all media and sends once at the end, so retrying cannot double-post.
 func (m *MTProtoClient) UploadAndSendAudioGroup(
 	chatID int64,
 	items []AudioGroupItem,
@@ -429,11 +535,20 @@ func (m *MTProtoClient) UploadAndSendAudioGroup(
 	status *DownloadStatus,
 	ctx context.Context,
 ) error {
-	api, _, ready := m.snapshot()
-	if !ready || api == nil {
-		return fmt.Errorf("MTProto client not ready")
-	}
+	return m.withUploadRetry(ctx, "audio group upload", func(api *tg.Client) error {
+		return m.uploadAndSendAudioGroupOnce(api, chatID, items, replyToID, status, ctx)
+	})
+}
 
+// uploadAndSendAudioGroupOnce performs a single media-group upload+send attempt against api.
+func (m *MTProtoClient) uploadAndSendAudioGroupOnce(
+	api *tg.Client,
+	chatID int64,
+	items []AudioGroupItem,
+	replyToID int,
+	status *DownloadStatus,
+	ctx context.Context,
+) error {
 	// Resolve peer
 	peer, err := m.resolveInputPeer(ctx, chatID)
 	if err != nil {
@@ -549,6 +664,7 @@ func (m *MTProtoClient) UploadAndSendAudioGroup(
 }
 
 // UploadAndSendDocument uploads a file as a document (e.g., ZIP) via MTProto.
+// A connection teardown mid-upload is retried on a fresh client before the caller falls back.
 func (m *MTProtoClient) UploadAndSendDocument(
 	chatID int64,
 	filePath string,
@@ -558,11 +674,22 @@ func (m *MTProtoClient) UploadAndSendDocument(
 	status *DownloadStatus,
 	ctx context.Context,
 ) error {
-	api, _, ready := m.snapshot()
-	if !ready || api == nil {
-		return fmt.Errorf("MTProto client not ready")
-	}
+	return m.withUploadRetry(ctx, "document upload", func(api *tg.Client) error {
+		return m.uploadAndSendDocumentOnce(api, chatID, filePath, displayName, caption, replyToID, status, ctx)
+	})
+}
 
+// uploadAndSendDocumentOnce performs a single document upload+send attempt against api.
+func (m *MTProtoClient) uploadAndSendDocumentOnce(
+	api *tg.Client,
+	chatID int64,
+	filePath string,
+	displayName string,
+	caption string,
+	replyToID int,
+	status *DownloadStatus,
+	ctx context.Context,
+) error {
 	u := uploader.NewUploader(api).WithPartSize(512 * 1024).WithThreads(8)
 	if status != nil {
 		u = u.WithProgress(&UploadProgress{status: status, phase: "Uploading"})
