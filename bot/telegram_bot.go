@@ -2742,6 +2742,20 @@ func (b *TelegramBot) replaceIdleStatusBoard(chatID int64, replyToID int, text s
 	b.queueMu.Unlock()
 }
 
+// progressSample is one (time, bytesDone) point in the rolling speed window.
+type progressSample struct {
+	at   time.Time
+	done int64
+}
+
+// speedWindow is how far back the live speed/ETA readout looks. Computing speed
+// over a trailing window (rather than cumulative bytes ÷ phase-elapsed) gives a
+// responsive "current rate" that reacts within a few seconds and reads on the
+// same basis for a 7 MB audio file and a 300 MB video. Samples are recorded
+// in-memory on every progress callback; this does NOT change how often the board
+// is edited (still throttled to ≥3s in flush), so it adds zero FloodWait risk.
+const speedWindow = 6 * time.Second
+
 type DownloadStatus struct {
 	bot            *TelegramBot
 	chatID         int64
@@ -2764,6 +2778,7 @@ type DownloadStatus struct {
 	stopOnce       sync.Once
 	userID         int64
 	username       string
+	speedSamples   []progressSample
 }
 
 func newDownloadStatus(bot *TelegramBot, chatID int64, replyToID int, existingMsgID int, req *downloadRequest) (*DownloadStatus, error) {
@@ -2890,15 +2905,60 @@ func (s *DownloadStatus) setLatestLocked(phase string, done, total int64) {
 	if normalizedPhase == "" {
 		normalizedPhase = "Working"
 	}
-	if normalizedPhase != s.latestPhase {
-		s.phaseStartedAt = time.Now()
+	now := time.Now()
+	phaseChanged := normalizedPhase != s.latestPhase
+	if phaseChanged {
+		s.phaseStartedAt = now
 	} else if s.phaseStartedAt.IsZero() {
-		s.phaseStartedAt = time.Now()
+		s.phaseStartedAt = now
 	}
+	// Maintain a short rolling window of (time, bytes) samples for a live speed
+	// readout. Reset it whenever the phase changes or the byte counter rewinds
+	// (the per-file audio group reports each file starting from 0), so we never
+	// compute a delta across a discontinuity.
+	if phaseChanged || done < s.latestDone {
+		s.speedSamples = s.speedSamples[:0]
+	}
+	s.speedSamples = append(s.speedSamples, progressSample{at: now, done: done})
+	s.speedSamples = pruneSpeedSamples(s.speedSamples, now)
+
 	s.latestPhase = normalizedPhase
 	s.latestDone = done
 	s.latestTotal = total
 	s.dirty = true
+}
+
+// pruneSpeedSamples drops samples older than speedWindow. The caller always appends
+// a now-stamped sample before pruning, so the result is never empty.
+func pruneSpeedSamples(samples []progressSample, now time.Time) []progressSample {
+	cutoff := now.Add(-speedWindow)
+	n := 0
+	for _, smp := range samples {
+		if !smp.at.Before(cutoff) {
+			samples[n] = smp
+			n++
+		}
+	}
+	return samples[:n]
+}
+
+// rollingSpeedBytesPerSec returns the upload/processing rate over the trailing
+// speedWindow, or 0 when there isn't enough spread to measure. It takes its own
+// lock and must be called WITHOUT s.mu held (flush/RenderSnapshot release it first).
+func (s *DownloadStatus) rollingSpeedBytesPerSec() float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.speedSamples) < 2 {
+		return 0
+	}
+	first := s.speedSamples[0]
+	last := s.speedSamples[len(s.speedSamples)-1]
+	dt := last.at.Sub(first.at).Seconds()
+	db := last.done - first.done
+	if dt <= 0 || db <= 0 {
+		return 0
+	}
+	return float64(db) / dt
 }
 
 func (s *DownloadStatus) loop() {
@@ -3014,22 +3074,17 @@ func (s *DownloadStatus) formatProgressText(phase string, done, total int64, per
 	header := fmt.Sprintf("📥 Task ID: %s%s\n╭ Status: %s", s.taskID, userIdent, phase)
 	modeName := formatUploadMode(s.mode)
 
-	// Phase elapsed time for speed / ETA
-	phaseElapsed := time.Duration(0)
-	if !s.phaseStartedAt.IsZero() {
-		phaseElapsed = time.Since(s.phaseStartedAt)
-	}
-
 	// Total elapsed time since the task started
 	totalElapsedStr := "-"
 	if !s.startedAt.IsZero() {
 		totalElapsedStr = formatDuration(time.Since(s.startedAt))
 	}
 
+	// Live rate over the trailing speedWindow — a current-speed readout that reacts
+	// within a few seconds, rather than a cumulative average smeared over the phase.
 	speedStr := "-"
 	etaStr := "-"
-	if phaseElapsed >= 1*time.Second && done > 0 {
-		speedBytesPerSec := float64(done) / phaseElapsed.Seconds()
+	if speedBytesPerSec := s.rollingSpeedBytesPerSec(); speedBytesPerSec > 0 {
 		speedStr = fmt.Sprintf("%s/s", formatBytes(int64(speedBytesPerSec)))
 		if total > done {
 			etaSecs := float64(total-done) / speedBytesPerSec

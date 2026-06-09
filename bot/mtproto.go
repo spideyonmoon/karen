@@ -70,6 +70,16 @@ const (
 	uploadReadyWait   = 45 * time.Second
 )
 
+// uploadPartSize is Telegram's maximum upload part size (512 KB) — cannot go higher.
+// uploadThreads is how many parts gotd keeps in flight concurrently over the single
+// DC connection. On a high-bandwidth, high-latency path (e.g. NZ→Telegram DC, ~150-280ms
+// RTT) the throughput ceiling is roughly (uploadThreads × uploadPartSize) ÷ RTT, so 8
+// threads (4 MB in flight) starves a fat pipe. 16 keeps ~8 MB in flight to fill it.
+const (
+	uploadPartSize = 512 * 1024
+	uploadThreads  = 16
+)
+
 // awaitReady blocks until the supervisor has a live, authenticated client again and
 // returns the fresh api. It returns (nil, false) if the caller's ctx ends, the client
 // is shutting down, or the wait times out — letting an upload ride out a reconnect
@@ -429,7 +439,7 @@ func (m *MTProtoClient) uploadAndSendAudioOnce(
 	status *DownloadStatus,
 	ctx context.Context,
 ) error {
-	u := uploader.NewUploader(api).WithPartSize(512 * 1024).WithThreads(8)
+	u := uploader.NewUploader(api).WithPartSize(uploadPartSize).WithThreads(uploadThreads)
 	if status != nil {
 		u = u.WithProgress(&UploadProgress{status: status, phase: "Uploading"})
 	}
@@ -446,7 +456,7 @@ func (m *MTProtoClient) uploadAndSendAudioOnce(
 	// Upload thumbnail if available
 	var thumb tg.InputFileClass
 	if thumbPath != "" {
-		thumbUploader := uploader.NewUploader(api).WithPartSize(512 * 1024)
+		thumbUploader := uploader.NewUploader(api).WithPartSize(uploadPartSize)
 		thumbFile, err := thumbUploader.FromPath(ctx, thumbPath)
 		if err != nil {
 			fmt.Printf("Warning: failed to upload thumbnail: %v\n", err)
@@ -555,7 +565,7 @@ func (m *MTProtoClient) uploadAndSendAudioGroupOnce(
 		return fmt.Errorf("failed to resolve peer for chat %d: %w", chatID, err)
 	}
 
-	u := uploader.NewUploader(api).WithPartSize(512 * 1024).WithThreads(8)
+	u := uploader.NewUploader(api).WithPartSize(uploadPartSize).WithThreads(uploadThreads)
 
 	var multiMedia []tg.InputSingleMedia
 
@@ -577,7 +587,7 @@ func (m *MTProtoClient) uploadAndSendAudioGroupOnce(
 		// Upload thumbnail if available
 		var thumb tg.InputFileClass
 		if item.ThumbPath != "" {
-			thumbUploader := uploader.NewUploader(api).WithPartSize(512 * 1024)
+			thumbUploader := uploader.NewUploader(api).WithPartSize(uploadPartSize)
 			thumbFile, err := thumbUploader.FromPath(ctx, item.ThumbPath)
 			if err != nil {
 				fmt.Printf("Warning: failed to upload thumbnail: %v\n", err)
@@ -690,7 +700,7 @@ func (m *MTProtoClient) uploadAndSendDocumentOnce(
 	status *DownloadStatus,
 	ctx context.Context,
 ) error {
-	u := uploader.NewUploader(api).WithPartSize(512 * 1024).WithThreads(8)
+	u := uploader.NewUploader(api).WithPartSize(uploadPartSize).WithThreads(uploadThreads)
 	if status != nil {
 		u = u.WithProgress(&UploadProgress{status: status, phase: "Uploading"})
 	}
@@ -778,7 +788,7 @@ func (m *MTProtoClient) uploadAndSendVideoOnce(
 	status *DownloadStatus,
 	ctx context.Context,
 ) error {
-	u := uploader.NewUploader(api).WithPartSize(512 * 1024).WithThreads(8)
+	u := uploader.NewUploader(api).WithPartSize(uploadPartSize).WithThreads(uploadThreads)
 	if status != nil {
 		u = u.WithProgress(&UploadProgress{status: status, phase: "Uploading"})
 	}
@@ -794,7 +804,7 @@ func (m *MTProtoClient) uploadAndSendVideoOnce(
 	// Upload thumbnail if available
 	var thumb tg.InputFileClass
 	if thumbPath != "" {
-		thumbUploader := uploader.NewUploader(api).WithPartSize(512 * 1024)
+		thumbUploader := uploader.NewUploader(api).WithPartSize(uploadPartSize)
 		thumbFile, terr := thumbUploader.FromPath(ctx, thumbPath)
 		if terr != nil {
 			fmt.Printf("Warning: failed to upload video thumbnail: %v\n", terr)
