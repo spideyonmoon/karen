@@ -1889,9 +1889,12 @@ func mvDownloader(ctx context.Context, adamID string, saveDir string, token stri
 		return nil
 	}
 
-	mvm3u8url, _, _, _ := runv3.GetWebplayback(adamID, token, mediaUserToken, true)
+	mvm3u8url, _, _, mvErr := runv3.GetWebplayback(adamID, token, mediaUserToken, true)
+	if mvErr != nil {
+		return fmt.Errorf("MV playback lookup failed: %w", mvErr)
+	}
 	if mvm3u8url == "" {
-		return errors.New("media-user-token may wrong or expired")
+		return errors.New("media-user-token may be wrong or expired")
 	}
 
 	os.MkdirAll(saveDir, os.ModePerm)

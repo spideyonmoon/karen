@@ -151,7 +151,10 @@ func GetWebplayback(adamId string, authtoken string, mutoken string, mvmode bool
 		return "", "", "", err
 	}
 	defer resp.Body.Close()
-	//fmt.Println("Response Status:", resp.Status)
+	if resp.StatusCode != http.StatusOK {
+		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
+		return "", "", "", fmt.Errorf("webPlayback HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(snippet)))
+	}
 	obj := new(Songlist)
 	err = json.NewDecoder(resp.Body).Decode(&obj)
 	if err != nil {
@@ -160,6 +163,9 @@ func GetWebplayback(adamId string, authtoken string, mutoken string, mvmode bool
 	}
 	if len(obj.List) > 0 {
 		if mvmode {
+			if obj.List[0].HlsPlaylistUrl == "" {
+				return "", "", "", errors.New("webPlayback returned no hls-playlist-url for this music video (not available for download in this storefront/account)")
+			}
 			return obj.List[0].HlsPlaylistUrl, "", "", nil
 		}
 		// 遍历 Assets
