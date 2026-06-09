@@ -45,7 +45,8 @@ const (
 	transferModeTelegramIndividual = "tg_individual"
 	transferModeTelegramZip        = "tg_zip"
 	transferModeGofileZip          = "gofile_zip"
-	transferModeMv                 = "mv"
+	transferModeMv                 = "mv"        // music video → native Telegram video
+	transferModeMvGofile           = "mv_gofile" // music video → Gofile direct (no zip)
 	transferModeCancel             = "cancel"
 )
 
@@ -105,6 +106,8 @@ type PendingTransfer struct {
 	AlbumID          string
 	SongID           string
 	PlaylistID       string
+	MvID             string
+	MvStorefront     string
 	Single           bool
 	ForceAAC         bool
 	ForceAtmos       bool
@@ -1228,6 +1231,15 @@ func (b *TelegramBot) handleTransferMode(chatID int64, messageID int, mode strin
 	}
 	_ = b.editMessageText(chatID, messageID, statusText, nil)
 
+	if pending.MvID != "" {
+		mvMode := transferModeMv
+		if mode == transferModeGofileZip {
+			mvMode = transferModeMvGofile
+		}
+		b.enqueueMvDownload(chatID, userID, pending.MvStorefront, pending.MvID, replyToID, messageID, mvMode)
+		return
+	}
+
 	if pending.Single && pending.SongID != "" {
 		b.enqueueDownload(chatID, userID, username, replyToID, messageID, true, b.resolveFormat(chatID, pending.ForceFlac), mode, "", func(ctx context.Context) error {
 			return ripSong(pending.SongID, b.appleToken, Config.Storefront, Config.MediaUserToken, pending.ForceAAC, ctx)
@@ -1373,9 +1385,10 @@ func (b *TelegramBot) queueDownloadPlaylistWithReply(chatID int64, playlistID st
 	b.promptTransferMode(chatID, "", "", playlistID, replyToID, false, forceAAC, forceAtmos, forceFlac)
 }
 
-// queueDownloadMvWithReply downloads a single music video and delivers it as a video.
-// MVs are a single file, so there's no transfer-mode prompt — delivery is video, then
-// document, then Gofile (handled by deliverMusicVideo). Requires media-user-token + mp4decrypt.
+// queueDownloadMvWithReply validates the preconditions for a music-video rip
+// (media-user-token + mp4decrypt) and then prompts for the delivery target. The
+// userID param is unused here — the chosen mode arrives via the inline button
+// callback, which carries its own user — but is kept for call-site symmetry.
 func (b *TelegramBot) queueDownloadMvWithReply(chatID int64, storefront string, mvID string, replyToID int, userID int64) {
 	if mvID == "" {
 		_ = b.sendMessage(chatID, "Music video ID is empty.", nil)
@@ -1392,11 +1405,41 @@ func (b *TelegramBot) queueDownloadMvWithReply(chatID int64, storefront string, 
 	if storefront == "" {
 		storefront = Config.Storefront
 	}
+	// Like every other /dl command, ask where to deliver. A single video only has two
+	// sensible targets (native Telegram video vs Gofile), so the prompt omits ZIP.
+	b.promptMvTransferMode(chatID, storefront, mvID, replyToID)
+}
+
+// promptMvTransferMode shows the music-video delivery keyboard and stores the pending
+// MV selection; handleTransferMode picks it up on the button press.
+func (b *TelegramBot) promptMvTransferMode(chatID int64, storefront string, mvID string, replyToID int) {
+	messageID, err := b.sendMessageWithReplyReturn(chatID, "Choose transfer method:", buildMvTransferKeyboard(), replyToID)
+	if err != nil {
+		return
+	}
+	b.transferMu.Lock()
+	b.pendingTransfers[chatID] = &PendingTransfer{
+		MvID:             mvID,
+		MvStorefront:     storefront,
+		Single:           true,
+		ReplyToMessageID: replyToID,
+		MessageID:        messageID,
+		CreatedAt:        time.Now(),
+	}
+	b.transferMu.Unlock()
+}
+
+// enqueueMvDownload queues a music-video rip with the chosen delivery mode
+// (transferModeMv for native video, transferModeMvGofile for a direct Gofile link).
+func (b *TelegramBot) enqueueMvDownload(chatID int64, userID int64, storefront string, mvID string, replyToID int, statusMessageID int, transferMode string) {
+	if storefront == "" {
+		storefront = Config.Storefront
+	}
 	saveDir := Config.AlacSaveFolder
 	if saveDir == "" {
 		saveDir = "."
 	}
-	b.enqueueDownload(chatID, userID, "", replyToID, 0, true, "", transferModeMv, "", func(ctx context.Context) error {
+	b.enqueueDownload(chatID, userID, "", replyToID, statusMessageID, true, "", transferMode, "", func(ctx context.Context) error {
 		return mvDownloader(ctx, mvID, saveDir, b.appleToken, storefront, Config.MediaUserToken, nil)
 	})
 }
@@ -1666,6 +1709,8 @@ func (b *TelegramBot) runDownload(req *downloadRequest) {
 	switch transferMode {
 	case transferModeMv:
 		b.deliverMusicVideo(chatID, paths[0], replyToID, status, req.ctx)
+	case transferModeMvGofile:
+		b.deliverMvGofile(chatID, paths[0], replyToID, status, req.ctx)
 	case transferModeTelegramIndividual:
 		b.deliverTelegramIndividual(chatID, paths, replyToID, format, status, req.ctx)
 	case transferModeTelegramZip:
@@ -2111,6 +2156,26 @@ func (b *TelegramBot) deliverMusicVideo(chatID int64, path string, replyToID int
 	}
 
 	// Gofile fallback.
+	if ctx != nil && ctx.Err() != nil {
+		status.UpdateSync("Cancelled", 0, 0)
+		return
+	}
+	status.UpdateSync("Uploading to Gofile...", 0, 0)
+	link, err := apputils.UploadToGofile(ctx, path, Config.GofileToken)
+	if err != nil {
+		b.reportDeliveryFailure(chatID, replyToID, status, err)
+		return
+	}
+	msg := fmt.Sprintf("File: %s\nDownload Link: %s", filepath.Base(path), link)
+	_ = b.sendMessageWithReply(chatID, msg, nil, replyToID)
+	status.Stop()
+	_ = b.deleteMessage(chatID, status.messageID)
+}
+
+// deliverMvGofile uploads a single music video straight to Gofile — no Telegram attempt,
+// no zip — used when the user explicitly picks Gofile at the prompt. The status board is
+// always resolved to a terminal state.
+func (b *TelegramBot) deliverMvGofile(chatID int64, path string, replyToID int, status *DownloadStatus, ctx context.Context) {
 	if ctx != nil && ctx.Err() != nil {
 		status.UpdateSync("Cancelled", 0, 0)
 		return
@@ -3041,6 +3106,10 @@ func formatUploadMode(mode string) string {
 		return "Telegram (ZIP)"
 	case transferModeGofileZip:
 		return "Gofile"
+	case transferModeMv:
+		return "Music video (Telegram)"
+	case transferModeMvGofile:
+		return "Music video (Gofile)"
 	default:
 		return mode
 	}
@@ -4082,6 +4151,24 @@ func buildTransferKeyboard(mtprotoReady bool) InlineKeyboardMarkup {
 			row1,
 			{
 				{Text: "📁 Gofile (ZIP)", CallbackData: "transfer:gofile_zip"},
+			},
+			{
+				{Text: "❌ Cancel", CallbackData: "transfer:cancel"},
+			},
+		},
+	}
+}
+
+// buildMvTransferKeyboard offers the two delivery targets that make sense for a single
+// music video: a native Telegram video (with document/Gofile fallback) or a direct Gofile
+// link. ZIP is omitted — there's nothing to bundle. Reuses the standard transfer callbacks
+// so the existing dispatcher routes them to handleTransferMode.
+func buildMvTransferKeyboard() InlineKeyboardMarkup {
+	return InlineKeyboardMarkup{
+		InlineKeyboard: [][]InlineKeyboardButton{
+			{
+				{Text: "🎬 Telegram", CallbackData: "transfer:tg_individual"},
+				{Text: "📁 Gofile", CallbackData: "transfer:gofile_zip"},
 			},
 			{
 				{Text: "❌ Cancel", CallbackData: "transfer:cancel"},
