@@ -43,8 +43,8 @@ apple-master-choice : "[M]"
 use-songinfo-for-playlist: false
 #if set true,will download album cover for playlist
 dl-albumcover-for-playlist: false
-mv-audio-type: atmos  #atmos ac3 aac
-mv-max: 2160
+mv-audio-type: aac  #atmos ac3 aac — aac stereo plays inline in Telegram's video player
+mv-max: 1080
 # storefront will be used only in searching. 
 # storefront is the 2-letter country code that are available in the urls (jp, ca, us etc.).
 # if your account is from Japan, you must use jp.

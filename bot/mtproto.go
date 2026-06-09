@@ -744,6 +744,118 @@ func (m *MTProtoClient) uploadAndSendDocumentOnce(
 	return nil
 }
 
+// UploadAndSendVideo uploads a video file as a streamable Telegram video (inline player +
+// thumbnail) via MTProto. A connection teardown mid-upload is retried on a fresh client
+// before the caller falls back to a document/Gofile.
+func (m *MTProtoClient) UploadAndSendVideo(
+	chatID int64,
+	filePath string,
+	caption string,
+	durationSecs int,
+	width int,
+	height int,
+	thumbPath string,
+	replyToID int,
+	status *DownloadStatus,
+	ctx context.Context,
+) error {
+	return m.withUploadRetry(ctx, "video upload", func(api *tg.Client) error {
+		return m.uploadAndSendVideoOnce(api, chatID, filePath, caption, durationSecs, width, height, thumbPath, replyToID, status, ctx)
+	})
+}
+
+// uploadAndSendVideoOnce performs a single video upload+send attempt against api.
+func (m *MTProtoClient) uploadAndSendVideoOnce(
+	api *tg.Client,
+	chatID int64,
+	filePath string,
+	caption string,
+	durationSecs int,
+	width int,
+	height int,
+	thumbPath string,
+	replyToID int,
+	status *DownloadStatus,
+	ctx context.Context,
+) error {
+	u := uploader.NewUploader(api).WithPartSize(512 * 1024).WithThreads(8)
+	if status != nil {
+		u = u.WithProgress(&UploadProgress{status: status, phase: "Uploading"})
+	}
+
+	if status != nil {
+		status.Update("Uploading", 0, 0)
+	}
+	videoFile, err := u.FromPath(ctx, filePath)
+	if err != nil {
+		return fmt.Errorf("failed to upload video via MTProto: %w", err)
+	}
+
+	// Upload thumbnail if available
+	var thumb tg.InputFileClass
+	if thumbPath != "" {
+		thumbUploader := uploader.NewUploader(api).WithPartSize(512 * 1024)
+		thumbFile, terr := thumbUploader.FromPath(ctx, thumbPath)
+		if terr != nil {
+			fmt.Printf("Warning: failed to upload video thumbnail: %v\n", terr)
+		} else {
+			thumb = thumbFile
+		}
+	}
+
+	attrs := []tg.DocumentAttributeClass{
+		&tg.DocumentAttributeVideo{
+			SupportsStreaming: true,
+			Duration:          float64(durationSecs),
+			W:                 width,
+			H:                 height,
+		},
+		&tg.DocumentAttributeFilename{
+			FileName: filepath.Base(filePath),
+		},
+	}
+
+	media := &tg.InputMediaUploadedDocument{
+		File:       videoFile,
+		MimeType:   "video/mp4",
+		Attributes: attrs,
+	}
+	if thumb != nil {
+		media.Thumb = thumb
+		media.Flags.Set(2) // bit 2 = thumb flag in InputMediaUploadedDocument
+	}
+
+	peer, err := m.resolveInputPeer(ctx, chatID)
+	if err != nil {
+		return fmt.Errorf("failed to resolve peer for chat %d: %w", chatID, err)
+	}
+
+	req := &tg.MessagesSendMediaRequest{
+		Peer:     peer,
+		Media:    media,
+		Message:  caption,
+		RandomID: cryptoRandID(),
+	}
+	if replyToID > 0 {
+		req.ReplyTo = &tg.InputReplyToMessage{
+			ReplyToMsgID: replyToID,
+		}
+		req.SetFlags()
+	}
+
+	_, err = api.MessagesSendMedia(ctx, req)
+	if waited, _ := tgerr.FloodWait(ctx, err); waited {
+		fmt.Println("FLOOD_WAIT for video, retrying...")
+		req.RandomID = cryptoRandID()
+		_, err = api.MessagesSendMedia(ctx, req)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to send video via MTProto: %w", err)
+	}
+
+	return nil
+}
+
 // mimeForAudioExt returns the MIME type for common audio file extensions.
 func mimeForAudioExt(ext string) string {
 	switch strings.ToLower(ext) {

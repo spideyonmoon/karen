@@ -89,6 +89,13 @@ func loadConfig() error {
 	if len(Config.Storefront) != 2 {
 		Config.Storefront = "us"
 	}
+	// MV defaults tuned for Telegram inline playback when unset in config.
+	if Config.MVMax <= 0 {
+		Config.MVMax = 1080
+	}
+	if Config.MVAudioType == "" {
+		Config.MVAudioType = "aac"
+	}
 	return nil
 }
 
@@ -1970,6 +1977,25 @@ func mvDownloader(ctx context.Context, adamID string, saveDir string, token stri
 		return err
 	}
 	fmt.Printf("\rMV Remuxed.   \n")
+
+	// Register the muxed MV so the Telegram delivery layer can find it the same way
+	// it finds audio tracks (recordDownloadedTrack). Harmless for the CLI path.
+	lastDownloadedPaths = append(lastDownloadedPaths, mvOutPath)
+	mvMeta := AudioMeta{
+		TrackID:        strings.TrimSpace(adamID),
+		Title:          strings.TrimSpace(MVInfo.Data[0].Attributes.Name),
+		Performer:      strings.TrimSpace(MVInfo.Data[0].Attributes.ArtistName),
+		DurationMillis: int64(MVInfo.Data[0].Attributes.DurationInMillis),
+		AlbumName:      strings.TrimSpace(MVInfo.Data[0].Attributes.AlbumName),
+		ReleaseDate:    strings.TrimSpace(MVInfo.Data[0].Attributes.ReleaseDate),
+		ContentRating:  strings.TrimSpace(MVInfo.Data[0].Attributes.ContentRating),
+		Codec:          "MV",
+	}
+	if mvMeta.Title != "" || mvMeta.Performer != "" {
+		downloadedMetaMu.Lock()
+		downloadedMeta[mvOutPath] = mvMeta
+		downloadedMetaMu.Unlock()
+	}
 	return nil
 }
 
