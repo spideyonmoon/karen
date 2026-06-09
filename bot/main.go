@@ -1065,6 +1065,118 @@ func ripStation(albumId string, token string, storefront string, mediaUserToken 
 	return nil
 }
 
+// firstNonEmpty returns the first non-empty string from vals, or "".
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// ripArtwork downloads only the cover image and, when available, the animated
+// (motion) artwork for an album, playlist, or station — no tracks. A song URL
+// resolves to its parent album's artwork (checkUrl matches both). Output paths are
+// appended to lastDownloadedPaths so the Telegram layer delivers the cover as a
+// photo and the motion artwork as a video. Unlike the per-track rips, this ignores
+// Config.SaveAnimatedArtwork — the user asked for artwork explicitly via -art.
+func ripArtwork(link string, token string, storefront string, mediaUserToken string, ctx context.Context) error {
+	var artworkURL, motionURL, name, idForDir string
+
+	if sf, id := checkUrlPlaylist(link); id != "" {
+		if sf != "" {
+			storefront = sf
+		}
+		pl := task.NewPlaylist(storefront, id)
+		if err := pl.GetResp(token, Config.Language); err != nil {
+			return err
+		}
+		if len(pl.Resp.Data) == 0 {
+			return errors.New("playlist not found")
+		}
+		a := pl.Resp.Data[0].Attributes
+		artworkURL = a.Artwork.URL
+		motionURL = firstNonEmpty(a.EditorialVideo.MotionDetailSquare.Video, a.EditorialVideo.MotionSquare.Video, a.EditorialVideo.MotionDetailTall.Video, a.EditorialVideo.MotionTall.Video)
+		name = a.Name
+		idForDir = id
+	} else if sf, id := checkUrlStation(link); id != "" {
+		if sf != "" {
+			storefront = sf
+		}
+		st := task.NewStation(storefront, id)
+		if err := st.GetResp(mediaUserToken, token, Config.Language); err != nil {
+			return err
+		}
+		if len(st.Resp.Data) == 0 {
+			return errors.New("station not found")
+		}
+		a := st.Resp.Data[0].Attributes
+		artworkURL = a.Artwork.URL
+		motionURL = firstNonEmpty(a.EditorialVideo.MotionSquare.Video, a.EditorialVideo.MotionDetailSquare.Video)
+		name = st.Name
+		idForDir = id
+	} else if sf, id := checkUrl(link); id != "" {
+		if sf != "" {
+			storefront = sf
+		}
+		al := task.NewAlbum(storefront, id)
+		if err := al.GetResp(token, Config.Language); err != nil {
+			return err
+		}
+		if len(al.Resp.Data) == 0 {
+			return errors.New("album not found")
+		}
+		a := al.Resp.Data[0].Attributes
+		artworkURL = a.Artwork.URL
+		motionURL = firstNonEmpty(a.EditorialVideo.MotionDetailSquare.Video, a.EditorialVideo.MotionSquare.Video, a.EditorialVideo.MotionDetailTall.Video, a.EditorialVideo.MotionTall.Video)
+		name = a.Name
+		idForDir = id
+	} else {
+		return errors.New("unsupported link for artwork (use an album, playlist, or station link)")
+	}
+
+	if artworkURL == "" {
+		return errors.New("no artwork available for this item")
+	}
+
+	// Dedicated output dir keyed by ID so cover.jpg never collides with a real download.
+	baseDir := Config.AlacSaveFolder
+	if baseDir == "" {
+		baseDir = "."
+	}
+	outDir := filepath.Join(baseDir, "artwork", forbiddenNames.ReplaceAllString(idForDir, "_"))
+	if err := os.MkdirAll(outDir, os.ModePerm); err != nil {
+		return err
+	}
+
+	coverName := "cover"
+	if name != "" {
+		coverName = forbiddenNames.ReplaceAllString(LimitString(name), "_")
+	}
+	coverPath, err := writeCover(outDir, coverName, artworkURL)
+	if err != nil {
+		return fmt.Errorf("failed to download cover: %w", err)
+	}
+	lastDownloadedPaths = append(lastDownloadedPaths, coverPath)
+
+	// Motion artwork is best-effort; its absence (or a muxing failure) is not fatal.
+	if motionURL != "" {
+		if hlsURL, err := extractVideo(motionURL); err != nil {
+			fmt.Println("animated artwork unavailable:", err)
+		} else {
+			motionPath := filepath.Join(outDir, coverName+"_animated.mp4")
+			cmd := exec.CommandContext(ctx, "ffmpeg", "-loglevel", "quiet", "-y", "-i", hlsURL, "-c", "copy", motionPath)
+			if err := cmd.Run(); err != nil {
+				fmt.Printf("animated artwork download failed: %v\n", err)
+			} else {
+				lastDownloadedPaths = append(lastDownloadedPaths, motionPath)
+			}
+		}
+	}
+	return nil
+}
+
 func ripAlbum(albumId string, token string, storefront string, mediaUserToken string, urlArg_i string, forceAAC bool, ctx context.Context) error {
 	album := task.NewAlbum(storefront, albumId)
 	err := album.GetResp(token, Config.Language)
