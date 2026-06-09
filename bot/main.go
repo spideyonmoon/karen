@@ -889,6 +889,13 @@ func ripStation(albumId string, token string, storefront string, mediaUserToken 
 	fmt.Println(" -", station.Type)
 	meta := station.Resp
 
+	// Live radio (e.g. Apple Music 1) is a continuous broadcast with no finite asset —
+	// the stream path would chase a VOD index that doesn't exist and die with a cryptic
+	// subprocess error. Bail out early with a message the user can actually act on.
+	if len(meta.Data) > 0 && meta.Data[0].Attributes.IsLive {
+		return errors.New("this is a live radio station (continuous broadcast) — it can't be downloaded as a file")
+	}
+
 	var Codec string
 	if dl_atmos {
 		Codec = "ATMOS"
