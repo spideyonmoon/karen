@@ -62,12 +62,17 @@ func (m *MTProtoClient) snapshot() (*tg.Client, context.Context, bool) {
 	return m.api, m.runCtx, m.ready
 }
 
-// uploadMaxAttempts bounds how many times an upload is retried across reconnects
-// before the caller falls back to Gofile. uploadReadyWait bounds how long each
-// attempt waits for the supervisor to bring the connection back.
+// uploadMaxAttempts bounds how many times a non-resumable upload (single audio/doc/
+// video) is retried across reconnects before the caller falls back to Gofile — each
+// retry restarts from byte zero, so it stays small. groupUploadMaxAttempts is larger
+// because the group upload resumes (see UploadAndSendAudioGroup): a retry re-sends only
+// the items that haven't registered yet, so the budget counts tolerated reconnects, not
+// full re-uploads. uploadReadyWait bounds how long each attempt waits for the supervisor
+// to bring the connection back.
 const (
-	uploadMaxAttempts = 3
-	uploadReadyWait   = 45 * time.Second
+	uploadMaxAttempts      = 3
+	groupUploadMaxAttempts = 10
+	uploadReadyWait        = 45 * time.Second
 )
 
 // uploadPartSize is Telegram's maximum upload part size (512 KB) — cannot go higher.
@@ -133,8 +138,15 @@ func isTransientConnErr(err error) bool {
 // fall back to Gofile. fn must be safe to re-run: it should not post a Telegram message
 // until its uploads succeed (all callers register media first and send once at the end).
 func (m *MTProtoClient) withUploadRetry(ctx context.Context, op string, fn func(api *tg.Client) error) error {
+	return m.withUploadRetryN(ctx, op, uploadMaxAttempts, fn)
+}
+
+// withUploadRetryN is withUploadRetry with an explicit attempt budget. Resumable uploads
+// (the audio group) pass a larger budget because each retry only re-sends what hasn't
+// already succeeded, so a higher cap costs reconnect-waits rather than re-uploaded bytes.
+func (m *MTProtoClient) withUploadRetryN(ctx context.Context, op string, maxAttempts int, fn func(api *tg.Client) error) error {
 	var lastErr error
-	for attempt := 1; attempt <= uploadMaxAttempts; attempt++ {
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		api, ok := m.awaitReady(ctx, uploadReadyWait)
 		if !ok {
 			if ctx.Err() != nil {
@@ -154,7 +166,7 @@ func (m *MTProtoClient) withUploadRetry(ctx context.Context, op string, fn func(
 			return err
 		}
 		lastErr = err
-		fmt.Printf("MTProto %s hit transient connection error (attempt %d/%d): %v; waiting for reconnect...\n", op, attempt, uploadMaxAttempts, err)
+		fmt.Printf("MTProto %s hit transient connection error (attempt %d/%d): %v; waiting for reconnect...\n", op, attempt, maxAttempts, err)
 	}
 	return lastErr
 }
@@ -536,8 +548,9 @@ type AudioGroupItem struct {
 }
 
 // UploadAndSendAudioGroup uploads and sends a group of audio files as a media group/album via MTProto.
-// A connection teardown mid-upload is retried on a fresh client before the caller falls back.
-// Each attempt re-registers all media and sends once at the end, so retrying cannot double-post.
+// A connection teardown mid-upload is retried on a fresh client before the caller falls back. Retries
+// resume from the first unregistered item and re-send with the same per-item RandomIDs, so neither the
+// upload nor the final send is repeated wholesale or double-posted.
 func (m *MTProtoClient) UploadAndSendAudioGroup(
 	chatID int64,
 	items []AudioGroupItem,
@@ -545,8 +558,16 @@ func (m *MTProtoClient) UploadAndSendAudioGroup(
 	status *DownloadStatus,
 	ctx context.Context,
 ) error {
-	return m.withUploadRetry(ctx, "audio group upload", func(api *tg.Client) error {
-		return m.uploadAndSendAudioGroupOnce(api, chatID, items, replyToID, status, ctx)
+	// registered[i] holds item i's Telegram document reference once it has been uploaded
+	// and registered via MessagesUploadMedia. It persists across retry attempts so a
+	// reconnect mid-group resumes from the first unregistered item instead of re-uploading
+	// (and re-flooding) the whole album — re-uploading everything on every reconnect is
+	// what turned a transient FLOOD_WAIT into a full Gofile cascade. Document refs are
+	// account-level and survive reconnects, and the cached InputSingleMedia keeps its
+	// RandomID, so a re-sent MessagesSendMultiMedia is idempotent (Telegram dedups).
+	registered := make([]*tg.InputSingleMedia, len(items))
+	return m.withUploadRetryN(ctx, "audio group upload", groupUploadMaxAttempts, func(api *tg.Client) error {
+		return m.uploadAndSendAudioGroupOnce(api, chatID, items, registered, replyToID, status, ctx)
 	})
 }
 
@@ -555,6 +576,7 @@ func (m *MTProtoClient) uploadAndSendAudioGroupOnce(
 	api *tg.Client,
 	chatID int64,
 	items []AudioGroupItem,
+	registered []*tg.InputSingleMedia,
 	replyToID int,
 	status *DownloadStatus,
 	ctx context.Context,
@@ -567,11 +589,15 @@ func (m *MTProtoClient) uploadAndSendAudioGroupOnce(
 
 	u := uploader.NewUploader(api).WithPartSize(uploadPartSize).WithThreads(uploadThreads)
 
-	var multiMedia []tg.InputSingleMedia
-
 	for i, item := range items {
 		if ctx != nil && ctx.Err() != nil {
 			return ctx.Err()
+		}
+
+		// Resume: skip items already uploaded+registered on an earlier attempt so a
+		// reconnect doesn't re-upload (and re-flood) what already succeeded.
+		if registered[i] != nil {
+			continue
 		}
 
 		if status != nil {
@@ -645,11 +671,21 @@ func (m *MTProtoClient) uploadAndSendAudioGroupOnce(
 			return fmt.Errorf("failed to extract document for item %d (%s) from UploadMedia response", i+1, filepath.Base(item.FilePath))
 		}
 
-		multiMedia = append(multiMedia, tg.InputSingleMedia{
+		registered[i] = &tg.InputSingleMedia{
 			Media:    inputMedia,
 			RandomID: cryptoRandID(),
 			Message:  item.Caption,
-		})
+		}
+	}
+
+	// Assemble the album in original order from the per-item cache, now fully populated
+	// (across however many attempts it took to register every item).
+	multiMedia := make([]tg.InputSingleMedia, len(items))
+	for i := range registered {
+		if registered[i] == nil {
+			return fmt.Errorf("internal: group item %d not registered before send", i+1)
+		}
+		multiMedia[i] = *registered[i]
 	}
 
 	// Build request
