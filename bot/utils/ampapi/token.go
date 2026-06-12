@@ -50,7 +50,7 @@ func GetToken() (string, error) {
 		return "", err
 	}
 
-	regex = regexp.MustCompile(`eyJh([^"'` + "`" + `]+)`)
+	regex = regexp.MustCompile(`eyJ([^"'` + "`" + `]+)`)
 	token := regex.FindString(string(body))
 	if token == "" {
 		return "", errors.New("GetToken: could not extract JWT from bundle " + indexJsUri)
