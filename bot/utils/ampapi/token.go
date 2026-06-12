@@ -2,7 +2,6 @@ package ampapi
 
 import (
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"regexp"
@@ -31,7 +30,7 @@ func GetToken() (string, error) {
 	if indexJsUri == "" {
 		return "", errors.New("GetToken: could not find index JS bundle URL in music.apple.com response")
 	}
-	fmt.Println("GetToken: found bundle", indexJsUri)
+
 
 	req, err = http.NewRequest("GET", "https://music.apple.com"+indexJsUri, nil)
 	if err != nil {
