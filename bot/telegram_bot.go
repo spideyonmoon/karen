@@ -1034,7 +1034,7 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args
 			return
 		}
 		if len(args) == 0 {
-			_ = b.sendMessageWithReply(chatID, "Usage: /dl <apple-music-link> [-aac|-atmos] [-flac] [-art]", nil, replyToID)
+			_ = b.sendMessageWithReply(chatID, "Usage: /dl <apple-music-link> [-aac|-atmos] [-flac] [-art] [-tgu|-tgz|-go]", nil, replyToID)
 			return
 		}
 
@@ -1042,6 +1042,7 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args
 		forceAtmos := false
 		forceFlac := false
 		forceArt := false
+		headlessMode := "" // -tgu / -tgz / -go: skip delivery keyboard
 		var link string
 		for _, arg := range args {
 			switch arg {
@@ -1053,6 +1054,12 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args
 				forceFlac = true
 			case "-art", "art":
 				forceArt = true
+			case "-tgu", "tgu":
+				headlessMode = transferModeTelegramIndividual
+			case "-tgz", "tgz":
+				headlessMode = transferModeTelegramZip
+			case "-go", "go":
+				headlessMode = transferModeGofileZip
 			default:
 				link = arg
 			}
@@ -1068,31 +1075,56 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args
 		// Music video URLs are distinct from song/album/playlist; check first.
 		mvStorefront, mvID := checkUrlMv(link)
 		if mvID != "" {
-			b.queueDownloadMvWithReply(chatID, mvStorefront, mvID, replyToID, userID)
+			if headlessMode != "" {
+				b.queueDownloadMvHeadless(chatID, userID, mvStorefront, mvID, replyToID, headlessMode)
+			} else {
+				b.queueDownloadMvWithReply(chatID, mvStorefront, mvID, replyToID, userID)
+			}
 			return
 		}
 
 		_, songID := checkUrlSong(link)
 		if songID != "" {
-			b.queueDownloadSongWithReply(chatID, songID, replyToID, forceAAC, forceAtmos, forceFlac)
+			if headlessMode != "" {
+				format := b.resolveFormat(chatID, forceFlac)
+				if !b.trySendCachedTrack(chatID, replyToID, songID, format) {
+					b.enqueueDownload(chatID, userID, "", replyToID, 0, true, format, headlessMode, "", func(ctx context.Context) error {
+						return ripSong(songID, b.appleToken, Config.Storefront, Config.MediaUserToken, forceAAC, ctx)
+					})
+				}
+			} else {
+				b.queueDownloadSongWithReply(chatID, songID, replyToID, forceAAC, forceAtmos, forceFlac)
+			}
 			return
 		}
 
 		_, albumID := checkUrl(link)
 		if albumID != "" {
-			b.queueDownloadAlbumWithReply(chatID, albumID, replyToID, forceAAC, forceAtmos, forceFlac)
+			if headlessMode != "" {
+				b.enqueueAlbumDownload(chatID, albumID, replyToID, 0, headlessMode, forceAAC, forceAtmos, forceFlac, userID, "")
+			} else {
+				b.queueDownloadAlbumWithReply(chatID, albumID, replyToID, forceAAC, forceAtmos, forceFlac)
+			}
 			return
 		}
 
 		_, playlistID := checkUrlPlaylist(link)
 		if playlistID != "" {
-			b.queueDownloadPlaylistWithReply(chatID, playlistID, replyToID, forceAAC, forceAtmos, forceFlac)
+			if headlessMode != "" {
+				b.enqueuePlaylistDownload(chatID, playlistID, replyToID, 0, headlessMode, forceAAC, forceAtmos, forceFlac, userID, "")
+			} else {
+				b.queueDownloadPlaylistWithReply(chatID, playlistID, replyToID, forceAAC, forceAtmos, forceFlac)
+			}
 			return
 		}
 
 		_, stationID := checkUrlStation(link)
 		if stationID != "" {
-			b.queueDownloadStationWithReply(chatID, stationID, replyToID, forceAAC, forceAtmos, forceFlac)
+			if headlessMode != "" {
+				b.enqueueStationDownload(chatID, stationID, replyToID, 0, headlessMode, forceAAC, forceAtmos, forceFlac, userID, "")
+			} else {
+				b.queueDownloadStationWithReply(chatID, stationID, replyToID, forceAAC, forceAtmos, forceFlac)
+			}
 			return
 		}
 
@@ -1438,6 +1470,31 @@ func (b *TelegramBot) queueDownloadMvWithReply(chatID int64, storefront string, 
 	b.promptMvTransferMode(chatID, storefront, mvID, replyToID)
 }
 
+// queueDownloadMvHeadless runs the same validation as queueDownloadMvWithReply but
+// skips the delivery keyboard and enqueues immediately with the supplied mode.
+func (b *TelegramBot) queueDownloadMvHeadless(chatID int64, userID int64, storefront string, mvID string, replyToID int, headlessMode string) {
+	if mvID == "" {
+		_ = b.sendMessage(chatID, "Music video ID is empty.", nil)
+		return
+	}
+	if len(Config.MediaUserToken) <= 50 {
+		_ = b.sendMessageWithReply(chatID, "Music videos require a valid media-user-token in config.yaml.", nil, replyToID)
+		return
+	}
+	if _, err := exec.LookPath("mp4decrypt"); err != nil {
+		_ = b.sendMessageWithReply(chatID, "Music video download is unavailable: mp4decrypt is not installed.", nil, replyToID)
+		return
+	}
+	if storefront == "" {
+		storefront = Config.Storefront
+	}
+	mvMode := transferModeMv
+	if headlessMode == transferModeGofileZip {
+		mvMode = transferModeMvGofile
+	}
+	b.enqueueMvDownload(chatID, userID, storefront, mvID, replyToID, 0, mvMode)
+}
+
 // promptMvTransferMode shows the music-video delivery keyboard and stores the pending
 // MV selection; handleTransferMode picks it up on the button press.
 func (b *TelegramBot) promptMvTransferMode(chatID int64, storefront string, mvID string, replyToID int) {
@@ -1768,6 +1825,16 @@ func (b *TelegramBot) runDownload(req *downloadRequest) {
 			return
 		}
 		status.UpdateSync("No files were downloaded.", 0, 0)
+		return
+	}
+
+	// Playlists with >40 tracks are automatically routed to Gofile regardless of the
+	// chosen delivery mode — sending 40+ individual uploads triggers FloodWait hard.
+	const largePlaylistThreshold = 40
+	if strings.HasPrefix(req.albumID, "pl.") && len(paths) > largePlaylistThreshold &&
+		transferMode != transferModeGofileZip && transferMode != transferModeMv && transferMode != transferModeMvGofile && transferMode != transferModeArt {
+		status.UpdateSync(fmt.Sprintf("Large playlist (%d tracks) — routing to Gofile.", len(paths)), 0, 0)
+		b.deliverGofileZip(chatID, paths, replyToID, single, status, req.ctx)
 		return
 	}
 
@@ -4406,7 +4473,7 @@ func (b *TelegramBot) cancelTask(chatID int64, taskID string, replyToID int) {
 func botHelpText() string {
 	return strings.TrimSpace(`
 Commands:
-/dl <apple-music-link> [-aac|-atmos]  download a song, album, or playlist
+/dl <apple-music-link> [-aac|-atmos] [-flac] [-art] [-tgu|-tgz|-go]  download a song, album, or playlist
 /status or /queue                     show active task and queue count
 /help                                 show this message
 
