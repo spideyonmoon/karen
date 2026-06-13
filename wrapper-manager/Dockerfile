@@ -4,6 +4,9 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y git ca-certificates && \
     git clone --depth 1 https://github.com/WorldObservationLog/wrapper-manager.git .
 
+# Patch: safe nil checks in WebPlayback handler (upstream crashes on certain responses)
+COPY webplay.go ./webplay.go
+
 RUN go env -w GO111MODULE=on
 RUN go mod tidy
 RUN GOOS=linux go build -o wrapper-manager
