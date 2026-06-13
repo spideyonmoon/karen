@@ -2,7 +2,6 @@ package structs
 
 type ConfigSet struct {
 	Storefront                 string  `yaml:"storefront"`
-	MediaUserToken             string  `yaml:"media-user-token"`
 	AuthorizationToken         string  `yaml:"authorization-token"`
 	Language                   string  `yaml:"language"`
 	SaveLrcFile                bool    `yaml:"save-lrc-file"`
@@ -26,10 +25,6 @@ type ConfigSet struct {
 	CleanChoice                string  `yaml:"clean-choice"`
 	AppleMasterChoice          string  `yaml:"apple-master-choice"`
 	MaxMemoryLimit             int     `yaml:"max-memory-limit"`
-	DecryptM3u8Port            string  `yaml:"decrypt-m3u8-port"`
-	GetM3u8Port                string  `yaml:"get-m3u8-port"`
-	GetM3u8Mode                string  `yaml:"get-m3u8-mode"`
-	GetM3u8FromDevice          bool    `yaml:"get-m3u8-from-device"`
 	AacType                    string  `yaml:"aac-type"`
 	AlacMax                    int     `yaml:"alac-max"`
 	AtmosMax                   int     `yaml:"atmos-max"`
@@ -60,6 +55,8 @@ type ConfigSet struct {
 	TelegramApiID                 int    `yaml:"telegram-api-id"`
 	TelegramApiHash               string `yaml:"telegram-api-hash"`
 	GofileToken                   string  `yaml:"gofile-token"`
+	MediaUserToken                string  `yaml:"media-user-token"`
+	WrapperManagerAddr            string  `yaml:"wrapper-manager-addr"`
 }
 
 type Counter struct {

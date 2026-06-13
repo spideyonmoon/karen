@@ -2,13 +2,11 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"net/url"
 	"context"
@@ -26,10 +24,9 @@ import (
 	apputils "main/utils"
 	"main/utils/ampapi"
 	"main/utils/lyrics"
-	"main/utils/runv2"
-	"main/utils/runv3"
 	"main/utils/structs"
 	"main/utils/task"
+	"main/utils/wmgrpc"
 
 	"github.com/fatih/color"
 	"github.com/grafov/m3u8"
@@ -45,6 +42,7 @@ var (
 	dl_aac               bool
 	dl_select            bool
 	dl_song              bool
+	wmClient             *wmgrpc.Client
 	artist_select        bool
 	debug_mode           bool
 	alac_max             *int
@@ -613,30 +611,18 @@ func convertIfNeeded(track *task.Track, lrc string) {
 	apputils.ConvertIfNeeded(track, lrc, &Config, coverPath, activeProgress)
 }
 
-func ripTrack(track *task.Track, token string, mediaUserToken string, ctx context.Context) {
+func ripTrack(track *task.Track, token string, ctx context.Context) {
 	if ctx != nil && ctx.Err() != nil { return }
 	var err error
 	counter.Total++
 	fmt.Printf("Track %d of %d: %s\n", track.TaskNum, track.TaskTotal, track.Type)
 
-	//提前获取到的播放列表下track所在的专辑信息
 	if track.PreType == "playlists" && Config.UseSongInfoForPlaylist {
 		track.GetAlbumData(token)
 	}
 
-	//mv dl dev
 	if track.Type == "music-videos" {
-		if len(mediaUserToken) <= 50 {
-			fmt.Println("meida-user-token is not set, skip MV dl")
-			counter.Success++
-			return
-		}
-		if _, err := exec.LookPath("mp4decrypt"); err != nil {
-			fmt.Println("mp4decrypt is not found, skip MV dl")
-			counter.Success++
-			return
-		}
-		err := mvDownloader(ctx, track.ID, track.SaveDir, token, track.Storefront, mediaUserToken, track)
+		err := mvDownloader(ctx, track.ID, track.SaveDir, token, track.Storefront, track)
 		if err != nil {
 			fmt.Println("\u26A0 Failed to dl MV:", err)
 			counter.Error++
@@ -660,21 +646,21 @@ func ripTrack(track *task.Track, token string, mediaUserToken string, ctx contex
 		fmt.Println("Unavailable, trying to dl aac-lc")
 		needDlAacLc = true
 	}
-	needCheck := false
 
-	if Config.GetM3u8Mode == "all" {
-		needCheck = true
-	} else if Config.GetM3u8Mode == "hires" && contains(track.Resp.Attributes.AudioTraits, "hi-res-lossless") {
-		needCheck = true
-	}
-	var EnhancedHls_m3u8 string
-	if needCheck && !needDlAacLc {
-		EnhancedHls_m3u8, _ = checkM3u8(track.ID, "song")
-		if strings.HasSuffix(EnhancedHls_m3u8, ".m3u8") {
-			track.DeviceM3u8 = EnhancedHls_m3u8
-			track.M3u8 = EnhancedHls_m3u8
+	// If AAC-LC, get M3U8 via WebPlayback; otherwise use track.M3u8
+	var downloadM3u8 string
+	if needDlAacLc {
+		downloadM3u8, err = wmClient.WebPlayback(ctx, track.ID)
+		if err != nil {
+			fmt.Println("Failed to get AAC-LC playback URL:", err)
+			recordDownloadFailure("%s: AAC-LC WebPlayback failed: %v", track.Name, err)
+			counter.Unavailable++
+			return
 		}
+	} else {
+		downloadM3u8 = track.M3u8
 	}
+
 	var Quality string
 	if strings.Contains(Config.SongFileFormat, "Quality") {
 		if dl_atmos {
@@ -682,7 +668,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string, ctx contex
 		} else if needDlAacLc {
 			Quality = "256Kbps"
 		} else {
-			_, Quality, err = extractMedia(track.M3u8, true)
+			_, Quality, err = extractMedia(downloadM3u8, true)
 			if err != nil {
 				fmt.Println("Failed to extract quality from manifest.\n", err)
 				recordDownloadFailure("%s: failed to read quality from manifest: %v", track.Name, err)
@@ -728,7 +714,6 @@ func ripTrack(track *task.Track, token string, mediaUserToken string, ctx contex
 	trackPath := filepath.Join(track.SaveDir, track.SaveName)
 	lrcFilename := fmt.Sprintf("%s.%s", forbiddenNames.ReplaceAllString(songName, "_"), Config.LrcFormat)
 
-	// Determine possible post-conversion target file (so we can skip re-download)
 	var convertedPath string
 	conversionEnabled := Config.ConvertAfterDownload &&
 		Config.ConvertFormat != "" &&
@@ -740,10 +725,9 @@ func ripTrack(track *task.Track, token string, mediaUserToken string, ctx contex
 			considerConverted = true
 		}
 	}
-	//get lrc
 	var lrc string = ""
 	if Config.EmbedLrc || Config.SaveLrcFile {
-		lrcStr, err := lyrics.Get(track.Storefront, track.ID, Config.LrcType, Config.Language, Config.LrcFormat, token, mediaUserToken)
+		lrcStr, err := lyrics.Get(track.Storefront, track.ID, Config.LrcType, Config.Language, Config.LrcFormat, token, Config.MediaUserToken)
 		if err != nil {
 			fmt.Println(err)
 		} else {
@@ -759,7 +743,6 @@ func ripTrack(track *task.Track, token string, mediaUserToken string, ctx contex
 		}
 	}
 
-	// Existence check now considers converted output (if original was deleted)
 	existsOriginal, err := fileExists(trackPath)
 	if err != nil {
 		fmt.Println("Failed to check if track exists.")
@@ -799,42 +782,18 @@ func ripTrack(track *task.Track, token string, mediaUserToken string, ctx contex
 		}
 	}
 
-	if needDlAacLc {
-		if len(mediaUserToken) <= 50 {
-			fmt.Println("Invalid media-user-token")
-			recordDownloadFailure("%s: AAC-LC fallback requires a valid media-user-token", track.Name)
-			counter.Error++
-			return
-		}
-		_, err := runv3.Run(ctx, track.ID, trackPath, token, mediaUserToken, false, "", activeProgress)
-		if err != nil {
-			fmt.Println("Failed to dl aac-lc:", err)
-			recordDownloadFailure("%s: failed to download AAC-LC: %v", track.Name, err)
-			if err.Error() == "Unavailable" {
-				counter.Unavailable++
-				return
-			}
-			counter.Error++
-			return
-		}
-	} else {
-		trackM3u8Url, _, err := extractMedia(track.M3u8, false)
-		if err != nil {
-			fmt.Println("\u26A0 Failed to extract info from manifest:", err)
-			recordDownloadFailure("%s: failed to extract stream URL: %v", track.Name, err)
+	err = wmgrpc.DownloadAndDecrypt(ctx, wmClient, track.ID, downloadM3u8, trackPath, activeProgress)
+	if err != nil {
+		fmt.Println("Failed to download/decrypt:", err)
+		recordDownloadFailure("%s: download/decrypt failed: %v", track.Name, err)
+		if strings.Contains(err.Error(), "Unavailable") {
 			counter.Unavailable++
 			return
 		}
-		//边下载边解密
-		err = runv2.Run(track.ID, trackM3u8Url, trackPath, Config, activeProgress)
-		if err != nil {
-			fmt.Println("Failed to run v2:", err)
-			recordDownloadFailure("%s: failed to decrypt/download ALAC: %v", track.Name, err)
-			counter.Error++
-			return
-		}
+		counter.Error++
+		return
 	}
-	//这里利用MP4box将fmp4转化为mp4，并添加ilst box与cover，方便后面的mp4tag添加更多自定义标签
+
 	tags := []string{
 		"tool=",
 		"artist=AppleMusic",
@@ -872,7 +831,6 @@ func ripTrack(track *task.Track, token string, mediaUserToken string, ctx contex
 		return
 	}
 
-	// CONVERSION FEATURE hook
 	convertIfNeeded(track, lrc)
 
 	recordDownloadedTrack(track)
@@ -880,9 +838,9 @@ func ripTrack(track *task.Track, token string, mediaUserToken string, ctx contex
 	okDict[track.PreID] = append(okDict[track.PreID], track.TaskNum)
 }
 
-func ripStation(albumId string, token string, storefront string, mediaUserToken string, ctx context.Context) error {
+func ripStation(albumId string, token string, storefront string, ctx context.Context) error {
 	station := task.NewStation(storefront, albumId)
-	err := station.GetResp(mediaUserToken, token, Config.Language)
+	err := station.GetResp(Config.MediaUserToken, token, Config.Language)
 	if err != nil {
 		return err
 	}
@@ -1009,15 +967,14 @@ func ripStation(albumId string, token string, storefront string, mediaUserToken 
 			fmt.Println("Radio already exists locally.")
 			return nil
 		}
-		assetsUrl, serverUrl, err := ampapi.GetStationAssetsUrlAndServerUrl(station.ID, mediaUserToken, token)
+		assetsUrl, serverUrl, err := ampapi.GetStationAssetsUrlAndServerUrl(station.ID, Config.MediaUserToken, token)
 		if err != nil {
 			fmt.Println("Failed to get station assets url.", err)
 			counter.Error++
 			return err
 		}
 		trackM3U8 := strings.ReplaceAll(assetsUrl, "index.m3u8", "256/prog_index.m3u8")
-		keyAndUrls, _ := runv3.Run(ctx, station.ID, trackM3U8, token, mediaUserToken, true, serverUrl, nil)
-		err = runv3.ExtMvData(ctx, keyAndUrls, trackPath)
+		err = wmgrpc.DownloadAndDecrypt(ctx, wmClient, station.ID, trackM3U8, trackPath, nil)
 		if err != nil {
 			fmt.Println("Failed to download station stream.", err)
 			counter.Error++
@@ -1066,7 +1023,7 @@ func ripStation(albumId string, token string, storefront string, mediaUserToken 
 	for i := range station.Tracks {
 		i++
 		if isInArray(selected, i) {
-			ripTrack(&station.Tracks[i-1], token, mediaUserToken, ctx)
+			ripTrack(&station.Tracks[i-1], token, ctx)
 		}
 	}
 	return nil
@@ -1088,7 +1045,7 @@ func firstNonEmpty(vals ...string) string {
 // appended to lastDownloadedPaths so the Telegram layer delivers the cover as a
 // photo and the motion artwork as a video. Unlike the per-track rips, this ignores
 // Config.SaveAnimatedArtwork — the user asked for artwork explicitly via -art.
-func ripArtwork(link string, token string, storefront string, mediaUserToken string, ctx context.Context) error {
+func ripArtwork(link string, token string, storefront string, ctx context.Context) error {
 	var artworkURL, motionURL, name, idForDir string
 
 	if sf, id := checkUrlPlaylist(link); id != "" {
@@ -1112,7 +1069,7 @@ func ripArtwork(link string, token string, storefront string, mediaUserToken str
 			storefront = sf
 		}
 		st := task.NewStation(storefront, id)
-		if err := st.GetResp(mediaUserToken, token, Config.Language); err != nil {
+		if err := st.GetResp(Config.MediaUserToken, token, Config.Language); err != nil {
 			return err
 		}
 		if len(st.Resp.Data) == 0 {
@@ -1184,7 +1141,7 @@ func ripArtwork(link string, token string, storefront string, mediaUserToken str
 	return nil
 }
 
-func ripAlbum(albumId string, token string, storefront string, mediaUserToken string, urlArg_i string, forceAAC bool, ctx context.Context) error {
+func ripAlbum(albumId string, token string, storefront string, urlArg_i string, forceAAC bool, ctx context.Context) error {
 	album := task.NewAlbum(storefront, albumId)
 	err := album.GetResp(token, Config.Language)
 	if err != nil {
@@ -1210,20 +1167,6 @@ func ripAlbum(albumId string, token string, storefront string, mediaUserToken st
 			var m3u8Url string
 			if manifest.Data[0].Attributes.ExtendedAssetUrls.EnhancedHls != "" {
 				m3u8Url = manifest.Data[0].Attributes.ExtendedAssetUrls.EnhancedHls
-			}
-			needCheck := false
-			if Config.GetM3u8Mode == "all" {
-				needCheck = true
-			} else if Config.GetM3u8Mode == "hires" && contains(track.Attributes.AudioTraits, "hi-res-lossless") {
-				needCheck = true
-			}
-			if needCheck {
-				fullM3u8Url, err := checkM3u8(track.ID, "song")
-				if err == nil && strings.HasSuffix(fullM3u8Url, ".m3u8") {
-					m3u8Url = fullM3u8Url
-				} else {
-					fmt.Println("Failed to get best quality m3u8 from device m3u8 port, will use m3u8 from Web API")
-				}
 			}
 
 			_, _, err = extractMedia(m3u8Url, true)
@@ -1287,20 +1230,6 @@ func ripAlbum(albumId string, token string, storefront string, mediaUserToken st
 					Codec = "AAC"
 					Quality = "256Kbps"
 				} else {
-					needCheck := false
-
-					if Config.GetM3u8Mode == "all" {
-						needCheck = true
-					} else if Config.GetM3u8Mode == "hires" && contains(meta.Data[0].Relationships.Tracks.Data[0].Attributes.AudioTraits, "hi-res-lossless") {
-						needCheck = true
-					}
-					var EnhancedHls_m3u8 string
-					if needCheck {
-						EnhancedHls_m3u8, _ = checkM3u8(meta.Data[0].Relationships.Tracks.Data[0].ID, "album")
-						if strings.HasSuffix(EnhancedHls_m3u8, ".m3u8") {
-							manifest1.Data[0].Attributes.ExtendedAssetUrls.EnhancedHls = EnhancedHls_m3u8
-						}
-					}
 					_, Quality, err = extractMedia(manifest1.Data[0].Attributes.ExtendedAssetUrls.EnhancedHls, true)
 					if err != nil {
 						fmt.Println("Failed to extract quality from manifest.\n", err)
@@ -1429,11 +1358,11 @@ func ripAlbum(albumId string, token string, storefront string, mediaUserToken st
 		} else {
 			for i := range album.Tracks {
 				if urlArg_i == album.Tracks[i].ID {
-					ripTrack(&album.Tracks[i], token, mediaUserToken, ctx)
+					ripTrack(&album.Tracks[i], token, ctx)
 					return nil
 				}
 			}
-			return ripAlbumSongFallback(album, urlArg_i, token, storefront, mediaUserToken, albumFolderPath, covPath, Codec, forceAAC, ctx)
+			return ripAlbumSongFallback(album, urlArg_i, token, storefront, albumFolderPath, covPath, Codec, forceAAC, ctx)
 		}
 		return nil
 	}
@@ -1451,13 +1380,13 @@ func ripAlbum(albumId string, token string, storefront string, mediaUserToken st
 			continue
 		}
 		if isInArray(selected, i) {
-			ripTrack(&album.Tracks[i-1], token, mediaUserToken, ctx)
+			ripTrack(&album.Tracks[i-1], token, ctx)
 		}
 	}
 	return nil
 
 }
-func ripPlaylist(playlistId string, token string, storefront string, mediaUserToken string, forceAAC bool, ctx context.Context) error {
+func ripPlaylist(playlistId string, token string, storefront string, forceAAC bool, ctx context.Context) error {
 	playlist := task.NewPlaylist(storefront, playlistId)
 	err := playlist.GetResp(token, Config.Language)
 	if err != nil {
@@ -1483,20 +1412,6 @@ func ripPlaylist(playlistId string, token string, storefront string, mediaUserTo
 			var m3u8Url string
 			if manifest.Data[0].Attributes.ExtendedAssetUrls.EnhancedHls != "" {
 				m3u8Url = manifest.Data[0].Attributes.ExtendedAssetUrls.EnhancedHls
-			}
-			needCheck := false
-			if Config.GetM3u8Mode == "all" {
-				needCheck = true
-			} else if Config.GetM3u8Mode == "hires" && contains(track.Attributes.AudioTraits, "hi-res-lossless") {
-				needCheck = true
-			}
-			if needCheck {
-				fullM3u8Url, err := checkM3u8(track.ID, "song")
-				if err == nil && strings.HasSuffix(fullM3u8Url, ".m3u8") {
-					m3u8Url = fullM3u8Url
-				} else {
-					fmt.Println("Failed to get best quality m3u8 from device m3u8 port, will use m3u8 from Web API")
-				}
 			}
 
 			_, _, err = extractMedia(m3u8Url, true)
@@ -1553,20 +1468,6 @@ func ripPlaylist(playlistId string, token string, storefront string, mediaUserTo
 					Codec = "AAC"
 					Quality = "256Kbps"
 				} else {
-					needCheck := false
-
-					if Config.GetM3u8Mode == "all" {
-						needCheck = true
-					} else if Config.GetM3u8Mode == "hires" && contains(meta.Data[0].Relationships.Tracks.Data[0].Attributes.AudioTraits, "hi-res-lossless") {
-						needCheck = true
-					}
-					var EnhancedHls_m3u8 string
-					if needCheck {
-						EnhancedHls_m3u8, _ = checkM3u8(meta.Data[0].Relationships.Tracks.Data[0].ID, "album")
-						if strings.HasSuffix(EnhancedHls_m3u8, ".m3u8") {
-							manifest1.Data[0].Attributes.ExtendedAssetUrls.EnhancedHls = EnhancedHls_m3u8
-						}
-					}
 					_, Quality, err = extractMedia(manifest1.Data[0].Attributes.ExtendedAssetUrls.EnhancedHls, true)
 					if err != nil {
 						fmt.Println("Failed to extract quality from manifest.\n", err)
@@ -1691,7 +1592,7 @@ func ripPlaylist(playlistId string, token string, storefront string, mediaUserTo
 			continue
 		}
 		if isInArray(selected, i) {
-			ripTrack(&playlist.Tracks[i-1], token, mediaUserToken, ctx)
+			ripTrack(&playlist.Tracks[i-1], token, ctx)
 		}
 	}
 	return nil
@@ -1825,6 +1726,13 @@ func main() {
 	Config.MVAudioType = *mv_audio_type
 	Config.MVMax = *mv_max
 
+	var initErr error
+	wmClient, initErr = wmgrpc.NewClient(context.Background(), Config.WrapperManagerAddr)
+	if initErr != nil {
+		log_fatalf("Failed to connect to wrapper-manager at %s: %v", Config.WrapperManagerAddr, initErr)
+	}
+	defer wmClient.Close()
+
 	if bot_mode {
 		runTelegramBot(token)
 		return
@@ -1890,16 +1798,6 @@ func main() {
 					continue
 				}
 				counter.Total++
-				if len(Config.MediaUserToken) <= 50 {
-					fmt.Println(": meida-user-token is not set, skip MV dl")
-					counter.Success++
-					continue
-				}
-				if _, err := exec.LookPath("mp4decrypt"); err != nil {
-					fmt.Println(": mp4decrypt is not found, skip MV dl")
-					counter.Success++
-					continue
-				}
 				mvSaveDir := strings.NewReplacer(
 					"{ArtistName}", "",
 					"{UrlArtistName}", "",
@@ -1911,7 +1809,7 @@ func main() {
 					mvSaveDir = Config.AlacSaveFolder
 				}
 				storefront, albumId = checkUrlMv(urlRaw)
-				err := mvDownloader(context.Background(), albumId, mvSaveDir, token, storefront, Config.MediaUserToken, nil)
+				err := mvDownloader(context.Background(), albumId, mvSaveDir, token, storefront, nil)
 				if err != nil {
 					fmt.Println("\u26A0 Failed to dl MV:", err)
 					counter.Error++
@@ -1927,7 +1825,7 @@ func main() {
 					fmt.Println("Invalid song URL format.")
 					continue
 				}
-				err := ripSong(songId, token, storefront, Config.MediaUserToken, false, nil)
+				err := ripSong(songId, token, storefront, false, nil)
 				if err != nil {
 					fmt.Println("Failed to rip song:", err)
 				}
@@ -1942,25 +1840,21 @@ func main() {
 			if strings.Contains(urlRaw, "/album/") {
 				fmt.Println("Album")
 				storefront, albumId = checkUrl(urlRaw)
-				err := ripAlbum(albumId, token, storefront, Config.MediaUserToken, urlArg_i, false, nil)
+				err := ripAlbum(albumId, token, storefront, urlArg_i, false, nil)
 				if err != nil {
 					fmt.Println("Failed to rip album:", err)
 				}
 			} else if strings.Contains(urlRaw, "/playlist/") {
 				fmt.Println("Playlist")
 				storefront, albumId = checkUrlPlaylist(urlRaw)
-				err := ripPlaylist(albumId, token, storefront, Config.MediaUserToken, false, nil)
+				err := ripPlaylist(albumId, token, storefront, false, nil)
 				if err != nil {
 					fmt.Println("Failed to rip playlist:", err)
 				}
 			} else if strings.Contains(urlRaw, "/station/") {
 				fmt.Printf("Station")
 				storefront, albumId = checkUrlStation(urlRaw)
-				if len(Config.MediaUserToken) <= 50 {
-					fmt.Println(": meida-user-token is not set, skip station dl")
-					continue
-				}
-				err := ripStation(albumId, token, storefront, Config.MediaUserToken, nil)
+				err := ripStation(albumId, token, storefront, nil)
 				if err != nil {
 					fmt.Println("Failed to rip station:", err)
 				}
@@ -1979,7 +1873,7 @@ func main() {
 	}
 }
 
-func mvDownloader(ctx context.Context, adamID string, saveDir string, token string, storefront string, mediaUserToken string, track *task.Track) error {
+func mvDownloader(ctx context.Context, adamID string, saveDir string, token string, storefront string, track *task.Track) error {
 	MVInfo, err := ampapi.GetMusicVideoResp(storefront, adamID, Config.Language, token)
 	if err != nil {
 		fmt.Println("\u26A0 Failed to get MV manifest:", err)
@@ -2008,22 +1902,26 @@ func mvDownloader(ctx context.Context, adamID string, saveDir string, token stri
 		return nil
 	}
 
-	mvm3u8url, _, _, mvErr := runv3.GetWebplayback(adamID, token, mediaUserToken, true)
-	if mvErr != nil {
-		return fmt.Errorf("MV playback lookup failed: %w", mvErr)
+	mvm3u8url, err := wmClient.WebPlayback(ctx, adamID)
+	if err != nil {
+		return fmt.Errorf("MV WebPlayback lookup failed: %w", err)
 	}
 	if mvm3u8url == "" {
-		return errors.New("media-user-token may be wrong or expired")
+		return errors.New("MV WebPlayback returned empty URL")
 	}
 
 	os.MkdirAll(saveDir, os.ModePerm)
 	videom3u8url, _ := extractVideo(mvm3u8url)
-	videokeyAndUrls, _ := runv3.Run(ctx, adamID, videom3u8url, token, mediaUserToken, true, "", nil)
-	_ = runv3.ExtMvData(ctx, videokeyAndUrls, vidPath)
+	err = wmgrpc.DownloadAndDecrypt(ctx, wmClient, adamID+"_video", videom3u8url, vidPath, nil)
+	if err != nil {
+		return fmt.Errorf("video track download failed: %w", err)
+	}
 	defer os.Remove(vidPath)
 	audiom3u8url, _ := extractMvAudio(mvm3u8url)
-	audiokeyAndUrls, _ := runv3.Run(ctx, adamID, audiom3u8url, token, mediaUserToken, true, "", nil)
-	_ = runv3.ExtMvData(ctx, audiokeyAndUrls, audPath)
+	err = wmgrpc.DownloadAndDecrypt(ctx, wmClient, adamID+"_audio", audiom3u8url, audPath, nil)
+	if err != nil {
+		return fmt.Errorf("audio track download failed: %w", err)
+	}
 	defer os.Remove(audPath)
 
 	tags := []string{
@@ -2200,51 +2098,17 @@ func extractMvAudio(c string) (string, error) {
 }
 
 func checkM3u8(b string, f string) (string, error) {
-	var EnhancedHls string
-	if Config.GetM3u8FromDevice {
-		adamID := b
-		conn, err := net.Dial("tcp", Config.GetM3u8Port)
-		if err != nil {
-			fmt.Println("Error connecting to device:", err)
-			return "none", err
-		}
-		defer conn.Close()
-		if f == "song" {
-			fmt.Println("Connected to device")
-		}
-
-		adamIDBuffer := []byte(adamID)
-		lengthBuffer := []byte{byte(len(adamIDBuffer))}
-
-		_, err = conn.Write(lengthBuffer)
-		if err != nil {
-			fmt.Println("Error writing length to device:", err)
-			return "none", err
-		}
-
-		_, err = conn.Write(adamIDBuffer)
-		if err != nil {
-			fmt.Println("Error writing adamID to device:", err)
-			return "none", err
-		}
-
-		response, err := bufio.NewReader(conn).ReadBytes('\n')
-		if err != nil {
-			fmt.Println("Error reading response from device:", err)
-			return "none", err
-		}
-
-		response = bytes.TrimSpace(response)
-		if len(response) > 0 {
-			if f == "song" {
-				fmt.Println("Received URL:", string(response))
-			}
-			EnhancedHls = string(response)
-		} else {
-			fmt.Println("Received an empty response")
-		}
+	if wmClient == nil {
+		return "", errors.New("wrapper-manager client not initialized")
 	}
-	return EnhancedHls, nil
+	m3u8URL, err := wmClient.M3U8(context.Background(), b)
+	if err != nil {
+		return "none", fmt.Errorf("M3U8 RPC failed for %s: %w", b, err)
+	}
+	if f == "song" {
+		fmt.Println("Received URL:", m3u8URL)
+	}
+	return m3u8URL, nil
 }
 
 func formatAvailability(available bool, quality string) string {
@@ -2521,7 +2385,7 @@ func extractVideo(c string) (string, error) {
 	return streamUrl.String(), nil
 }
 
-func ripSong(songId string, token string, storefront string, mediaUserToken string, forceAAC bool, ctx context.Context) error {
+func ripSong(songId string, token string, storefront string, forceAAC bool, ctx context.Context) error {
 	// Get song info to find album ID
 	manifest, err := ampapi.GetSongResp(storefront, songId, Config.Language, token)
 	if err != nil {
@@ -2540,7 +2404,7 @@ func ripSong(songId string, token string, storefront string, mediaUserToken stri
 
 	// Use album approach but only download the specific song
 	dl_song = true
-	err = ripAlbum(albumId, token, storefront, mediaUserToken, songId, forceAAC, ctx)
+	err = ripAlbum(albumId, token, storefront, songId, forceAAC, ctx)
 	if err != nil {
 		fmt.Println("Failed to rip song:", err)
 		return err
@@ -2638,7 +2502,7 @@ func buildAlbumTrackFromSongData(song ampapi.SongRespData, album *task.Album, al
 	}, nil
 }
 
-func ripAlbumSongFallback(album *task.Album, songID string, token string, storefront string, mediaUserToken string, albumFolderPath string, coverPath string, codec string, forceAAC bool, ctx context.Context) error {
+func ripAlbumSongFallback(album *task.Album, songID string, token string, storefront string, albumFolderPath string, coverPath string, codec string, forceAAC bool, ctx context.Context) error {
 	manifest, err := ampapi.GetSongResp(storefront, songID, album.Language, token)
 	if err != nil {
 		recordDownloadFailure("song %s: failed to fetch direct song metadata: %v", songID, err)
@@ -2655,6 +2519,6 @@ func ripAlbumSongFallback(album *task.Album, songID string, token string, storef
 		return err
 	}
 	fmt.Println("Song was not found in album track list, downloading by song metadata.")
-	ripTrack(track, token, mediaUserToken, ctx)
+	ripTrack(track, token, ctx)
 	return nil
 }

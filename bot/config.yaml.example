@@ -1,4 +1,3 @@
-media-user-token: "your-media-user-token" #If you need to obtain lyrics and aac-lc, need to change it
 authorization-token: "your-authorization-token" #You don't need to change it; it can automatically obtain token
 language: ""         #supportedLanguage by each storefront --> https://gist.github.com/itouakirai/c8ba9df9dc65bd300094103b058731d0
 lrc-type: "lyrics"   #lyrics or syllable-lyrics
@@ -15,11 +14,6 @@ alac-save-folder: AM-DL downloads
 atmos-save-folder: AM-DL-Atmos downloads
 aac-save-folder: AM-DL-AAC downloads
 max-memory-limit: 256 # MB
-decrypt-m3u8-port: "wrapper:10020"
-get-m3u8-port: "wrapper:20020"
-get-m3u8-from-device: true
-#set 'all' to retrieve all m3u8, and set 'hires' to only detect hires m3u8.
-get-m3u8-mode: hires # all hires
 aac-type: aac-lc # aac-lc aac aac-binaural aac-downmix
 alac-max: 192000  #192000 96000 48000 44100
 atmos-max: 2768  #2768 2448
@@ -45,7 +39,7 @@ use-songinfo-for-playlist: false
 dl-albumcover-for-playlist: false
 mv-audio-type: aac  #atmos ac3 aac — aac stereo plays inline in Telegram's video player
 mv-max: 1080
-# storefront will be used only in searching. 
+# storefront will be used only in searching.
 # storefront is the 2-letter country code that are available in the urls (jp, ca, us etc.).
 # if your account is from Japan, you must use jp.
 # if the storefront is different from your account, you will see a "failed to get lyrics" error in most of the songs. By default the storefront is set to US if not set.
@@ -76,3 +70,6 @@ telegram-request-timeout-seconds: 3600 # Telegram API request timeout, including
 telegram-api-id: 0            # Get from https://my.telegram.org/apps
 telegram-api-hash: ""         # Get from https://my.telegram.org/apps
 gofile-token: "YOUR_GOFILE_TOKEN_HERE"
+media-user-token: "your_media_user_token" # Apple Music API token (required for lyrics, stations; get from browser devtools)
+# wrapper-manager gRPC address
+wrapper-manager-addr: "wrapper-manager:8080"

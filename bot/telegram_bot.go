@@ -1089,7 +1089,7 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args
 				format := b.resolveFormat(chatID, forceFlac)
 				if !b.trySendCachedTrack(chatID, replyToID, songID, format) {
 					b.enqueueDownload(chatID, userID, "", replyToID, 0, true, format, headlessMode, "", func(ctx context.Context) error {
-						return ripSong(songID, b.appleToken, Config.Storefront, Config.MediaUserToken, forceAAC, ctx)
+						return ripSong(songID, b.appleToken, Config.Storefront, forceAAC, ctx)
 					})
 				}
 			} else {
@@ -1292,7 +1292,7 @@ func (b *TelegramBot) handleTransferMode(chatID int64, messageID int, mode strin
 
 	if pending.Single && pending.SongID != "" {
 		b.enqueueDownload(chatID, userID, username, replyToID, messageID, true, b.resolveFormat(chatID, pending.ForceFlac), mode, "", func(ctx context.Context) error {
-			return ripSong(pending.SongID, b.appleToken, Config.Storefront, Config.MediaUserToken, pending.ForceAAC, ctx)
+			return ripSong(pending.SongID, b.appleToken, Config.Storefront, pending.ForceAAC, ctx)
 		})
 	} else if pending.PlaylistID != "" {
 		b.enqueuePlaylistDownload(chatID, pending.PlaylistID, replyToID, messageID, mode, pending.ForceAAC, pending.ForceAtmos, pending.ForceFlac, userID, username)
@@ -1410,7 +1410,7 @@ func (b *TelegramBot) queueInlineSongDownload(chatID int64, songID string, inlin
 		_ = b.editInlineMessageText(inlineMessageID, "Download failed. Please check bot logs or cache chat permissions.")
 	}
 	ok := b.enqueueDownloadWithAfter(uploadChatID, 0, "", 0, 0, true, format, transferModeOneByOne, "", func(ctx context.Context) error {
-		return ripSong(songID, b.appleToken, Config.Storefront, Config.MediaUserToken, false, ctx)
+		return ripSong(songID, b.appleToken, Config.Storefront, false, ctx)
 	}, after)
 	if !ok && inlineMessageID != "" {
 		_ = b.editInlineMessageText(inlineMessageID, "Download queue is full. Please try again later.")
@@ -1446,27 +1446,17 @@ func (b *TelegramBot) queueDownloadStationWithReply(chatID int64, stationID stri
 }
 
 // queueDownloadMvWithReply validates the preconditions for a music-video rip
-// (media-user-token + mp4decrypt) and then prompts for the delivery target. The
-// userID param is unused here — the chosen mode arrives via the inline button
-// callback, which carries its own user — but is kept for call-site symmetry.
+// and then prompts for the delivery target. The userID param is unused here — the
+// chosen mode arrives via the inline button callback, which carries its own user —
+// but is kept for call-site symmetry.
 func (b *TelegramBot) queueDownloadMvWithReply(chatID int64, storefront string, mvID string, replyToID int, userID int64) {
 	if mvID == "" {
 		_ = b.sendMessage(chatID, "Music video ID is empty.", nil)
 		return
 	}
-	if len(Config.MediaUserToken) <= 50 {
-		_ = b.sendMessageWithReply(chatID, "Music videos require a valid media-user-token in config.yaml.", nil, replyToID)
-		return
-	}
-	if _, err := exec.LookPath("mp4decrypt"); err != nil {
-		_ = b.sendMessageWithReply(chatID, "Music video download is unavailable: mp4decrypt is not installed.", nil, replyToID)
-		return
-	}
 	if storefront == "" {
 		storefront = Config.Storefront
 	}
-	// Like every other /dl command, ask where to deliver. A single video only has two
-	// sensible targets (native Telegram video vs Gofile), so the prompt omits ZIP.
 	b.promptMvTransferMode(chatID, storefront, mvID, replyToID)
 }
 
@@ -1475,14 +1465,6 @@ func (b *TelegramBot) queueDownloadMvWithReply(chatID int64, storefront string, 
 func (b *TelegramBot) queueDownloadMvHeadless(chatID int64, userID int64, storefront string, mvID string, replyToID int, headlessMode string) {
 	if mvID == "" {
 		_ = b.sendMessage(chatID, "Music video ID is empty.", nil)
-		return
-	}
-	if len(Config.MediaUserToken) <= 50 {
-		_ = b.sendMessageWithReply(chatID, "Music videos require a valid media-user-token in config.yaml.", nil, replyToID)
-		return
-	}
-	if _, err := exec.LookPath("mp4decrypt"); err != nil {
-		_ = b.sendMessageWithReply(chatID, "Music video download is unavailable: mp4decrypt is not installed.", nil, replyToID)
 		return
 	}
 	if storefront == "" {
@@ -1525,7 +1507,7 @@ func (b *TelegramBot) enqueueMvDownload(chatID int64, userID int64, storefront s
 		saveDir = "."
 	}
 	b.enqueueDownload(chatID, userID, "", replyToID, statusMessageID, true, "", transferMode, "", func(ctx context.Context) error {
-		return mvDownloader(ctx, mvID, saveDir, b.appleToken, storefront, Config.MediaUserToken, nil)
+		return mvDownloader(ctx, mvID, saveDir, b.appleToken, storefront, nil)
 	})
 }
 
@@ -1562,7 +1544,7 @@ func (b *TelegramBot) enqueueAlbumDownload(chatID int64, albumID string, replyTo
 		if forceAtmos {
 			dl_atmos = true
 		}
-		return ripAlbum(albumID, b.appleToken, Config.Storefront, Config.MediaUserToken, "", forceAAC, ctx)
+		return ripAlbum(albumID, b.appleToken, Config.Storefront, "", forceAAC, ctx)
 	})
 }
 
@@ -1576,7 +1558,7 @@ func (b *TelegramBot) enqueuePlaylistDownload(chatID int64, playlistID string, r
 		if forceAtmos {
 			dl_atmos = true
 		}
-		return ripPlaylist(playlistID, b.appleToken, Config.Storefront, Config.MediaUserToken, forceAAC, ctx)
+		return ripPlaylist(playlistID, b.appleToken, Config.Storefront, forceAAC, ctx)
 	})
 }
 
@@ -1596,7 +1578,7 @@ func (b *TelegramBot) enqueueStationDownload(chatID int64, stationID string, rep
 		if forceAAC {
 			dl_aac = true
 		}
-		return ripStation(stationID, b.appleToken, Config.Storefront, Config.MediaUserToken, ctx)
+		return ripStation(stationID, b.appleToken, Config.Storefront, ctx)
 	})
 }
 
@@ -1612,7 +1594,7 @@ func (b *TelegramBot) queueDownloadArtwork(chatID int64, link string, replyToID 
 		return
 	}
 	b.enqueueDownload(chatID, userID, "", replyToID, 0, true, "", transferModeArt, "", func(ctx context.Context) error {
-		return ripArtwork(link, b.appleToken, Config.Storefront, Config.MediaUserToken, ctx)
+		return ripArtwork(link, b.appleToken, Config.Storefront, ctx)
 	})
 }
 

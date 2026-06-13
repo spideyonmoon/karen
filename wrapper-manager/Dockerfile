@@ -1,0 +1,20 @@
+FROM golang:1.23 AS builder
+
+WORKDIR /app
+RUN apt-get update && apt-get install -y git ca-certificates && \
+    git clone --depth 1 https://github.com/WorldObservationLog/wrapper-manager.git .
+
+RUN go env -w GO111MODULE=on
+RUN go mod tidy
+RUN GOOS=linux go build -o wrapper-manager
+
+FROM ubuntu:latest
+
+WORKDIR /root/
+
+COPY --from=builder /app/wrapper-manager .
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN chmod +x ./wrapper-manager
+
+ENTRYPOINT ["./wrapper-manager"]
+EXPOSE 8080
