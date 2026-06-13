@@ -794,6 +794,24 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 		return
 	}
 
+	{
+		// Remux fMP4 to standard MP4 (go-mp4tag corrupts fMP4 by leaving trun offsets stale)
+		remuxPath := trackPath + ".remux"
+		remuxCmd := exec.CommandContext(ctx, "MP4Box", "-add", trackPath, "-new", remuxPath)
+		if err := remuxCmd.Run(); err != nil {
+			fmt.Println("Failed to remux fMP4:", err)
+			recordDownloadFailure("%s: MP4Box remux failed: %v", track.Name, err)
+			counter.Error++
+			return
+		}
+		if err := os.Rename(remuxPath, trackPath); err != nil {
+			fmt.Println("Failed to replace with remuxed file:", err)
+			recordDownloadFailure("%s: rename failed: %v", track.Name, err)
+			counter.Error++
+			return
+		}
+	}
+
 	tags := []string{
 		"tool=",
 		"artist=AppleMusic",
