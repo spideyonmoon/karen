@@ -967,7 +967,7 @@ func ripStation(albumId string, token string, storefront string, ctx context.Con
 			fmt.Println("Radio already exists locally.")
 			return nil
 		}
-		assetsUrl, serverUrl, err := ampapi.GetStationAssetsUrlAndServerUrl(station.ID, Config.MediaUserToken, token)
+		assetsUrl, _, err := ampapi.GetStationAssetsUrlAndServerUrl(station.ID, Config.MediaUserToken, token)
 		if err != nil {
 			fmt.Println("Failed to get station assets url.", err)
 			counter.Error++
@@ -1727,9 +1727,9 @@ func main() {
 	Config.MVMax = *mv_max
 
 	var initErr error
-	wmClient, initErr = wmgrpc.NewClient(context.Background(), Config.WrapperManagerAddr)
+	wmClient, initErr = wmgrpc.NewClient(Config.WrapperManagerAddr)
 	if initErr != nil {
-		log_fatalf("Failed to connect to wrapper-manager at %s: %v", Config.WrapperManagerAddr, initErr)
+		log.Fatalf("Failed to connect to wrapper-manager at %s: %v", Config.WrapperManagerAddr, initErr)
 	}
 	defer wmClient.Close()
 
