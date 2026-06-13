@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/grafov/m3u8"
 	"github.com/itouakirai/mp4ff/mp4"
@@ -270,7 +271,6 @@ func DownloadAndDecrypt(ctx context.Context, wm *Client, adamID string, playlist
 	}
 	parsed := make([]parsedSeg, 0, len(segments))
 	downloaded := 0
-	target := 0
 	for downloaded < len(segments) {
 		select {
 		case res := <-segChan:
