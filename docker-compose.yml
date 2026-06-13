@@ -8,7 +8,7 @@ services:
     container_name: karen-wm-1
     volumes:
       - wm-data-1:/root/rootfs/data
-    command: ["--host", "0.0.0.0", "--port", "8081"]
+    command: ["--host", "0.0.0.0", "--port", "8081", "-debug"]
     restart: unless-stopped
 
   wrapper-manager-2:
@@ -18,7 +18,7 @@ services:
     container_name: karen-wm-2
     volumes:
       - wm-data-2:/root/rootfs/data
-    command: ["--host", "0.0.0.0", "--port", "8082"]
+    command: ["--host", "0.0.0.0", "--port", "8082", "-debug"]
     restart: unless-stopped
 
   bot:
