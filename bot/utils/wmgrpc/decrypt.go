@@ -263,15 +263,21 @@ func DownloadAndDecrypt(ctx context.Context, wm *Client, adamID string, playlist
 		}()
 	}
 
-	// Collect downloaded segments in order
+	// Collect downloaded segments (arrive out of order)
 	type parsedSeg struct {
-		frag       *mp4.Fragment
+		frag         *mp4.Fragment
 		keyForSample string
-		trackID    uint32
+		trackID      uint32
 	}
-	parsed := make([]parsedSeg, 0, len(segments))
+	parsedMap := make(map[int]parsedSeg, len(segments))
+	var totalSegments int
+	for _, seg := range segments {
+		if seg != nil {
+			totalSegments++
+		}
+	}
 	downloaded := 0
-	for downloaded < len(segments) {
+	for downloaded < totalSegments {
 		select {
 		case res := <-segChan:
 			segReader := bytes.NewReader(res.data)
@@ -303,14 +309,7 @@ func DownloadAndDecrypt(ctx context.Context, wm *Client, adamID string, playlist
 			for _, traf := range frag.Moof.Trafs {
 				trackID = traf.Tfhd.TrackID
 			}
-			p := parsedSeg{frag, res.keyURI, trackID}
-			if res.index == len(parsed) {
-				parsed = append(parsed, p)
-			} else {
-				parsed = append(parsed, parsedSeg{})
-				copy(parsed[res.index+1:], parsed[res.index:])
-				parsed[res.index] = p
-			}
+			parsedMap[res.index] = parsedSeg{frag, res.keyURI, trackID}
 			downloaded++
 			dlProgress += int64(len(res.data))
 			if progress != nil {
@@ -319,6 +318,14 @@ func DownloadAndDecrypt(ctx context.Context, wm *Client, adamID string, playlist
 		case err := <-errChan:
 			cancelDownloads()
 			return err
+		}
+	}
+
+	// Convert to ordered slice for sequential processing
+	parsed := make([]parsedSeg, 0, len(parsedMap))
+	for i := 0; i < len(segments); i++ {
+		if p, ok := parsedMap[i]; ok {
+			parsed = append(parsed, p)
 		}
 	}
 
@@ -336,6 +343,7 @@ func DownloadAndDecrypt(ctx context.Context, wm *Client, adamID string, playlist
 	numWorkers := 4
 	jobs := make(chan sampleJob, 256)
 	results := make(chan sampleResult, 256)
+	errChan2 := make(chan error, 1)
 	var totalSamples int
 	for i := range parsed {
 		for _, traf := range parsed[i].frag.Moof.Trafs {
@@ -359,7 +367,7 @@ func DownloadAndDecrypt(ctx context.Context, wm *Client, adamID string, playlist
 				decrypted, err := wm.DecryptSample(ctx, adamID, parsed[job.segIdx].keyForSample, job.data, int32(job.sampleIdx))
 				if err != nil {
 					select {
-					case errChan <- fmt.Errorf("decrypt sample %d/%d: %w", job.segIdx, job.sampleIdx, err):
+					case errChan2 <- fmt.Errorf("decrypt sample %d/%d: %w", job.segIdx, job.sampleIdx, err):
 					default:
 					}
 					return
@@ -396,7 +404,7 @@ func DownloadAndDecrypt(ctx context.Context, wm *Client, adamID string, playlist
 		close(results)
 	}()
 
-	// Collect decrypted results and write in order
+	// Collect decrypted results
 	resultMap := make(map[int]map[int][]byte)
 	for res := range results {
 		if resultMap[res.segIdx] == nil {
@@ -405,7 +413,7 @@ func DownloadAndDecrypt(ctx context.Context, wm *Client, adamID string, playlist
 		resultMap[res.segIdx][res.sampleIdx] = res.data
 	}
 	select {
-	case err := <-errChan:
+	case err := <-errChan2:
 		return err
 	default:
 	}
