@@ -42,7 +42,7 @@ var (
 	dl_aac               bool
 	dl_select            bool
 	dl_song              bool
-	wmClient             *wmgrpc.Client
+	wmPool               *wmgrpc.Pool
 	artist_select        bool
 	debug_mode           bool
 	alac_max             *int
@@ -650,7 +650,9 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 	// If AAC-LC, get M3U8 via WebPlayback; otherwise use track.M3u8
 	var downloadM3u8 string
 	if needDlAacLc {
-		downloadM3u8, err = wmClient.WebPlayback(ctx, track.ID)
+		wm := wmPool.Acquire()
+		downloadM3u8, err = wm.WebPlayback(ctx, track.ID)
+		wmPool.Release(wm)
 		if err != nil {
 			fmt.Println("Failed to get AAC-LC playback URL:", err)
 			recordDownloadFailure("%s: AAC-LC WebPlayback failed: %v", track.Name, err)
@@ -782,7 +784,9 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 		}
 	}
 
-	err = wmgrpc.DownloadAndDecrypt(ctx, wmClient, track.ID, downloadM3u8, trackPath, activeProgress)
+	wm := wmPool.Acquire()
+	err = wmgrpc.DownloadAndDecrypt(ctx, wm, track.ID, downloadM3u8, trackPath, activeProgress)
+	wmPool.Release(wm)
 	if err != nil {
 		fmt.Println("Failed to download/decrypt:", err)
 		recordDownloadFailure("%s: download/decrypt failed: %v", track.Name, err)
@@ -992,7 +996,9 @@ func ripStation(albumId string, token string, storefront string, ctx context.Con
 			return err
 		}
 		trackM3U8 := strings.ReplaceAll(assetsUrl, "index.m3u8", "256/prog_index.m3u8")
-		err = wmgrpc.DownloadAndDecrypt(ctx, wmClient, station.ID, trackM3U8, trackPath, nil)
+		wm := wmPool.Acquire()
+		err = wmgrpc.DownloadAndDecrypt(ctx, wm, station.ID, trackM3U8, trackPath, nil)
+		wmPool.Release(wm)
 		if err != nil {
 			fmt.Println("Failed to download station stream.", err)
 			counter.Error++
@@ -1745,11 +1751,11 @@ func main() {
 	Config.MVMax = *mv_max
 
 	var initErr error
-	wmClient, initErr = wmgrpc.NewClient(Config.WrapperManagerAddr)
+	wmPool, initErr = wmgrpc.NewPool(Config.WrapperManagerAddrs)
 	if initErr != nil {
-		log.Fatalf("Failed to connect to wrapper-manager at %s: %v", Config.WrapperManagerAddr, initErr)
+		log.Fatalf("Failed to connect to wrapper-manager: %v", initErr)
 	}
-	defer wmClient.Close()
+	defer wmPool.Close()
 
 	if bot_mode {
 		runTelegramBot(token)
@@ -1920,23 +1926,28 @@ func mvDownloader(ctx context.Context, adamID string, saveDir string, token stri
 		return nil
 	}
 
-	mvm3u8url, err := wmClient.WebPlayback(ctx, adamID)
+	wm := wmPool.Acquire()
+	mvm3u8url, err := wm.WebPlayback(ctx, adamID)
 	if err != nil {
+		wmPool.Release(wm)
 		return fmt.Errorf("MV WebPlayback lookup failed: %w", err)
 	}
 	if mvm3u8url == "" {
+		wmPool.Release(wm)
 		return errors.New("MV WebPlayback returned empty URL")
 	}
 
 	os.MkdirAll(saveDir, os.ModePerm)
 	videom3u8url, _ := extractVideo(mvm3u8url)
-	err = wmgrpc.DownloadAndDecrypt(ctx, wmClient, adamID+"_video", videom3u8url, vidPath, nil)
+	err = wmgrpc.DownloadAndDecrypt(ctx, wm, adamID+"_video", videom3u8url, vidPath, nil)
 	if err != nil {
+		wmPool.Release(wm)
 		return fmt.Errorf("video track download failed: %w", err)
 	}
 	defer os.Remove(vidPath)
 	audiom3u8url, _ := extractMvAudio(mvm3u8url)
-	err = wmgrpc.DownloadAndDecrypt(ctx, wmClient, adamID+"_audio", audiom3u8url, audPath, nil)
+	err = wmgrpc.DownloadAndDecrypt(ctx, wm, adamID+"_audio", audiom3u8url, audPath, nil)
+	wmPool.Release(wm)
 	if err != nil {
 		return fmt.Errorf("audio track download failed: %w", err)
 	}
@@ -2116,10 +2127,12 @@ func extractMvAudio(c string) (string, error) {
 }
 
 func checkM3u8(b string, f string) (string, error) {
-	if wmClient == nil {
-		return "", errors.New("wrapper-manager client not initialized")
+	if wmPool == nil {
+		return "", errors.New("wrapper-manager pool not initialized")
 	}
-	m3u8URL, err := wmClient.M3U8(context.Background(), b)
+	wm := wmPool.Acquire()
+	m3u8URL, err := wm.M3U8(context.Background(), b)
+	wmPool.Release(wm)
 	if err != nil {
 		return "none", fmt.Errorf("M3U8 RPC failed for %s: %w", b, err)
 	}

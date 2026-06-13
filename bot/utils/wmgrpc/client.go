@@ -3,7 +3,6 @@ package wmgrpc
 import (
 	"context"
 	"fmt"
-	"time"
 
 	pb "github.com/WorldObservationLog/wrapper-manager/proto"
 	"google.golang.org/grpc"
@@ -17,11 +16,8 @@ type Client struct {
 }
 
 func NewClient(addr string) (*Client, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	conn, err := grpc.DialContext(ctx, addr,
+	conn, err := grpc.NewClient(addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("wmgrpc: dial %s: %w", addr, err)

@@ -1,21 +1,32 @@
 version: '3.8'
 
 services:
-  wrapper-manager:
+  wrapper-manager-1:
     build: ./wrapper-manager
     image: karen-wrapper-manager:local
     privileged: true
-    container_name: karen-wrapper-manager
+    container_name: karen-wm-1
     volumes:
-      - wrapper-manager-data:/root/rootfs/data
-    command: ["--host", "0.0.0.0"]
+      - wm-data-1:/root/rootfs/data
+    command: ["--host", "0.0.0.0", "--port", "8081"]
+    restart: unless-stopped
+
+  wrapper-manager-2:
+    build: ./wrapper-manager
+    image: karen-wrapper-manager:local
+    privileged: true
+    container_name: karen-wm-2
+    volumes:
+      - wm-data-2:/root/rootfs/data
+    command: ["--host", "0.0.0.0", "--port", "8082"]
     restart: unless-stopped
 
   bot:
     build: ./bot
     container_name: karen-bot
     depends_on:
-      - wrapper-manager
+      - wrapper-manager-1
+      - wrapper-manager-2
     volumes:
       - ./bot/config.yaml:/app/config.yaml
       - ./bot/downloads:/downloads
@@ -24,4 +35,5 @@ services:
     restart: unless-stopped
 
 volumes:
-  wrapper-manager-data:
+  wm-data-1:
+  wm-data-2:

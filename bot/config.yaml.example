@@ -71,5 +71,7 @@ telegram-api-id: 0            # Get from https://my.telegram.org/apps
 telegram-api-hash: ""         # Get from https://my.telegram.org/apps
 gofile-token: "YOUR_GOFILE_TOKEN_HERE"
 media-user-token: "your_media_user_token" # Apple Music API token (required for lyrics, stations; get from browser devtools)
-# wrapper-manager gRPC address
-wrapper-manager-addr: "wrapper-manager:8080"
+# wrapper-manager gRPC addresses (one per Apple Music account/container)
+wrapper-manager-addrs:
+  - "karen-wm-1:8081"
+  - "karen-wm-2:8082"

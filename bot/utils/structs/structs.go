@@ -56,7 +56,7 @@ type ConfigSet struct {
 	TelegramApiHash               string `yaml:"telegram-api-hash"`
 	GofileToken                   string  `yaml:"gofile-token"`
 	MediaUserToken                string  `yaml:"media-user-token"`
-	WrapperManagerAddr            string  `yaml:"wrapper-manager-addr"`
+	WrapperManagerAddrs           []string `yaml:"wrapper-manager-addrs"`
 }
 
 type Counter struct {
