@@ -7,7 +7,7 @@ services:
     privileged: true
     container_name: karen-wrapper-manager
     volumes:
-      - wrapper-manager-data:/app/rootfs/data
+      - wrapper-manager-data:/root/rootfs/data
     command: ["--host", "0.0.0.0"]
     restart: unless-stopped
 
