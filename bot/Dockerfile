@@ -6,10 +6,10 @@ ARG TARGETARCH
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN apk add --no-cache git
-RUN go mod download
 COPY . .
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg/mod \
+    go mod tidy && \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /bin/apple-music-dl .
 
 FROM gpac/ubuntu
