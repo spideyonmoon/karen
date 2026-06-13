@@ -36,6 +36,9 @@ func (p *progressWriter) Write(b []byte) (int, error) {
 const prefetchKey = "skd://itunes.apple.com/P000000000/s1/e1"
 
 func downloadBytes(ctx context.Context, url string) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, err
@@ -78,6 +81,9 @@ func extractKeyURIs(segments []*m3u8.MediaSegment) []string {
 }
 
 func DownloadAndDecrypt(ctx context.Context, wm *Client, adamID string, playlistURL string, outfile string, progress ProgressFunc) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	masterBytes, err := downloadBytes(ctx, playlistURL)
 	if err != nil {
 		return fmt.Errorf("download master playlist: %w", err)

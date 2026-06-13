@@ -612,7 +612,10 @@ func convertIfNeeded(track *task.Track, lrc string) {
 }
 
 func ripTrack(track *task.Track, token string, ctx context.Context) {
-	if ctx != nil && ctx.Err() != nil { return }
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil { return }
 	var err error
 	counter.Total++
 	fmt.Printf("Track %d of %d: %s\n", track.TaskNum, track.TaskTotal, track.Type)
@@ -861,6 +864,9 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 }
 
 func ripStation(albumId string, token string, storefront string, ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	station := task.NewStation(storefront, albumId)
 	err := station.GetResp(Config.MediaUserToken, token, Config.Language)
 	if err != nil {
@@ -1166,6 +1172,9 @@ func ripArtwork(link string, token string, storefront string, ctx context.Contex
 }
 
 func ripAlbum(albumId string, token string, storefront string, urlArg_i string, forceAAC bool, ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	album := task.NewAlbum(storefront, albumId)
 	err := album.GetResp(token, Config.Language)
 	if err != nil {
@@ -1411,6 +1420,9 @@ func ripAlbum(albumId string, token string, storefront string, urlArg_i string, 
 
 }
 func ripPlaylist(playlistId string, token string, storefront string, forceAAC bool, ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	playlist := task.NewPlaylist(storefront, playlistId)
 	err := playlist.GetResp(token, Config.Language)
 	if err != nil {
@@ -2417,6 +2429,9 @@ func extractVideo(c string) (string, error) {
 }
 
 func ripSong(songId string, token string, storefront string, forceAAC bool, ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	// Get song info to find album ID
 	manifest, err := ampapi.GetSongResp(storefront, songId, Config.Language, token)
 	if err != nil {

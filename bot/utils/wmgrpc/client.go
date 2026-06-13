@@ -34,6 +34,9 @@ func (c *Client) Close() error {
 }
 
 func (c *Client) Status(ctx context.Context) (*pb.StatusData, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	resp, err := c.client.Status(ctx, &emptypb.Empty{})
 	if err != nil {
 		return nil, fmt.Errorf("wmgrpc Status: %w", err)
@@ -45,6 +48,9 @@ func (c *Client) Status(ctx context.Context) (*pb.StatusData, error) {
 }
 
 func (c *Client) M3U8(ctx context.Context, adamID string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	resp, err := c.client.M3U8(ctx, &pb.M3U8Request{
 		Data: &pb.M3U8DataRequest{AdamId: adamID},
 	})
@@ -58,6 +64,9 @@ func (c *Client) M3U8(ctx context.Context, adamID string) (string, error) {
 }
 
 func (c *Client) WebPlayback(ctx context.Context, adamID string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	resp, err := c.client.WebPlayback(ctx, &pb.WebPlaybackRequest{
 		Data: &pb.WebPlaybackDataRequest{AdamId: adamID},
 	})
@@ -77,6 +86,9 @@ type DecryptionStream struct {
 }
 
 func (c *Client) NewDecryptionStream(ctx context.Context, adamID string) (*DecryptionStream, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	stream, err := c.client.Decrypt(ctx)
 	if err != nil {
