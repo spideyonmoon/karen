@@ -3,7 +3,6 @@ package wmgrpc
 import (
 	"context"
 	"fmt"
-	"io"
 	"time"
 
 	pb "github.com/WorldObservationLog/wrapper-manager/proto"
@@ -75,31 +74,47 @@ func (c *Client) WebPlayback(ctx context.Context, adamID string) (string, error)
 	return resp.Data.M3U8, nil
 }
 
-func (c *Client) DecryptSample(ctx context.Context, adamID, key string, sample []byte, sampleIndex int32) ([]byte, error) {
+type DecryptionStream struct {
+	stream pb.WrapperManagerService_DecryptClient
+	cancel context.CancelFunc
+	adamID string
+}
+
+func (c *Client) NewDecryptionStream(ctx context.Context, adamID string) (*DecryptionStream, error) {
+	ctx, cancel := context.WithCancel(ctx)
 	stream, err := c.client.Decrypt(ctx)
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("wmgrpc Decrypt stream: %w", err)
 	}
-	defer stream.CloseSend()
-	err = stream.Send(&pb.DecryptRequest{
+	return &DecryptionStream{stream: stream, cancel: cancel, adamID: adamID}, nil
+}
+
+func (ds *DecryptionStream) Decrypt(key string, sample []byte, sampleIndex int32) ([]byte, error) {
+	err := ds.stream.Send(&pb.DecryptRequest{
 		Data: &pb.DecryptData{
-			AdamId:      adamID,
+			AdamId:      ds.adamID,
 			Key:         key,
 			SampleIndex: sampleIndex,
 			Sample:      sample,
 		},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("wmgrpc Decrypt send: %w", err)
+		return nil, fmt.Errorf("send sample %d: %w", sampleIndex, err)
 	}
-	resp, err := stream.Recv()
+	resp, err := ds.stream.Recv()
 	if err != nil {
-		return nil, fmt.Errorf("wmgrpc Decrypt recv: %w", err)
+		return nil, fmt.Errorf("recv sample %d: %w", sampleIndex, err)
 	}
 	if resp.Header.Code != 0 {
-		return nil, fmt.Errorf("wmgrpc Decrypt: %s", resp.Header.Msg)
+		return nil, fmt.Errorf("decrypt sample %d: %s", sampleIndex, resp.Header.Msg)
 	}
 	return resp.Data.Sample, nil
+}
+
+func (ds *DecryptionStream) Close() {
+	ds.cancel()
+	_ = ds.stream.CloseSend()
 }
 
 func (c *Client) License(ctx context.Context, adamID, challenge, uri string) (string, error) {
@@ -134,73 +149,4 @@ func (c *Client) Lyrics(ctx context.Context, adamID, region, language string) (s
 		return "", fmt.Errorf("wmgrpc Lyrics: %s", resp.Header.Msg)
 	}
 	return resp.Data.Lyrics, nil
-}
-
-type DecryptResult struct {
-	SampleIndex int32
-	Data        []byte
-	Err         error
-}
-
-func (c *Client) DecryptSamples(ctx context.Context, adamID string, keys []string, samples [][]byte, sampleIndices []int32) ([]DecryptResult, error) {
-	stream, err := c.client.Decrypt(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("wmgrpc DecryptStream: %w", err)
-	}
-	defer stream.CloseSend()
-
-	type pending struct {
-		idx   int
-		key   string
-		data  []byte
-		sidx  int32
-	}
-
-	sendCh := make(chan pending, len(samples))
-	results := make([]DecryptResult, len(samples))
-
-	sendDone := make(chan error, 1)
-	go func() {
-		defer close(sendDone)
-		for p := range sendCh {
-			err := stream.Send(&pb.DecryptRequest{
-				Data: &pb.DecryptData{
-					AdamId:      adamID,
-					Key:         p.key,
-					SampleIndex: p.sidx,
-					Sample:      p.data,
-				},
-			})
-			if err != nil {
-				sendDone <- fmt.Errorf("send sample %d: %w", p.idx, err)
-				return
-			}
-		}
-	}()
-
-	sendCh <- pending{idx: 0, key: keys[0], data: samples[0], sidx: sampleIndices[0]}
-	for i := 1; i < len(samples); i++ {
-		sendCh <- pending{idx: i, key: keys[i], data: samples[i], sidx: sampleIndices[i]}
-	}
-
-	for i := 0; i < len(samples); i++ {
-		resp, err := stream.Recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return results, fmt.Errorf("wmgrpc DecryptStream recv %d: %w", i, err)
-		}
-		if resp.Header.Code != 0 {
-			results[i] = DecryptResult{SampleIndex: resp.Data.SampleIndex, Err: fmt.Errorf("decrypt failed: %s", resp.Header.Msg)}
-		} else {
-			results[i] = DecryptResult{SampleIndex: resp.Data.SampleIndex, Data: resp.Data.Sample}
-		}
-	}
-
-	close(sendCh)
-	if err := <-sendDone; err != nil {
-		return results, err
-	}
-	return results, nil
 }
