@@ -8,8 +8,7 @@ services:
     container_name: karen-wrapper-manager
     volumes:
       - wrapper-manager-data:/app/rootfs/data
-    environment:
-      - GRPC_ADDR=:8080
+    command: ["--host", "0.0.0.0"]
     restart: unless-stopped
 
   bot:
