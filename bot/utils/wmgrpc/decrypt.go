@@ -208,7 +208,7 @@ func DownloadAndDecrypt(ctx context.Context, wm *Client, adamID string, playlist
 		return fmt.Errorf("write init: %w", err)
 	}
 
-	totalBytes := int64(len(initData)) * (1 + totalSegments)
+	totalBytes := int64(len(initData)) * int64(1+totalSegments)
 
 	if progress != nil {
 		progress("Downloading", int64(len(initData)), totalBytes)
