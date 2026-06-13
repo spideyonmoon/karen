@@ -224,98 +224,216 @@ func DownloadAndDecrypt(ctx context.Context, wm *Client, adamID string, playlist
 		progress("Downloading", int64(len(initData)), totalBytes)
 	}
 
-	var totalDecrypted int64
-	for i := 0; ; i++ {
-		if ctx.Err() != nil {
-			return ctx.Err()
+	// Download all segments in parallel
+	type segResult struct {
+		index   int
+		data    []byte
+		keyURI  string
+	}
+	segChan := make(chan segResult, len(segments))
+	errChan := make(chan error, 1)
+	downloadCtx, cancelDownloads := context.WithCancel(ctx)
+	defer cancelDownloads()
+	var dlProgress int64
+	for i := 0; i < len(segments); i++ {
+		if segments[i] == nil {
+			continue
 		}
-
-		if i >= len(segments) || segments[i] == nil {
-			break
-		}
-
-		seg := segments[i]
-		var segURL string
-		if strings.HasPrefix(seg.URI, "http") {
-			segURL = seg.URI
-		} else {
-			segURL = baseURL + seg.URI
-		}
-
-		segData, err := downloadBytes(ctx, segURL)
-		if err != nil {
-			return fmt.Errorf("download segment %d: %w", i, err)
-		}
-
-		segReader := bytes.NewReader(segData)
-		frag := mp4.NewFragment()
-		var soffset uint64 = 0
-		for {
-			box, err := mp4.DecodeBox(soffset, segReader)
-			if err == io.EOF {
-				break
+		i := i
+		go func() {
+			var segURL string
+			if strings.HasPrefix(segments[i].URI, "http") {
+				segURL = segments[i].URI
+			} else {
+				segURL = baseURL + segments[i].URI
 			}
+			data, err := downloadBytes(downloadCtx, segURL)
 			if err != nil {
-				return fmt.Errorf("decode segment %d box: %w", i, err)
+				errChan <- fmt.Errorf("download segment %d: %w", i, err)
+				return
 			}
-			bt := box.Type()
-			soffset += box.Size()
-			if bt == "moof" || bt == "emsg" || bt == "prft" {
-				frag.AddChild(box)
-				continue
+			var keyURI string
+			if segments[i].Key != nil && segments[i].Key.URI != "" {
+				keyURI = segments[i].Key.URI
+			} else {
+				keyURI = keyURIs[0]
 			}
-			if bt == "mdat" {
-				frag.AddChild(box)
-				break
+			segChan <- segResult{i, data, keyURI}
+		}()
+	}
+
+	// Collect downloaded segments in order
+	type parsedSeg struct {
+		frag       *mp4.Fragment
+		keyForSample string
+		trackID    uint32
+	}
+	parsed := make([]parsedSeg, 0, len(segments))
+	downloaded := 0
+	target := 0
+	for downloaded < len(segments) {
+		select {
+		case res := <-segChan:
+			segReader := bytes.NewReader(res.data)
+			frag := mp4.NewFragment()
+			var soffset uint64 = 0
+			for {
+				box, err := mp4.DecodeBox(soffset, segReader)
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					return fmt.Errorf("decode segment %d box: %w", res.index, err)
+				}
+				bt := box.Type()
+				soffset += box.Size()
+				if bt == "moof" || bt == "emsg" || bt == "prft" {
+					frag.AddChild(box)
+					continue
+				}
+				if bt == "mdat" {
+					frag.AddChild(box)
+					break
+				}
 			}
+			if frag.Moof == nil {
+				return fmt.Errorf("segment %d: no moof", res.index)
+			}
+			var trackID uint32
+			for _, traf := range frag.Moof.Trafs {
+				trackID = traf.Tfhd.TrackID
+			}
+			p := parsedSeg{frag, res.keyURI, trackID}
+			if res.index == len(parsed) {
+				parsed = append(parsed, p)
+			} else {
+				parsed = append(parsed, parsedSeg{})
+				copy(parsed[res.index+1:], parsed[res.index:])
+				parsed[res.index] = p
+			}
+			downloaded++
+			dlProgress += int64(len(res.data))
+			if progress != nil {
+				progress("Downloading", dlProgress, totalBytes)
+			}
+		case err := <-errChan:
+			cancelDownloads()
+			return err
 		}
+	}
 
-		if frag.Moof == nil {
-			return fmt.Errorf("segment %d: no moof", i)
-		}
-
-		var keyForSample string
-		if seg.Key != nil && seg.Key.URI != "" {
-			keyForSample = seg.Key.URI
-		} else {
-			keyForSample = keyURIs[0]
-		}
-
-		for _, traf := range frag.Moof.Trafs {
+	// Decrypt all samples in parallel using a worker pool
+	type sampleJob struct {
+		segIdx    int
+		sampleIdx int
+		data      []byte
+	}
+	type sampleResult struct {
+		segIdx    int
+		sampleIdx int
+		data      []byte
+	}
+	numWorkers := 4
+	jobs := make(chan sampleJob, 256)
+	results := make(chan sampleResult, 256)
+	var totalSamples int
+	for i := range parsed {
+		for _, traf := range parsed[i].frag.Moof.Trafs {
 			ti, ok := trackMap[traf.Tfhd.TrackID]
 			if !ok || ti.Sinf == nil {
 				continue
 			}
-
-			samples, err := frag.GetFullSamples(ti.Trex)
+			samples, err := parsed[i].frag.GetFullSamples(ti.Trex)
 			if err != nil {
 				return fmt.Errorf("get samples segment %d: %w", i, err)
 			}
-
-			for j := range samples {
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
-
-				decrypted, err := wm.DecryptSample(ctx, adamID, keyForSample, samples[j].Data, int32(j))
+			totalSamples += len(samples)
+		}
+	}
+	var wg sync.WaitGroup
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				decrypted, err := wm.DecryptSample(ctx, adamID, parsed[job.segIdx].keyForSample, job.data, int32(job.sampleIdx))
 				if err != nil {
-					return fmt.Errorf("decrypt sample %d/%d: %w", i, j, err)
+					select {
+					case errChan <- fmt.Errorf("decrypt sample %d/%d: %w", job.segIdx, job.sampleIdx, err):
+					default:
+					}
+					return
 				}
-				samples[j].Data = decrypted
-				totalDecrypted += int64(len(decrypted))
-				if progress != nil {
-					progress("Decrypting", totalDecrypted, totalBytes)
+				results <- sampleResult{job.segIdx, job.sampleIdx, decrypted}
+			}
+		}()
+	}
+
+	// Feed jobs and collect results in order
+	type segSamples struct {
+		samples []mp4.FullSample
+	}
+	segSampleMap := make([]segSamples, len(parsed))
+	for i := range parsed {
+		for _, traf := range parsed[i].frag.Moof.Trafs {
+			ti, ok := trackMap[traf.Tfhd.TrackID]
+			if !ok || ti.Sinf == nil {
+				continue
+			}
+			samples, err := parsed[i].frag.GetFullSamples(ti.Trex)
+			if err != nil {
+				return fmt.Errorf("get samples segment %d: %w", i, err)
+			}
+			segSampleMap[i] = segSamples{samples}
+			for j := range samples {
+				jobs <- sampleJob{i, j, samples[j].Data}
+			}
+		}
+	}
+	close(jobs)
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Collect decrypted results and write in order
+	resultMap := make(map[int]map[int][]byte)
+	for res := range results {
+		if resultMap[res.segIdx] == nil {
+			resultMap[res.segIdx] = make(map[int][]byte)
+		}
+		resultMap[res.segIdx][res.sampleIdx] = res.data
+	}
+	select {
+	case err := <-errChan:
+		return err
+	default:
+	}
+
+	var totalDecrypted int64
+	for i := range parsed {
+		for _, traf := range parsed[i].frag.Moof.Trafs {
+			ti, ok := trackMap[traf.Tfhd.TrackID]
+			if !ok || ti.Sinf == nil {
+				continue
+			}
+			samples, err := parsed[i].frag.GetFullSamples(ti.Trex)
+			if err != nil {
+				return fmt.Errorf("get samples segment %d: %w", i, err)
+			}
+			for j := range samples {
+				if d, ok := resultMap[i][j]; ok {
+					samples[j].Data = d
+					totalDecrypted += int64(len(d))
 				}
 			}
 		}
-
-		err = frag.Encode(outBuf)
+		err = parsed[i].frag.Encode(outBuf)
 		if err != nil {
 			return fmt.Errorf("write segment %d: %w", i, err)
 		}
-
 		if progress != nil {
-			progress("Decrypting", int64(len(segData))+int64(len(initData)), totalBytes)
+			progress("Decrypting", totalDecrypted, totalBytes)
 		}
 	}
 
