@@ -387,7 +387,6 @@ func DownloadAndDecrypt(ctx context.Context, wm *Client, adamID string, playlist
 				}
 			}
 			seg.frag.Mdat.Data = decryptedMdat
-			seg.frag.Mdat.lazyDataSize = 0
 		}
 		if err := seg.frag.Encode(outBuf); err != nil {
 			return fmt.Errorf("write segment %d: %w", segIdx, err)
