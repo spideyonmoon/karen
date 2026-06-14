@@ -78,11 +78,13 @@ This builds a single shared image (`karen-wrapper-manager:local`) used by all in
 Each wrapper-manager instance holds exactly one account. Login is a one-time interactive step per account.
 
 **For the first instance:**
+
 ```bash
 docker compose run --rm wrapper-manager-1 -L "APPLE_ID:PASSWORD"
 ```
 
 **For the second instance:**
+
 ```bash
 docker compose run --rm wrapper-manager-2 -L "APPLE_ID:PASSWORD"
 ```
@@ -99,6 +101,7 @@ docker compose up -d --build
 ```
 
 Monitor startup:
+
 ```bash
 docker compose logs -f bot
 ```
@@ -172,6 +175,7 @@ volumes:
 ```
 
 **Key rules:**
+
 - Each instance gets a unique **port** (8081, 8082, 8083, ...)
 - Each instance gets a unique **volume** (wm-data-1, wm-data-2, wm-data-3, ...)
 - Each instance gets a unique **container name** (karen-wm-1, karen-wm-2, ...)
@@ -215,50 +219,84 @@ The bot's pool automatically discovers and distributes across all configured ins
 
 ## Usage
 
-Send an Apple Music link to the bot in Telegram:
+### Commands
 
-- `/dl <url>` — download album, playlist, or individual track
-- `/status` — live progress board
-- `/cancel_<id>` — abort a running download
+| Command | Description |
+|---|---|
+| `/dl <url> [flags]` | Download a song, album, or playlist |
+| `/status` or `/queue` | Show active task and queue count |
+| `/stop_<task_id>` | Cancel a running or queued download |
+| `/help` | Show help message |
 
-The bot presents an inline keyboard for delivery mode:
-- **Individual Tracks** — sends each file separately (Bot API, <50MB each)
+### Flags (appended to `/dl`)
+
+| Flag | Description |
+|---|---|
+| `-aac` | Download in AAC-LC format |
+| `-atmos` | Download in Dolby Atmos format |
+| `-flac` | Convert to FLAC after download (requires ffmpeg) |
+| `-art` | Save artist cover art |
+| `-tgu` | Skip delivery keyboard — send as individual Telegram tracks |
+| `-tgz` | Skip delivery keyboard — send as Telegram ZIP |
+| `-go` | Skip delivery keyboard — send as Gofile ZIP |
+
+**Examples:**
+```
+/dl https://music.apple.com/album/123456
+/dl https://music.apple.com/album/123456 -aac
+/dl https://music.apple.com/song/789012 -atmos -tgz
+```
+
+### Delivery modes
+
+After `/dl`, the bot presents an inline keyboard (unless a headless flag is used):
+
+- **Individual Tracks** — sends each file separately via Bot API (<50MB each)
 - **Telegram ZIP** — MTProto upload up to 2GB
 - **Gofile ZIP** — fallback for oversized packages
+
+### Inline search
+
+```
+@bot <keywords> — search songs directly in any chat
+```
 
 ---
 
 ## Config reference
 
-| Field | Description |
-|---|---|
-| `telegram-bot-token` | Bot token from @BotFather |
-| `telegram-allowed-chat-ids` | Chat ID allowlist (e.g. `[-100123456789]`) |
-| `storefront` | Account region code (`us`, `jp`, `gb`, etc.) |
-| `media-user-token` | Apple Music API token from browser devtools |
-| `wrapper-manager-addrs` | List of `host:port` for each wrapper-manager instance |
-| `alac-max` | Max ALAC sample rate (`192000`, `96000`, `48000`, `44100`) |
-| `atmos-max` | Max Atmos bitrate (`2768`, `2448`) |
-| `aac-type` | AAC variant (`aac-lc`, `aac`, `aac-binaural`, `aac-downmix`) |
-| `convert-after-download` | Post-download format conversion (requires ffmpeg) |
-| `convert-format` | Target format (`flac`, `mp3`, `opus`, `wav`, `copy`) |
-| `telegram-api-id` | MTProto API ID from my.telegram.org |
-| `telegram-api-hash` | MTProto API hash from my.telegram.org |
-| `gofile-token` | Gofile API token for fallback delivery |
-| `song-file-format` | Output filename template (e.g. `"{SongNumer}. {SongName}"`) |
-| `album-folder-format` | Album folder name template |
+| Field                       | Description                                                  |
+| --------------------------- | ------------------------------------------------------------ |
+| `telegram-bot-token`        | Bot token from @BotFather                                    |
+| `telegram-allowed-chat-ids` | Chat ID allowlist (e.g. `[-100123456789]`)                   |
+| `storefront`                | Account region code (`us`, `jp`, `gb`, etc.)                 |
+| `media-user-token`          | Apple Music API token from browser devtools                  |
+| `wrapper-manager-addrs`     | List of `host:port` for each wrapper-manager instance        |
+| `alac-max`                  | Max ALAC sample rate (`192000`, `96000`, `48000`, `44100`)   |
+| `atmos-max`                 | Max Atmos bitrate (`2768`, `2448`)                           |
+| `aac-type`                  | AAC variant (`aac-lc`, `aac`, `aac-binaural`, `aac-downmix`) |
+| `convert-after-download`    | Post-download format conversion (requires ffmpeg)            |
+| `convert-format`            | Target format (`flac`, `mp3`, `opus`, `wav`, `copy`)         |
+| `telegram-api-id`           | MTProto API ID from my.telegram.org                          |
+| `telegram-api-hash`         | MTProto API hash from my.telegram.org                        |
+| `gofile-token`              | Gofile API token for fallback delivery                       |
+| `song-file-format`          | Output filename template (e.g. `"{SongNumer}. {SongName}"`)  |
+| `album-folder-format`       | Album folder name template                                   |
 
 ---
 
 ## Troubleshooting
 
 **Wrapper-manager fails to start:**
+
 - Ensure `--privileged` is set (required for Frida hooks in the Android emulator)
 - Check `docker compose logs wrapper-manager-1` for emulator errors
 - If the emulator is stuck, restart the container: `docker compose restart wrapper-manager-1`
 
 **"The item you tried to download is no longer available":**
+
 - The wrapper-manager's emulator may be in a stale state. Restart the affected instance:
+  
   ```bash
   docker compose restart wrapper-manager-1
   ```
@@ -266,16 +304,19 @@ The bot presents an inline keyboard for delivery mode:
 - Some tracks may be region-restricted — check your account's storefront
 
 **Tracks are preview clips (15-30 seconds):**
+
 - The bot may be falling back to the public catalog API instead of the authenticated M3U8 endpoint
 - Ensure `wrapper-manager-addrs` is configured and instances are running
 - Check that `needDlAacLc` is `false` in logs (should use authenticated M3U8 for ALAC)
 
 **Bot can't connect to wrapper-manager:**
+
 - Verify containers are on the same Docker network
 - Use Docker service names in config (e.g. `karen-wm-1:8081`), not `localhost`
 - Check `docker compose ps` to confirm all services are running
 
 **MTProto FLOOD_WAIT errors:**
+
 - Normal behavior — the bot automatically sleeps and retries
 - For persistent issues, check your API credentials at my.telegram.org
 
