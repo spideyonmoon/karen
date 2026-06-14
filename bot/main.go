@@ -685,19 +685,21 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 	}
 
 	var Quality string
-	if strings.Contains(Config.SongFileFormat, "Quality") {
-		if dl_atmos {
-			Quality = fmt.Sprintf("%dKbps", Config.AtmosMax-2000)
-		} else if needDlAacLc {
-			Quality = "256Kbps"
-		} else {
-			_, Quality, err = extractMedia(downloadM3u8, true)
-			if err != nil {
-				fmt.Println("Failed to extract quality from manifest.\n", err)
-				recordDownloadFailure("%s: failed to read quality from manifest: %v", track.Name, err)
-				counter.Inc(&counter.Error)
-				return
-			}
+	if dl_atmos {
+		Quality = fmt.Sprintf("%dKbps", Config.AtmosMax-2000)
+	} else if needDlAacLc {
+		Quality = "256Kbps"
+	} else {
+		var variantURL string
+		variantURL, Quality, err = extractMedia(downloadM3u8, true)
+		if err != nil {
+			fmt.Println("Failed to extract quality from manifest.\n", err)
+			recordDownloadFailure("%s: failed to read quality from manifest: %v", track.Name, err)
+			counter.Inc(&counter.Error)
+			return
+		}
+		if variantURL != "" {
+			downloadM3u8 = variantURL
 		}
 	}
 	track.Quality = Quality
