@@ -352,6 +352,11 @@ func DownloadAndDecrypt(ctx context.Context, wm *Client, adamID string, playlist
 	var totalDecrypted int64
 
 	decryptAndWrite := func(seg parsedSeg, segIdx int) error {
+		type trackSamples struct {
+			trackID uint32
+			samples []mp4.FullSample
+		}
+		var allTracks []trackSamples
 		for _, traf := range seg.frag.Moof.Trafs {
 			ti, ok := trackMap[traf.Tfhd.TrackID]
 			if !ok || ti.Sinf == nil {
@@ -372,6 +377,17 @@ func DownloadAndDecrypt(ctx context.Context, wm *Client, adamID string, playlist
 					progress("Decrypting", totalDecrypted, totalBytes)
 				}
 			}
+			allTracks = append(allTracks, trackSamples{traf.Tfhd.TrackID, samples})
+		}
+		if len(allTracks) > 0 {
+			var decryptedMdat []byte
+			for _, ts := range allTracks {
+				for _, s := range ts.samples {
+					decryptedMdat = append(decryptedMdat, s.Data...)
+				}
+			}
+			seg.frag.Mdat.Data = decryptedMdat
+			seg.frag.Mdat.lazyDataSize = 0
 		}
 		if err := seg.frag.Encode(outBuf); err != nil {
 			return fmt.Errorf("write segment %d: %w", segIdx, err)
