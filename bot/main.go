@@ -671,7 +671,17 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 			}
 		}
 	} else {
-		downloadM3u8 = track.M3u8
+		{
+			wm := wmPool.Acquire()
+			downloadM3u8, err = wm.M3U8(ctx, track.ID)
+			wmPool.Release(wm)
+			if err != nil {
+				fmt.Println("Failed to get ALAC/Atmos playback URL:", err)
+				recordDownloadFailure("%s: ALAC/Atmos M3U8 failed: %v", track.Name, err)
+				counter.Inc(&counter.Unavailable)
+				return
+			}
+		}
 	}
 
 	var Quality string
