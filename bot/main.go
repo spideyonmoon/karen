@@ -230,7 +230,7 @@ func isInArray(arr []int, target int) bool {
 func fileExists(path string) (bool, error) {
 	f, err := os.Stat(path)
 	if err == nil {
-		return !f.IsDir(), nil
+		return !f.IsDir() && f.Size() > 0, nil
 	} else if os.IsNotExist(err) {
 		return false, nil
 	}
