@@ -818,7 +818,7 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 	{
 		// Remux fMP4 → flat MP4 so go-mp4tag can tag it safely.
 		// ffmpeg stream-copy is significantly faster than MP4Box -add.
-		remuxPath := trackPath + ".remux"
+		remuxPath := trackPath + ".remux.m4a"
 		remuxCmd := exec.CommandContext(ctx, "ffmpeg",
 			"-y",
 			"-i", trackPath,
