@@ -1773,7 +1773,9 @@ func writeMP4Tags(track *task.Track, lrc string) error {
 
 	if track.CoverPath != "" && Config.EmbedCover {
 		if coverData, err := os.ReadFile(track.CoverPath); err == nil {
-			t.Cover = coverData
+			t.Pictures = []*mp4tag.MP4Picture{
+				{Data: coverData},
+			}
 		}
 	}
 
