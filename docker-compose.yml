@@ -7,7 +7,7 @@ services:
     privileged: true
     container_name: karen-wm-1
     volumes:
-      - wm-data-1:/root/rootfs/data
+      - wm-data-1:/root/data
     command: ["--host", "0.0.0.0", "--port", "8081", "-debug"]
     restart: unless-stopped
 
@@ -17,7 +17,7 @@ services:
     privileged: true
     container_name: karen-wm-2
     volumes:
-      - wm-data-2:/root/rootfs/data
+      - wm-data-2:/root/data
     command: ["--host", "0.0.0.0", "--port", "8082", "-debug"]
     restart: unless-stopped
 
