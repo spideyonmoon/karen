@@ -820,14 +820,14 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 		// ffmpeg stream-copy is significantly faster than MP4Box -add.
 		remuxPath := trackPath + ".remux"
 		remuxCmd := exec.CommandContext(ctx, "ffmpeg",
-			"-loglevel", "quiet", "-y",
+			"-y",
 			"-i", trackPath,
 			"-c", "copy",
 			remuxPath,
 		)
-		if err := remuxCmd.Run(); err != nil {
-			fmt.Println("Failed to remux fMP4:", err)
-			recordDownloadFailure("%s: ffmpeg remux failed: %v", track.Name, err)
+		if out, err := remuxCmd.CombinedOutput(); err != nil {
+			fmt.Printf("Failed to remux fMP4: %v. Output: %s\n", err, string(out))
+			recordDownloadFailure("%s: ffmpeg remux failed: %v, output: %s", track.Name, err, string(out))
 			counter.Inc(&counter.Error)
 			return
 		}
