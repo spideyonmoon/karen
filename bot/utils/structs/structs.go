@@ -1,5 +1,7 @@
 package structs
 
+import "sync"
+
 type ConfigSet struct {
 	Storefront                 string  `yaml:"storefront"`
 	AuthorizationToken         string  `yaml:"authorization-token"`
@@ -60,11 +62,18 @@ type ConfigSet struct {
 }
 
 type Counter struct {
+	mu          sync.Mutex
 	Unavailable int
 	NotSong     int
 	Error       int
 	Success     int
 	Total       int
+}
+
+func (c *Counter) Inc(field *int) {
+	c.mu.Lock()
+	*field++
+	c.mu.Unlock()
 }
 
 // 艺术家页面
