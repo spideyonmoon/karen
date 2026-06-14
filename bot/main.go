@@ -816,12 +816,18 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 	}
 
 	{
-		// Remux fMP4 to standard MP4 (go-mp4tag corrupts fMP4 by leaving trun offsets stale)
+		// Remux fMP4 → flat MP4 so go-mp4tag can tag it safely.
+		// ffmpeg stream-copy is significantly faster than MP4Box -add.
 		remuxPath := trackPath + ".remux"
-		remuxCmd := exec.CommandContext(ctx, "MP4Box", "-add", trackPath, "-new", remuxPath)
+		remuxCmd := exec.CommandContext(ctx, "ffmpeg",
+			"-loglevel", "quiet", "-y",
+			"-i", trackPath,
+			"-c", "copy",
+			remuxPath,
+		)
 		if err := remuxCmd.Run(); err != nil {
 			fmt.Println("Failed to remux fMP4:", err)
-			recordDownloadFailure("%s: MP4Box remux failed: %v", track.Name, err)
+			recordDownloadFailure("%s: ffmpeg remux failed: %v", track.Name, err)
 			counter.Inc(&counter.Error)
 			return
 		}
@@ -833,10 +839,7 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 		}
 	}
 
-	tags := []string{
-		"tool=",
-		"artist=AppleMusic",
-	}
+	// Download per-track cover for playlist/station entries if needed.
 	if Config.EmbedCover {
 		if (strings.Contains(track.PreID, "pl.") || strings.Contains(track.PreID, "ra.")) && Config.DlAlbumcoverForPlaylist {
 			track.CoverPath, err = writeCover(track.SaveDir, track.ID, track.Resp.Attributes.Artwork.URL)
@@ -844,23 +847,8 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 				fmt.Println("Failed to write cover.")
 			}
 		}
-		tags = append(tags, fmt.Sprintf("cover=%s", track.CoverPath))
 	}
-	tagsString := strings.Join(tags, ":")
-	cmd := exec.CommandContext(ctx, "MP4Box", "-itags", tagsString, trackPath)
-	if err := cmd.Run(); err != nil {
-		fmt.Printf("Embed failed: %v\n", err)
-		recordDownloadFailure("%s: MP4Box tagging failed: %v", track.Name, err)
-		counter.Inc(&counter.Error)
-		return
-	}
-	if (strings.Contains(track.PreID, "pl.") || strings.Contains(track.PreID, "ra.")) && Config.DlAlbumcoverForPlaylist {
-		if err := os.Remove(track.CoverPath); err != nil {
-			fmt.Printf("Error deleting file: %s\n", track.CoverPath)
-			counter.Inc(&counter.Error)
-			return
-		}
-	}
+
 	track.SavePath = trackPath
 	err = writeMP4Tags(track, lrc)
 	if err != nil {
@@ -868,6 +856,11 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 		recordDownloadFailure("%s: failed to write MP4 tags: %v", track.Name, err)
 		counter.Inc(&counter.Unavailable)
 		return
+	}
+
+	// Clean up per-track cover written above (not the shared album cover).
+	if Config.EmbedCover && (strings.Contains(track.PreID, "pl.") || strings.Contains(track.PreID, "ra.")) && Config.DlAlbumcoverForPlaylist {
+		_ = os.Remove(track.CoverPath)
 	}
 
 	convertIfNeeded(track, lrc)
@@ -1776,6 +1769,12 @@ func writeMP4Tags(track *task.Track, lrc string) error {
 		t.ItunesAdvisory = mp4tag.ItunesAdvisoryClean
 	} else {
 		t.ItunesAdvisory = mp4tag.ItunesAdvisoryNone
+	}
+
+	if track.CoverPath != "" && Config.EmbedCover {
+		if coverData, err := os.ReadFile(track.CoverPath); err == nil {
+			t.Cover = coverData
+		}
 	}
 
 	mp4, err := mp4tag.Open(track.SavePath)

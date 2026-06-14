@@ -265,83 +265,79 @@ func DownloadAndDecrypt(ctx context.Context, wm *Client, adamID string, playlist
 		}()
 	}
 
-	// Collect downloaded segments (arrive out of order)
+	// Pipelined collect + decrypt: process segments in order as they arrive.
+	// As soon as segment[nextToDecrypt] lands, decrypt+write it immediately —
+	// while the remaining goroutines are still downloading later segments.
+	// This overlaps the two most expensive phases rather than running them serially.
 	type parsedSeg struct {
 		frag         *mp4.Fragment
 		keyForSample string
 		trackID      uint32
 	}
-	parsedMap := make(map[int]parsedSeg, len(segments))
-	downloaded := 0
-	for downloaded < totalSegments {
-		select {
-		case res := <-segChan:
-			segReader := bytes.NewReader(res.data)
-			frag := mp4.NewFragment()
-			var soffset uint64 = 0
-			for {
-				box, err := mp4.DecodeBox(soffset, segReader)
-				if err == io.EOF {
-					break
-				}
-				if err != nil {
-					return fmt.Errorf("decode segment %d box: %w", res.index, err)
-				}
-				bt := box.Type()
-				soffset += box.Size()
-				if bt == "moof" || bt == "emsg" || bt == "prft" {
-					frag.AddChild(box)
-					continue
-				}
-				if bt == "mdat" {
-					frag.AddChild(box)
-					break
-				}
+
+	parseSeg := func(res struct {
+		index  int
+		data   []byte
+		keyURI string
+	}) (parsedSeg, error) {
+		segReader := bytes.NewReader(res.data)
+		frag := mp4.NewFragment()
+		var soffset uint64 = 0
+		for {
+			box, err := mp4.DecodeBox(soffset, segReader)
+			if err == io.EOF {
+				break
 			}
-			if frag.Moof == nil {
-				return fmt.Errorf("segment %d: no moof", res.index)
+			if err != nil {
+				return parsedSeg{}, fmt.Errorf("decode segment %d box: %w", res.index, err)
 			}
-			var trackID uint32
-			for _, traf := range frag.Moof.Trafs {
-				trackID = traf.Tfhd.TrackID
+			bt := box.Type()
+			soffset += box.Size()
+			if bt == "moof" || bt == "emsg" || bt == "prft" {
+				frag.AddChild(box)
+				continue
 			}
-			parsedMap[res.index] = parsedSeg{frag, res.keyURI, trackID}
-			downloaded++
-			dlProgress += int64(len(res.data))
-			if progress != nil {
-				progress("Downloading", dlProgress, totalBytes)
+			if bt == "mdat" {
+				frag.AddChild(box)
+				break
 			}
-		case err := <-errChan:
-			cancelDownloads()
-			return err
 		}
+		if frag.Moof == nil {
+			return parsedSeg{}, fmt.Errorf("segment %d: no moof", res.index)
+		}
+		var trackID uint32
+		for _, traf := range frag.Moof.Trafs {
+			trackID = traf.Tfhd.TrackID
+		}
+		return parsedSeg{frag, res.keyURI, trackID}, nil
 	}
 
-	// Convert to ordered slice
-	parsed := make([]parsedSeg, 0, len(parsedMap))
-	for i := 0; i < len(segments); i++ {
-		if p, ok := parsedMap[i]; ok {
-			parsed = append(parsed, p)
-		}
+	// readyMap holds segments that arrived but whose predecessors aren't decrypted yet.
+	type rawSeg = struct {
+		index  int
+		data   []byte
+		keyURI string
 	}
-
-	// Decrypt and write segments sequentially using the persistent stream
-	totalBytes = int64(len(initData)) + dlProgress
+	readyMap := make(map[int]parsedSeg, totalSegments)
+	received := 0
+	nextToDecrypt := 0
+	totalBytes = int64(len(initData)) + int64(totalSegments)*512*1024 // rough estimate
 	var totalDecrypted int64
-	for i := range parsed {
-		for _, traf := range parsed[i].frag.Moof.Trafs {
+
+	decryptAndWrite := func(seg parsedSeg, segIdx int) error {
+		for _, traf := range seg.frag.Moof.Trafs {
 			ti, ok := trackMap[traf.Tfhd.TrackID]
 			if !ok || ti.Sinf == nil {
 				continue
 			}
-			samples, err := parsed[i].frag.GetFullSamples(ti.Trex)
+			samples, err := seg.frag.GetFullSamples(ti.Trex)
 			if err != nil {
-				return fmt.Errorf("get samples segment %d: %w", i, err)
+				return fmt.Errorf("get samples segment %d: %w", segIdx, err)
 			}
 			for j := range samples {
-				decrypted, err := ds.Decrypt(parsed[i].keyForSample, samples[j].Data, int32(j))
+				decrypted, err := ds.Decrypt(seg.keyForSample, samples[j].Data, int32(j))
 				if err != nil {
-					return fmt.Errorf("decrypt sample %d/%d: %w", i, j, err)
+					return fmt.Errorf("decrypt sample %d/%d: %w", segIdx, j, err)
 				}
 				samples[j].Data = decrypted
 				totalDecrypted += int64(len(decrypted))
@@ -350,14 +346,54 @@ func DownloadAndDecrypt(ctx context.Context, wm *Client, adamID string, playlist
 				}
 			}
 		}
-		err := parsed[i].frag.Encode(outBuf)
-		if err != nil {
-			return fmt.Errorf("write segment %d: %w", i, err)
+		if err := seg.frag.Encode(outBuf); err != nil {
+			return fmt.Errorf("write segment %d: %w", segIdx, err)
+		}
+		return nil
+	}
+
+	for nextToDecrypt < totalSegments {
+		// If the next segment we need is already buffered, decrypt it immediately.
+		if seg, ok := readyMap[nextToDecrypt]; ok {
+			delete(readyMap, nextToDecrypt)
+			if err := decryptAndWrite(seg, nextToDecrypt); err != nil {
+				cancelDownloads()
+				return err
+			}
+			nextToDecrypt++
+			continue
+		}
+		// Otherwise block until a download completes.
+		select {
+		case res := <-segChan:
+			received++
+			dlProgress += int64(len(res.data))
+			if progress != nil {
+				progress("Downloading", dlProgress, totalBytes)
+			}
+			parsed, err := parseSeg(rawSeg(res))
+			if err != nil {
+				cancelDownloads()
+				return err
+			}
+			if res.index == nextToDecrypt {
+				// This is exactly the segment we're waiting for — decrypt inline.
+				if err := decryptAndWrite(parsed, res.index); err != nil {
+					cancelDownloads()
+					return err
+				}
+				nextToDecrypt++
+			} else {
+				// Arrived out of order — buffer it.
+				readyMap[res.index] = parsed
+			}
+		case err := <-errChan:
+			cancelDownloads()
+			return err
 		}
 	}
 
-	err = outBuf.Flush()
-	if err != nil {
+	if err := outBuf.Flush(); err != nil {
 		return fmt.Errorf("flush output: %w", err)
 	}
 	return nil
