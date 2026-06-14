@@ -1,111 +1,308 @@
-# 🎵 Karen - Apple Music Telegram Bot
+# Karen — Apple Music Telegram Bot
 
-Karen is a high-performance, robust Telegram bot built in Go. It acts as a bridge to directly rip music from Apple Music in lossless ALAC/FLAC or AAC quality, embed all metadata and cover arts, and deliver the files directly to your Telegram chat. 
-
-When Telegram's native file-size limits hit, Karen flexes her muscles: she leverages MTProto to upload files up to 2GB or seamlessly falls back to Gofile for delivery.
+Karen rips lossless ALAC, Atmos, and AAC from Apple Music and delivers files directly to your Telegram chat. She handles DRM decryption, metadata embedding, cover art, and intelligent delivery — sending individual tracks under 50MB via Bot API, zipping and uploading up to 2GB via MTProto, or falling back to Gofile for oversized packages.
 
 ---
 
-## ✨ Features
+## Architecture
 
-- **Pristine Quality:** Rips lossless ALAC, FLAC, and AAC directly from Apple Music.
-- **Music Videos:** Full support for downloading and muxing Music Videos.
-- **Smart Delivery:** 
-  - **Telegram Bot API:** Fast delivery for individual tracks under 50MB.
-  - **MTProto Integration:** Bypasses Telegram limits to deliver entire ZIPs (up to 2GB) directly in chat.
-  - **Gofile Integration:** Automatically uploads and provides high-speed download links for oversized packages or when MTProto isn't ready.
-- **Dynamic Status Board:** Beautiful, live-updating ASCII status board showing download progress, transfer modes, and queue status.
-- **Instant Cancellation:** Powerful `/cancel_<id>` command instantly severs HTTP connections and kills background ffmpeg processes mid-download.
-- **Fully Dockerized:** Easy deployment with Docker Compose, running seamlessly alongside the decryption wrapper.
-
----
-
-## 🛠 Prerequisites
-
-Before starting, ensure you have:
-1. A Linux server/VPS (Ubuntu/Debian recommended).
-2. [Docker](https://docs.docker.com/get-docker/) & [Docker Compose](https://docs.docker.com/compose/install/) installed.
-3. A **Telegram Bot Token** (from [@BotFather](https://t.me/BotFather)).
-4. An **Apple ID** with an active Apple Music subscription.
-5. (Optional) A **Telegram MTProto Session** if you want to deliver files >50MB natively in Telegram.
-6. (Optional) A **Gofile API Token** to avoid guest upload limits.
-
----
-
-## 🚀 Installation & Deployment
-
-Karen is deployed in two parts: the **Decryption Wrapper** (which handles Apple Music API auth and DRM) and the **Bot Core**.
-
-> [!WARNING]
-> The wrapper is an upstream dependency and is **not maintained in this repository**. If a new Apple Music update rolls out or the wrapper breaks, you should pull the latest version directly from the [WorldObservationLog/wrapper](https://github.com/WorldObservationLog/wrapper/) repository.
-
-### 1. Clone the Repository
-```bash
-git clone https://github.com/spideyonmoon/karen.git ~/karen
-cd ~/karen
+```
+┌─────────────┐     ┌──────────────┐     ┌──────────────┐
+│  Telegram    │────▶│  Bot (Go)    │────▶│  Wrapper-Mgr │  ← runs Android emulator
+│  User        │◀────│  docker      │◀────│  gRPC :8081  │     with Frida hooks
+└─────────────┘     │              │     └──────────────┘
+                    │  pool.go     │     ┌──────────────┐
+                    │  distributes │────▶│  Wrapper-Mgr │  ← second account
+                    │  across N    │◀────│  gRPC :8082  │
+                    │  instances   │     └──────────────┘
+                    └──────────────┘          ...
 ```
 
-### 2. Configure the Bot
-Configure your bot's settings by editing the config file:
+- **Wrapper-manager** ([upstream](https://github.com/WorldObservationLog/wrapper-manager)) — runs an Android emulator with a hooked Apple Music app. Exposes gRPC endpoints for M3U8 playlists, WebPlayback (AAC-LC), and real-time DRM decryption. Each instance holds one Apple Music account.
+- **Bot** — Go binary that receives Telegram commands, fetches playlists via gRPC, downloads HLS segments in parallel, decrypts them through a bidirectional gRPC stream, remuxes with ffmpeg, and delivers files.
+- **Pool** — channel-based FIFO pool that distributes load across all wrapper-manager instances. Acquire a client, use it, release it. Automatically rotates accounts.
+
+---
+
+## Prerequisites
+
+1. **Linux VPS** (Ubuntu/Debian recommended) with Docker and Docker Compose
+2. **Telegram Bot Token** from [@BotFather](https://t.me/BotFather)
+3. **Apple Music accounts** — one account per wrapper-manager instance
+4. **(Optional)** Telegram API credentials from [my.telegram.org](https://my.telegram.org) for MTProto uploads >50MB
+5. **(Optional)** Gofile API token for fallback delivery
+
+---
+
+## Setup
+
+### 1. Clone and configure
+
 ```bash
+git clone -b feat/wrapper-manager https://github.com/spideyonmoon/karen.git ~/karen
+cd ~/karen
+cp bot/config.yaml.example bot/config.yaml
 nano bot/config.yaml
 ```
 
-Fill in the critical details:
+Fill in the required fields:
+
 ```yaml
-telegram-bot-token: "YOUR_BOT_TOKEN_HERE"
-telegram-allowed-chat-ids: [-100123456789] # Your private chat/group IDs
+telegram-bot-token: "YOUR_BOT_TOKEN"
+telegram-allowed-chat-ids: [-100123456789]   # your chat/group IDs
+storefront: "us"                              # account region (us, jp, etc.)
+media-user-token: "YOUR_MEDIA_USER_TOKEN"     # from browser devtools on music.apple.com
 
-# Optional: Gofile Token for oversized files
-gofile-token: "YOUR_GOFILE_TOKEN_HERE"
+# MTProto (optional, for >50MB uploads)
+telegram-api-id: 0
+telegram-api-hash: ""
 
-# Keep these network settings so the bot finds the wrapper via Docker
-decrypt-m3u8-port: "wrapper:10020"
-get-m3u8-port: "wrapper:20020"
+gofile-token: ""
+
+# Wrapper-manager addresses — one per instance
+wrapper-manager-addrs:
+  - "karen-wm-1:8081"
+  - "karen-wm-2:8082"
 ```
 
-> [!NOTE]
-> To configure MTProto, you will also need to provide your `telegram-api-id` and `telegram-api-hash` (which can be obtained from [my.telegram.org](https://my.telegram.org)). Run the bot locally once to generate a session string, which is then placed in your config. No OTP or extra verification is needed for this workflow!
-
-### 3. Initialize the Apple Music Wrapper
-Before launching the background services, the wrapper must be authenticated with your Apple ID. This is a one-time interactive step.
-
-First, build the wrapper image:
-```bash
-sudo docker compose build wrapper
-```
-
-Next, run the interactive login:
-> [!IMPORTANT]  
-> Replace `YOUR_APPLE_ID:YOUR_PASSWORD` with your actual Apple credentials.
-```bash
-sudo docker run --privileged --rm -it \
-  -v ./wrapper/wrapper-data:/app/rootfs/data \
-  --entrypoint /app/wrapper \
-  karen-wrapper:local -L "YOUR_APPLE_ID:YOUR_PASSWORD" -H 0.0.0.0
-```
-*Wait for the "Login successful" message, then press `Ctrl+C` to exit. Your session is now saved in the `wrapper/wrapper-data` volume.*
-
-### 4. Fire It Up!
-With the configuration saved and the wrapper authenticated, launch the full stack in the background:
+### 2. Build wrapper-manager image
 
 ```bash
-sudo docker compose up -d --build
+docker compose build wrapper-manager
 ```
 
-You can monitor the bot's logs to ensure everything started smoothly:
+This builds a single shared image (`karen-wrapper-manager:local`) used by all instances. It clones the upstream wrapper-manager, patches the WebPlayback nil-safety bug, and increases the emulator timeout from 5s to 25s.
+
+### 3. Login Apple Music accounts
+
+Each wrapper-manager instance holds exactly one account. Login is a one-time interactive step per account.
+
+**For the first instance:**
 ```bash
-sudo docker compose logs -f bot
+docker compose run --rm wrapper-manager-1 -L "APPLE_ID:PASSWORD"
 ```
+
+**For the second instance:**
+```bash
+docker compose run --rm wrapper-manager-2 -L "APPLE_ID:PASSWORD"
+```
+
+Wait for `Login successful` or the wrapper ready message, then `Ctrl+C`. The account data persists in the Docker volume (`wm-data-X`).
+
+> [!IMPORTANT]
+> Login must go through the wrapper-manager's gRPC interface (the `-L` flag), not the raw wrapper binary. The manager registers the instance in `instances.json` and manages the emulator lifecycle. Raw `wrapper -L` login does NOT persist under the correct volume path.
+
+### 4. Start the stack
+
+```bash
+docker compose up -d --build
+```
+
+Monitor startup:
+```bash
+docker compose logs -f bot
+```
+
+You should see both wrapper-managers report `Wrapper ready` and the bot print `Telegram bot started. Waiting for updates...`.
 
 ---
 
-## 🎮 Usage
+## Scaling to N accounts
 
-Simply send an Apple Music link (album, playlist, or individual track) to the bot in Telegram. 
+To add more wrapper-manager instances (e.g., 6-8 accounts):
 
-- `/dl <apple_music_url>` - Initiates the download. The bot will present an inline keyboard to choose your preferred delivery method (Individual Tracks, Telegram ZIP, or Gofile ZIP).
-- `/status` or `/queue` - Displays the live ASCII status board showing the active task, elapsed time, and any pending items in the queue.
-- `/cancel_<task_id>` - Instantly aborts a running or queued download.
+### 1. Add services to `docker-compose.yml`
+
+Each instance needs its own service definition and named volume:
+
+```yaml
+services:
+  wrapper-manager-1:
+    build: ./wrapper-manager
+    image: karen-wrapper-manager:local
+    privileged: true
+    container_name: karen-wm-1
+    volumes:
+      - wm-data-1:/root/data
+    command: ["--host", "0.0.0.0", "--port", "8081", "-debug"]
+    restart: unless-stopped
+
+  wrapper-manager-2:
+    build: ./wrapper-manager
+    image: karen-wrapper-manager:local
+    privileged: true
+    container_name: karen-wm-2
+    volumes:
+      - wm-data-2:/root/data
+    command: ["--host", "0.0.0.0", "--port", "8082", "-debug"]
+    restart: unless-stopped
+
+  wrapper-manager-3:
+    build: ./wrapper-manager
+    image: karen-wrapper-manager:local
+    privileged: true
+    container_name: karen-wm-3
+    volumes:
+      - wm-data-3:/root/data
+    command: ["--host", "0.0.0.0", "--port", "8083", "-debug"]
+    restart: unless-stopped
+
+  # ... repeat for wrapper-manager-4, 5, 6, etc.
+
+  bot:
+    build: ./bot
+    container_name: karen-bot
+    depends_on:
+      - wrapper-manager-1
+      - wrapper-manager-2
+      - wrapper-manager-3
+      # ... list all instances here
+    volumes:
+      - ./bot/config.yaml:/app/config.yaml
+      - ./bot/downloads:/downloads
+      - ./bot/telegram-cache.json:/app/telegram-cache.json
+    command: ["--bot"]
+    restart: unless-stopped
+
+volumes:
+  wm-data-1:
+  wm-data-2:
+  wm-data-3:
+  # ... one volume per instance
+```
+
+**Key rules:**
+- Each instance gets a unique **port** (8081, 8082, 8083, ...)
+- Each instance gets a unique **volume** (wm-data-1, wm-data-2, wm-data-3, ...)
+- Each instance gets a unique **container name** (karen-wm-1, karen-wm-2, ...)
+- All instances share the same `karen-wrapper-manager:local` image
+- The bot's `depends_on` must list all instances
+
+### 2. Update `bot/config.yaml`
+
+Add all instance addresses:
+
+```yaml
+wrapper-manager-addrs:
+  - "karen-wm-1:8081"
+  - "karen-wm-2:8082"
+  - "karen-wm-3:8083"
+  - "karen-wm-4:8084"
+  - "karen-wm-5:8085"
+  - "karen-wm-6:8086"
+  - "karen-wm-7:8087"
+  - "karen-wm-8:8088"
+```
+
+### 3. Login each account
+
+```bash
+for i in 1 2 3 4 5 6 7 8; do
+  echo "=== Login wrapper-manager-$i ==="
+  docker compose run --rm wrapper-manager-$i -L "APPLE_ID_$i:PASSWORD_$i"
+done
+```
+
+### 4. Start everything
+
+```bash
+docker compose up -d --build
+```
+
+The bot's pool automatically discovers and distributes across all configured instances. No code changes needed.
 
 ---
+
+## Usage
+
+Send an Apple Music link to the bot in Telegram:
+
+- `/dl <url>` — download album, playlist, or individual track
+- `/status` — live progress board
+- `/cancel_<id>` — abort a running download
+
+The bot presents an inline keyboard for delivery mode:
+- **Individual Tracks** — sends each file separately (Bot API, <50MB each)
+- **Telegram ZIP** — MTProto upload up to 2GB
+- **Gofile ZIP** — fallback for oversized packages
+
+---
+
+## Config reference
+
+| Field | Description |
+|---|---|
+| `telegram-bot-token` | Bot token from @BotFather |
+| `telegram-allowed-chat-ids` | Chat ID allowlist (e.g. `[-100123456789]`) |
+| `storefront` | Account region code (`us`, `jp`, `gb`, etc.) |
+| `media-user-token` | Apple Music API token from browser devtools |
+| `wrapper-manager-addrs` | List of `host:port` for each wrapper-manager instance |
+| `alac-max` | Max ALAC sample rate (`192000`, `96000`, `48000`, `44100`) |
+| `atmos-max` | Max Atmos bitrate (`2768`, `2448`) |
+| `aac-type` | AAC variant (`aac-lc`, `aac`, `aac-binaural`, `aac-downmix`) |
+| `convert-after-download` | Post-download format conversion (requires ffmpeg) |
+| `convert-format` | Target format (`flac`, `mp3`, `opus`, `wav`, `copy`) |
+| `telegram-api-id` | MTProto API ID from my.telegram.org |
+| `telegram-api-hash` | MTProto API hash from my.telegram.org |
+| `gofile-token` | Gofile API token for fallback delivery |
+| `song-file-format` | Output filename template (e.g. `"{SongNumer}. {SongName}"`) |
+| `album-folder-format` | Album folder name template |
+
+---
+
+## Troubleshooting
+
+**Wrapper-manager fails to start:**
+- Ensure `--privileged` is set (required for Frida hooks in the Android emulator)
+- Check `docker compose logs wrapper-manager-1` for emulator errors
+- If the emulator is stuck, restart the container: `docker compose restart wrapper-manager-1`
+
+**"The item you tried to download is no longer available":**
+- The wrapper-manager's emulator may be in a stale state. Restart the affected instance:
+  ```bash
+  docker compose restart wrapper-manager-1
+  ```
+- Verify the account has an active Apple Music subscription
+- Some tracks may be region-restricted — check your account's storefront
+
+**Tracks are preview clips (15-30 seconds):**
+- The bot may be falling back to the public catalog API instead of the authenticated M3U8 endpoint
+- Ensure `wrapper-manager-addrs` is configured and instances are running
+- Check that `needDlAacLc` is `false` in logs (should use authenticated M3U8 for ALAC)
+
+**Bot can't connect to wrapper-manager:**
+- Verify containers are on the same Docker network
+- Use Docker service names in config (e.g. `karen-wm-1:8081`), not `localhost`
+- Check `docker compose ps` to confirm all services are running
+
+**MTProto FLOOD_WAIT errors:**
+- Normal behavior — the bot automatically sleeps and retries
+- For persistent issues, check your API credentials at my.telegram.org
+
+---
+
+## Project structure
+
+```
+karen/
+├── bot/                        # Go binary
+│   ├── main.go                 # Core: ripTrack, extractMedia, album/playlist flows
+│   ├── telegram_bot.go         # Telegram bot handler, download queue, delivery
+│   ├── mtproto.go              # MTProto client for large uploads
+│   ├── config.yaml.example     # Config template
+│   ├── utils/
+│   │   ├── wmgrpc/
+│   │   │   ├── client.go       # gRPC client: M3U8, WebPlayback, Decrypt, Login
+│   │   │   ├── decrypt.go      # HLS download + decrypt pipeline
+│   │   │   └── pool.go         # Channel-based FIFO client pool
+│   │   ├── structs/            # Shared data structures
+│   │   ├── task/               # Album/playlist/track task models
+│   │   ├── ampapi/             # Apple Music catalog API
+│   │   └── gofile.go           # Gofile upload client
+│   └── Dockerfile              # Multi-stage: Go build + GPAC + ffmpeg
+├── wrapper-manager/
+│   ├── Dockerfile              # Builds upstream wrapper-manager + patches
+│   └── webplay.go              # Nil-safety patch for WebPlayback handler
+├── docker-compose.yml          # Stack: N wrapper-managers + bot
+└── SESSION_HISTORY.md          # Development log
+```
