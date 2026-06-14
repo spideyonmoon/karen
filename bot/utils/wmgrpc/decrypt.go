@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 
@@ -49,6 +50,28 @@ func downloadBytes(ctx context.Context, url string) ([]byte, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, url)
+	}
+	return io.ReadAll(resp.Body)
+}
+
+func downloadBytesRange(ctx context.Context, url string, offset, limit int64) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	if limit > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+limit-1))
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, url)
 	}
 	return io.ReadAll(resp.Body)
@@ -142,32 +165,30 @@ func DownloadAndDecrypt(ctx context.Context, wm *Client, adamID string, playlist
 		return errors.New("no segments in playlist")
 	}
 
-	var baseURL string
-	if strings.HasPrefix(segment0.URI, "http") {
-		baseURL = segment0.URI[:strings.LastIndex(segment0.URI, "/")+1]
-	} else {
-		lastSlash := strings.LastIndex(mediaURL, "/")
-		if lastSlash >= 0 {
-			baseURL = mediaURL[:lastSlash+1]
-		} else {
-			baseURL = ""
-		}
+	mediaParsed, err := url.Parse(mediaURL)
+	if err != nil {
+		return fmt.Errorf("parse media URL: %w", err)
 	}
 
 	var initURL string
 	if segment0.Map != nil && segment0.Map.URI != "" {
-		if strings.HasPrefix(segment0.Map.URI, "http") {
-			initURL = segment0.Map.URI
-		} else {
-			initURL = baseURL + segment0.Map.URI
+		initParsed, err := url.Parse(segment0.Map.URI)
+		if err != nil {
+			return fmt.Errorf("parse init URI: %w", err)
 		}
+		initURL = mediaParsed.ResolveReference(initParsed).String()
 	}
 
 	if initURL == "" {
 		return errors.New("no init segment URL in playlist")
 	}
 
-	initData, err := downloadBytes(ctx, initURL)
+	var initData []byte
+	if segment0.Map != nil && segment0.Map.Limit > 0 {
+		initData, err = downloadBytesRange(ctx, initURL, segment0.Map.Offset, segment0.Map.Limit)
+	} else {
+		initData, err = downloadBytes(ctx, initURL)
+	}
 	if err != nil {
 		return fmt.Errorf("download init segment: %w", err)
 	}
@@ -244,13 +265,19 @@ func DownloadAndDecrypt(ctx context.Context, wm *Client, adamID string, playlist
 		}
 		i := i
 		go func() {
-			var segURL string
-			if strings.HasPrefix(segments[i].URI, "http") {
-				segURL = segments[i].URI
-			} else {
-				segURL = baseURL + segments[i].URI
+			segParsed, err := url.Parse(segments[i].URI)
+			if err != nil {
+				errChan <- fmt.Errorf("parse segment %d URI: %w", i, err)
+				return
 			}
-			data, err := downloadBytes(downloadCtx, segURL)
+			segURL := mediaParsed.ResolveReference(segParsed).String()
+
+			var data []byte
+			if segments[i].Limit > 0 {
+				data, err = downloadBytesRange(downloadCtx, segURL, segments[i].Offset, segments[i].Limit)
+			} else {
+				data, err = downloadBytes(downloadCtx, segURL)
+			}
 			if err != nil {
 				errChan <- fmt.Errorf("download segment %d: %w", i, err)
 				return
