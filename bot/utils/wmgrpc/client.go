@@ -3,6 +3,7 @@ package wmgrpc
 import (
 	"context"
 	"fmt"
+	"time"
 
 	pb "github.com/WorldObservationLog/wrapper-manager/proto"
 	"google.golang.org/grpc"
@@ -51,6 +52,8 @@ func (c *Client) M3U8(ctx context.Context, adamID string) (string, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	resp, err := c.client.M3U8(ctx, &pb.M3U8Request{
 		Data: &pb.M3U8DataRequest{AdamId: adamID},
 	})
@@ -67,6 +70,8 @@ func (c *Client) WebPlayback(ctx context.Context, adamID string) (string, error)
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	resp, err := c.client.WebPlayback(ctx, &pb.WebPlaybackRequest{
 		Data: &pb.WebPlaybackDataRequest{AdamId: adamID},
 	})

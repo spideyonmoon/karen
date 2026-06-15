@@ -659,28 +659,42 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 	// If AAC-LC, get M3U8 via WebPlayback; otherwise use track.M3u8
 	var downloadM3u8 string
 	if needDlAacLc {
-		{
+		for attempt := 0; attempt < 2; attempt++ {
 			wm := wmPool.Acquire()
 			downloadM3u8, err = wm.WebPlayback(ctx, track.ID)
 			wmPool.Release(wm)
-			if err != nil {
-				fmt.Println("Failed to get AAC-LC playback URL:", err)
-				recordDownloadFailure("%s: AAC-LC WebPlayback failed: %v", track.Name, err)
-				counter.Inc(&counter.Unavailable)
-				return
+			if err == nil {
+				break
+			}
+			if attempt == 0 {
+				fmt.Printf("WebPlayback attempt 1 failed, retrying with different instance: %v\n", err)
+				time.Sleep(2 * time.Second)
 			}
 		}
+		if err != nil {
+			fmt.Println("Failed to get AAC-LC playback URL:", err)
+			recordDownloadFailure("%s: AAC-LC WebPlayback failed: %v", track.Name, err)
+			counter.Inc(&counter.Unavailable)
+			return
+		}
 	} else {
-		{
+		for attempt := 0; attempt < 2; attempt++ {
 			wm := wmPool.Acquire()
 			downloadM3u8, err = wm.M3U8(ctx, track.ID)
 			wmPool.Release(wm)
-			if err != nil {
-				fmt.Println("Failed to get ALAC/Atmos playback URL:", err)
-				recordDownloadFailure("%s: ALAC/Atmos M3U8 failed: %v", track.Name, err)
-				counter.Inc(&counter.Unavailable)
-				return
+			if err == nil {
+				break
 			}
+			if attempt == 0 {
+				fmt.Printf("M3U8 attempt 1 failed, retrying with different instance: %v\n", err)
+				time.Sleep(2 * time.Second)
+			}
+		}
+		if err != nil {
+			fmt.Println("Failed to get ALAC/Atmos playback URL:", err)
+			recordDownloadFailure("%s: ALAC/Atmos M3U8 failed: %v", track.Name, err)
+			counter.Inc(&counter.Unavailable)
+			return
 		}
 	}
 

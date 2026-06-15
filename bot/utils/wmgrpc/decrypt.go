@@ -379,17 +379,20 @@ func DownloadAndDecrypt(ctx context.Context, wm *Client, adamID string, playlist
 			}
 			allTracks = append(allTracks, trackSamples{traf.Tfhd.TrackID, samples})
 		}
-		if len(allTracks) > 0 {
-			var decryptedMdat []byte
-			for _, ts := range allTracks {
-				for _, s := range ts.samples {
-					decryptedMdat = append(decryptedMdat, s.Data...)
-				}
-			}
-			seg.frag.Mdat.Data = decryptedMdat
+		if len(allTracks) == 0 {
+			return nil
 		}
-		if err := seg.frag.Encode(outBuf); err != nil {
-			return fmt.Errorf("write segment %d: %w", segIdx, err)
+		for _, ts := range allTracks {
+			newFrag, err := mp4.CreateFragment(uint32(segIdx+1), ts.trackID)
+			if err != nil {
+				return fmt.Errorf("create fragment seg %d: %w", segIdx, err)
+			}
+			for _, s := range ts.samples {
+				newFrag.AddFullSample(s)
+			}
+			if err := newFrag.Encode(outBuf); err != nil {
+				return fmt.Errorf("write segment %d: %w", segIdx, err)
+			}
 		}
 		return nil
 	}
