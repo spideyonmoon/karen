@@ -88,17 +88,17 @@ func parseMediaPlaylist(r io.Reader) ([]*m3u8.MediaSegment, error) {
 	return playlist.(*m3u8.MediaPlaylist).Segments, nil
 }
 
-func extractKeyURIs(segments []*m3u8.MediaSegment) []string {
-	seen := make(map[string]bool)
-	keyURIs := []string{prefetchKey}
-	for _, seg := range segments {
-		if seg != nil && seg.Key != nil && seg.Key.URI != "" {
-			uri := seg.Key.URI
-			if !seen[uri] {
-				seen[uri] = true
-				keyURIs = append(keyURIs, uri)
-			}
+func resolveSegmentKeyURIs(segments []*m3u8.MediaSegment) []string {
+	keyURIs := make([]string, len(segments))
+	currentKey := prefetchKey
+	for i, seg := range segments {
+		if seg == nil {
+			continue
 		}
+		if seg.Key != nil && seg.Key.URI != "" {
+			currentKey = seg.Key.URI
+		}
+		keyURIs[i] = currentKey
 	}
 	return keyURIs
 }
@@ -146,19 +146,28 @@ func DownloadAndDecrypt(ctx context.Context, wm *Client, adamID string, playlist
 		return fmt.Errorf("parse media playlist: %w", err)
 	}
 
+	segmentKeyURIs := resolveSegmentKeyURIs(segments)
 	var totalSegments int
-	for _, seg := range segments {
+	var playlistDuration float64
+	for i, seg := range segments {
+		if seg == nil {
+			continue
+		}
+		fmt.Printf(
+			"  seg[%d] key=%s duration=%.3f start=%.3f range=%d@%d\n",
+			i,
+			segmentKeyURIs[i],
+			seg.Duration,
+			playlistDuration,
+			seg.Limit,
+			seg.Offset,
+		)
+		playlistDuration += seg.Duration
 		if seg != nil {
 			totalSegments++
 		}
 	}
-
-	keyURIs := extractKeyURIs(segments)
-
-	keyToIndex := make(map[string]int)
-	for i, k := range keyURIs {
-		keyToIndex[k] = i
-	}
+	fmt.Printf("M3U8: %d segments, duration=%.3fs\n", totalSegments, playlistDuration)
 
 	segment0 := segments[0]
 	if segment0 == nil {
@@ -282,13 +291,7 @@ func DownloadAndDecrypt(ctx context.Context, wm *Client, adamID string, playlist
 				errChan <- fmt.Errorf("download segment %d: %w", i, err)
 				return
 			}
-			var keyURI string
-			if segments[i].Key != nil && segments[i].Key.URI != "" {
-				keyURI = segments[i].Key.URI
-			} else {
-				keyURI = keyURIs[0]
-			}
-			segChan <- segResult{i, data, keyURI}
+			segChan <- segResult{i, data, segmentKeyURIs[i]}
 		}()
 	}
 
