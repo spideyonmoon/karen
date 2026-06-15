@@ -42,6 +42,11 @@ const (
 	telegramFormatFlac   = "flac"
 	transferModeOneByOne = "one" // deprecated alias
 	transferModeZip      = "zip" // deprecated alias
+	// transferModeCancel is a sentinel set when the user hits the inline "Cancel"
+	// button on the delivery-mode picker. The transfer-mode switch in
+	// runTransfer then short-circuits to a "Download cancelled." edit and returns
+	// without enqueueing anything.
+	transferModeCancel = "cancel"
 
 	transferModeTelegramIndividual = "tg_individual"
 	transferModeTelegramZip        = "tg_zip"
