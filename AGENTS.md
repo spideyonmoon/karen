@@ -66,6 +66,8 @@ Wrapper-manager needs `--privileged` (Frida hooks inside Android emulator).
 - No retry logic on failed segment downloads
 - `wrapper-manager/webplay.go` `GetLicense()` has unsafe type assertion (line 106) that can panic
 
-## Branch: feat/wrapper-manager
-- 28 commits on top of `main`. See `SESSION_HISTORY.md` for details.
-- Full-track ALAC delivery verified end-to-end.
+## Branches
+- `main` — current development (post-wrapper-manager overhaul, "v2")
+- `v1-stable` — frozen snapshot of the pre-overhaul code (single-account wrapper, MP4Box remux, serial downloads). The legendary v1. Preserved for reference; do not target new work here.
+- `v1.0.0` — git tag pointing at the same commit as `v1-stable`, visible on the GitHub Releases page.
+- See `SESSION_HISTORY.md` for the full migration log.
