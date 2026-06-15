@@ -839,11 +839,24 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 	}
 
 	{
-		wm := wmPool.Acquire()
-		currentWorkerID = wm.ID()
-		defer func() { currentWorkerID = "" }()
-		defer wmPool.Release(wm)
-		err = wmgrpc.DownloadAndDecrypt(ctx, wm, track.ID, downloadM3u8, trackPath, wmgrpc.ProgressFunc(trackProgress))
+		// Retry on a different pool client if the wrapper crashes mid-decrypt
+		// (Invalid CKC from the Android CDM, connection reset, etc.). Mirrors
+		// the M3U8/WebPlayback retry pattern added in b7d1ea9 — without this,
+		// a single bad wrapper takes the whole track down.
+		for attempt := 0; attempt < 2; attempt++ {
+			wm := wmPool.Acquire()
+			currentWorkerID = wm.ID()
+			err = wmgrpc.DownloadAndDecrypt(ctx, wm, track.ID, downloadM3u8, trackPath, wmgrpc.ProgressFunc(trackProgress))
+			currentWorkerID = ""
+			wmPool.Release(wm)
+			if err == nil {
+				break
+			}
+			if attempt == 0 {
+				fmt.Printf("DownloadAndDecrypt attempt 1 failed, retrying with different instance: %v\n", err)
+				time.Sleep(2 * time.Second)
+			}
+		}
 	}
 	if err != nil {
 		fmt.Println("Failed to download/decrypt:", err)
