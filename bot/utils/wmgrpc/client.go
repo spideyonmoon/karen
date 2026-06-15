@@ -14,9 +14,23 @@ import (
 type Client struct {
 	conn   *grpc.ClientConn
 	client pb.WrapperManagerServiceClient
+	id     string
+}
+
+// ID returns the stable identifier assigned at construction (e.g. "wm-1").
+// Empty when NewClient was called without an id (legacy callers / tests).
+func (c *Client) ID() string {
+	if c == nil {
+		return ""
+	}
+	return c.id
 }
 
 func NewClient(addr string) (*Client, error) {
+	return NewClientWithID(addr, "")
+}
+
+func NewClientWithID(addr, id string) (*Client, error) {
 	conn, err := grpc.NewClient(addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
@@ -26,6 +40,7 @@ func NewClient(addr string) (*Client, error) {
 	c := &Client{
 		conn:   conn,
 		client: pb.NewWrapperManagerServiceClient(conn),
+		id:     id,
 	}
 	return c, nil
 }

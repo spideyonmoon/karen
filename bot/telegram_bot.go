@@ -25,6 +25,7 @@ import (
 	apputils "main/utils"
 	"main/utils/ampapi"
 	"main/utils/structs"
+	"main/utils/task"
 )
 
 const (
@@ -39,16 +40,39 @@ const (
 const (
 	telegramFormatAlac   = "alac"
 	telegramFormatFlac   = "flac"
-	transferModeOneByOne = "one"  // deprecated alias
-	transferModeZip      = "zip"  // deprecated alias
+	transferModeOneByOne = "one" // deprecated alias
+	transferModeZip      = "zip" // deprecated alias
 
 	transferModeTelegramIndividual = "tg_individual"
 	transferModeTelegramZip        = "tg_zip"
 	transferModeGofileZip          = "gofile_zip"
 	transferModeMv                 = "mv"        // music video → native Telegram video
-	transferModeMvGofile           = "mv_gofile" // music video → Gofile direct (no zip)
+	transferModeMvGofile           = "mv_gofile" // music video → Gofile direct (no zip
 	transferModeArt                = "art"       // artwork (cover + motion) → Telegram photo/video
-	transferModeCancel             = "cancel"
+)
+
+// Outline-style status board symbols. Variation selector U+FE0E forces text
+// (outline) presentation on emoji that have it; the rest are inherently
+// non-colored Unicode symbols. Renders identically across iOS/Android/Desktop
+// Telegram clients.
+const (
+	symDownload = "\u25B8"          // ▸ right-pointing small triangle
+	symQueue    = "\u2261"          // ≡ identical-to (three lines)
+	symSpeed    = "\u26A1\uFE0E"    // ⚡︎ outline lightning
+	symETA      = "\u23F1\uFE0E"    // ⏱︎ outline stopwatch
+	symElapsed  = "\u231B\uFE0E"    // ⌛︎ outline hourglass
+	symActive   = "\u25B8"          // ▸ active track
+	symDone     = "\u2713"          // ✓ done
+	symQueued   = "\u2026"          // … queued
+	symFailed   = "\u2717"          // ✗ failed
+	symCancel   = "\u2715"          // ✕ cancel
+	symBarFull  = "\u25B0"          // ▰ filled hex (or █)
+	symBarEmpty = "\u25B1"          // ▱ empty hex
+)
+
+// Per-board limits so the rendered text never blows Telegram's 4096-char limit.
+const (
+	statusTrackListCap = 30 // top-N active tracks shown; rest collapse into "and N more"
 )
 
 var telegramBotTokenPattern = regexp.MustCompile(`bot[0-9]+:[A-Za-z0-9_-]+`)
@@ -1133,7 +1157,7 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args
 			_ = b.sendMessageWithReply(chatID, "Downloading artist discographies is not allowed.", nil, replyToID)
 			return
 		}
-		
+
 		_ = b.sendMessageWithReply(chatID, "Invalid Apple Music link.", nil, replyToID)
 	default:
 		// Silently ignore unknown commands
@@ -1779,11 +1803,22 @@ func (b *TelegramBot) runDownload(req *downloadRequest) {
 		b.queueMu.Unlock()
 	}()
 
-	progress := func(phase string, done, total int64) {
-		status.Update(phase, done, total)
+	activeProgressFactory = func(track *task.Track) apputils.ProgressFunc {
+		totalTracks := track.TaskTotal
+		if single {
+			totalTracks = 1
+		}
+		// releaseTitle: prefer the album name (albums / playlists-of-an-album);
+		// fall back to the track's own name for a single-track download.
+		releaseTitle := strings.TrimSpace(track.Resp.Attributes.AlbumName)
+		if releaseTitle == "" {
+			releaseTitle = track.Resp.Attributes.Name
+		}
+		return func(phase string, done, total int64) {
+			status.UpdateTrack(track.ID, track.Resp.Attributes.Name, releaseTitle, currentWorkerID, track.TaskNum, totalTracks, phase, done, total)
+		}
 	}
-	activeProgress = progress
-	defer func() { activeProgress = nil }()
+	defer func() { activeProgressFactory = nil }()
 
 	status.Update("Downloading", 0, 0)
 	err = fn(req.ctx)
@@ -1794,7 +1829,7 @@ func (b *TelegramBot) runDownload(req *downloadRequest) {
 	}
 	dl_song = false
 
-	activeProgress = nil
+	activeProgressFactory = nil
 
 	paths := append([]string{}, lastDownloadedPaths...)
 	if len(paths) == 0 {
@@ -1963,7 +1998,7 @@ func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, re
 				if errIndiv != nil {
 					fmt.Printf("MTProto individual upload failed for %s: %v. Falling back to Gofile...\n", filepath.Base(item.FilePath), errIndiv)
 					status.Update(fmt.Sprintf("Upload failed for %s: %v. Uploading to Gofile...", item.Title, errIndiv), 0, 0)
-					
+
 					downloadLink, gofileErr := apputils.UploadToGofile(ctx, item.FilePath, Config.GofileToken)
 					if gofileErr == nil {
 						msg := fmt.Sprintf("File: %s\nDownload Link: %s", filepath.Base(item.FilePath), downloadLink)
@@ -2677,7 +2712,9 @@ func (b *TelegramBot) sendAudioFile(chatID int64, filePath string, replyToID int
 	}
 	coverPath := findCoverFile(filepath.Dir(filePath))
 	if coverPath != "" {
-		if path, err := makeTelegramThumb(coverPath); err != nil { fmt.Printf("makeTelegramThumb failed: %v\n", err) } else {
+		if path, err := makeTelegramThumb(coverPath); err != nil {
+			fmt.Printf("makeTelegramThumb failed: %v\n", err)
+		} else {
 			thumbPath = path
 		}
 	}
@@ -2922,6 +2959,7 @@ func (b *TelegramBot) sendDocumentByFileID(chatID int64, entry CachedDocument, r
 // "" when the queue is empty (so a clean single download shows no queue section).
 // It reads the display-only queuedReqs mirror so it never touches the live channel
 // (no draining/blocking) even when called every few seconds from the update loop.
+// Renders with outline-style symbols to match the active-task board.
 func (b *TelegramBot) queueBoardSuffix() string {
 	b.queueMu.Lock()
 	reqs := make([]*downloadRequest, len(b.queuedReqs))
@@ -2930,15 +2968,20 @@ func (b *TelegramBot) queueBoardSuffix() string {
 	if len(reqs) == 0 {
 		return ""
 	}
-	out := fmt.Sprintf("\n\n📋 Queue: %d task(s)\n", len(reqs))
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "\n\n%s Queue · %d waiting", symQueue, len(reqs))
 	for i, r := range reqs {
 		user := r.username
 		if user == "" {
 			user = fmt.Sprintf("ID:%d", r.userID)
 		}
-		out += fmt.Sprintf("%d. %s (by @%s) — /stop_%s\n", i+1, r.taskID, user, r.taskID)
+		if user != "" && user[0] != '@' {
+			user = "@" + user
+		}
+		fmt.Fprintf(&sb, "\n#%d %s · %s · /stop_%s",
+			i+1, user, shortMode(r.transferMode), r.taskID)
 	}
-	return out
+	return sb.String()
 }
 
 // removeQueuedReqLocked drops a task from the display-only queue mirror.
@@ -2978,6 +3021,20 @@ type progressSample struct {
 	done int64
 }
 
+type trackProgressState struct {
+	id           string
+	title        string
+	number       int
+	total        int
+	phase        string
+	done         int64
+	size         int64
+	startedAt    time.Time
+	updatedAt    time.Time
+	workerID     string
+	speedSamples []progressSample
+}
+
 // speedWindow is how far back the live speed/ETA readout looks. Computing speed
 // over a trailing window (rather than cumulative bytes ÷ phase-elapsed) gives a
 // responsive "current rate" that reacts within a few seconds and reads on the
@@ -3009,6 +3066,22 @@ type DownloadStatus struct {
 	userID         int64
 	username       string
 	speedSamples   []progressSample
+	tracks         map[string]trackProgressState
+	finishedTracks int
+	// finishedSizes retains the byte size of every track that has completed, so
+	// the aggregated progress bar keeps a stable total as active tracks come and
+	// go. Without this, the denominator shrinks with each finishing track and
+	// done can exceed total (the "30MB / 18MB" overflow bug).
+	finishedSizes []int64
+	trackTotal    int
+	workerLimit   int
+	// releaseTitle is captured from the first track's album name (or the track
+	// name itself for a single-track download). It's the user-facing heading on
+	// the status board, set lazily so the task runner doesn't have to plumb it.
+	releaseTitle string
+	// single is true for a one-shot track download (--song / direct URL). The
+	// renderer uses it to skip the per-track list and show a single-track view.
+	single bool
 }
 
 func newDownloadStatus(bot *TelegramBot, chatID int64, replyToID int, existingMsgID int, req *downloadRequest) (*DownloadStatus, error) {
@@ -3024,6 +3097,13 @@ func newDownloadStatus(bot *TelegramBot, chatID int64, replyToID int, existingMs
 		username:       req.username,
 		updateCh:       make(chan struct{}, 1),
 		stopCh:         make(chan struct{}),
+		tracks:         make(map[string]trackProgressState),
+		finishedSizes:  nil,
+		workerLimit:    len(Config.WrapperManagerAddrs),
+		single:         req.single,
+	}
+	if status.workerLimit < 1 {
+		status.workerLimit = 1
 	}
 	if existingMsgID <= 0 {
 		msgID, err := bot.sendMessageWithReplyReturn(chatID, "Starting download...", nil, replyToID)
@@ -3066,6 +3146,71 @@ func (s *DownloadStatus) UpdateSync(phase string, done, total int64) {
 	s.setLatestLocked(phase, done, total)
 	s.mu.Unlock()
 	s.flush(true)
+}
+
+func (s *DownloadStatus) UpdateTrack(id, title, releaseTitle, workerID string, number, trackTotal int, phase string, done, total int64) {
+	if s == nil {
+		return
+	}
+	now := time.Now()
+	s.mu.Lock()
+	if trackTotal > s.trackTotal {
+		s.trackTotal = trackTotal
+	}
+	if releaseTitle != "" && s.releaseTitle == "" {
+		s.releaseTitle = releaseTitle
+	}
+	if phase == "Finished" {
+		if prev, ok := s.tracks[id]; ok {
+			// Retain the size so the aggregate progress bar keeps a stable total.
+			// Prefer the final reported size; fall back to the last seen done.
+			size := prev.size
+			if size <= 0 {
+				size = prev.done
+			}
+			if size > 0 {
+				s.finishedSizes = append(s.finishedSizes, size)
+			}
+			delete(s.tracks, id)
+			s.finishedTracks++
+		}
+	} else {
+		state, ok := s.tracks[id]
+		if !ok {
+			state = trackProgressState{
+				id:        id,
+				title:     title,
+				number:    number,
+				total:     trackTotal,
+				startedAt: now,
+			}
+		}
+		// Per-track speed: reset on phase change or byte rewind, then append sample.
+		// Compare against OLD values before overwriting.
+		oldPhase := state.phase
+		oldDone := state.done
+		state.phase = phase
+		state.done = done
+		state.size = total
+		state.updatedAt = now
+		if workerID != "" {
+			state.workerID = workerID
+		}
+		if phase != oldPhase || done < oldDone {
+			state.speedSamples = state.speedSamples[:0]
+		}
+		state.speedSamples = append(state.speedSamples, progressSample{at: now, done: done})
+		state.speedSamples = pruneSpeedSamples(state.speedSamples, now)
+		s.tracks[id] = state
+	}
+	s.dirty = true
+	s.mu.Unlock()
+	if s.updateCh != nil {
+		select {
+		case s.updateCh <- struct{}{}:
+		default:
+		}
+	}
 }
 
 // MessageID returns the board's current Telegram message ID under lock, so callers
@@ -3299,70 +3444,293 @@ func formatDuration(d time.Duration) string {
 	return fmt.Sprintf("%ds", s)
 }
 
+func truncateStatusTitle(value string, maxRunes int) string {
+	value = strings.TrimSpace(value)
+	runes := []rune(value)
+	if len(runes) <= maxRunes {
+		return value
+	}
+	return string(runes[:maxRunes-1]) + "…"
+}
+
+// shortMode returns a compact, terminal-aesthetic label for a transfer mode.
+// Used in the status board header; full human labels still live in formatUploadMode.
+func shortMode(mode string) string {
+	switch mode {
+	case transferModeTelegramIndividual:
+		return "TG_Track"
+	case transferModeTelegramZip:
+		return "TG_Zip"
+	case transferModeGofileZip:
+		return "Gofile"
+	case transferModeMv:
+		return "MV_TG"
+	case transferModeMvGofile:
+		return "MV_Gofile"
+	case transferModeArt:
+		return "Cover"
+	default:
+		return mode
+	}
+}
+
+// renderBar returns a fixed-width progress bar using outline hex cells.
+// Uses ▰ (filled) and ▱ (empty) — no half-cell, so the percentage label
+// (printed next to it) carries the granular readout.
+func renderBar(pct, width int) string {
+	if pct < 0 {
+		pct = 0
+	}
+	if pct > 100 {
+		pct = 100
+	}
+	if width < 1 {
+		width = 1
+	}
+	filled := (pct * width) / 100
+	b := make([]byte, 0, width*3)
+	for i := 0; i < width; i++ {
+		if i < filled {
+			b = append(b, symBarFull...)
+		} else {
+			b = append(b, symBarEmpty...)
+		}
+	}
+	return string(b)
+}
+
+// medianSpeed returns the median bytes/sec across adjacent speed samples in the
+// rolling window. Median (not mean) kills the "412MB/s" outlier that happens
+// when one sample in the window catches a track transitioning through a phase
+// boundary or finishing. Returns 0 when there's not enough data to estimate.
+func medianSpeed(samples []progressSample) float64 {
+	if len(samples) < 2 {
+		return 0
+	}
+	deltas := make([]float64, 0, len(samples)-1)
+	for i := 1; i < len(samples); i++ {
+		dt := samples[i].at.Sub(samples[i-1].at).Seconds()
+		db := float64(samples[i].done - samples[i-1].done)
+		if dt > 0 && db > 0 {
+			deltas = append(deltas, db/dt)
+		}
+	}
+	if len(deltas) == 0 {
+		return 0
+	}
+	sort.Float64s(deltas)
+	return deltas[len(deltas)/2]
+}
+
+// aggregatedProgress snapshots everything the renderer needs in a single locked
+// block, so formatProgressText can be called without juggling mutexes.
+//   - active:     currently downloading tracks, sorted by track number
+//   - finished:   count of completed tracks
+//   - total:      planned track count
+//   - aggDone,
+//     aggTotal:   bytes — sum of finished track sizes plus live track progress.
+//                 Stable denominator: finished tracks are retained, not forgotten.
+type progressSnapshot struct {
+	active        []trackProgressState
+	finished      int
+	total         int
+	aggDone       int64
+	aggTotal      int64
+	hasActiveData bool
+	releaseTitle  string
+	workerLimit   int
+	single        bool
+}
+
+func (s *DownloadStatus) snapshot() progressSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	snap := progressSnapshot{
+		finished:     s.finishedTracks,
+		total:        s.trackTotal,
+		releaseTitle: s.releaseTitle,
+		workerLimit:  s.workerLimit,
+		single:       s.single,
+	}
+	snap.active = make([]trackProgressState, 0, len(s.tracks))
+	for _, st := range s.tracks {
+		snap.active = append(snap.active, st)
+		// Clamp done to size so an over-shoot at the phase boundary can't
+		// push aggDone past aggTotal (the symptom of the original bug).
+		d := st.done
+		if st.size > 0 && d > st.size {
+			d = st.size
+		}
+		if d < 0 {
+			d = 0
+		}
+		snap.aggDone += d
+		snap.aggTotal += st.size
+		snap.hasActiveData = true
+	}
+	for _, sz := range s.finishedSizes {
+		snap.aggDone += sz
+		snap.aggTotal += sz
+	}
+	if snap.total < snap.finished+len(snap.active) {
+		snap.total = snap.finished + len(snap.active)
+	}
+	sort.Slice(snap.active, func(i, j int) bool {
+		if snap.active[i].number == snap.active[j].number {
+			return snap.active[i].id < snap.active[j].id
+		}
+		return snap.active[i].number < snap.active[j].number
+	})
+	return snap
+}
+
+// formatProgressText is the single renderer for the active-task status board.
+// The output uses outline-style symbols (see sym* constants) and a single
+// monospace code block for the bar+stats+per-track list so columns align
+// across Telegram's font variations.
 func (s *DownloadStatus) formatProgressText(phase string, done, total int64, percent int) string {
-	userIdent := ""
-	if s.username != "" {
-		userIdent = fmt.Sprintf(" (by @%s)", s.username)
-	} else if s.userID != 0 {
-		userIdent = fmt.Sprintf(" (by ID:%d)", s.userID)
+	snap := s.snapshot()
+
+	// Prefer per-track aggregate (stable denominator) when we have any data.
+	// Falls back to the shared (phase, done, total) for non-download phases
+	// (Zipping, Uploading, etc.) where track progress is no longer streaming.
+	barDone, barTotal, hasBar := int64(0), int64(0), false
+	if snap.hasActiveData || snap.finished > 0 {
+		barDone, barTotal, hasBar = snap.aggDone, snap.aggTotal, true
+	}
+	if !hasBar {
+		barDone, barTotal, hasBar = done, total, total > 0
+	}
+	barPct := -1
+	if hasBar && barTotal > 0 {
+		barPct = int(barDone * 100 / barTotal)
+		if barPct < 0 {
+			barPct = 0
+		}
+		if barPct > 100 {
+			barPct = 100
+		}
 	}
 
-	header := fmt.Sprintf("📥 Task ID: %s%s\n╭ Status: %s", s.taskID, userIdent, phase)
-	modeName := formatUploadMode(s.mode)
-
-	// Total elapsed time since the task started
-	totalElapsedStr := "-"
-	if !s.startedAt.IsZero() {
-		totalElapsedStr = formatDuration(time.Since(s.startedAt))
+	// Speed: aggregate median across active tracks, or fall back to the global
+	// rolling sample when we're in a post-download phase.
+	var totalSpeed float64
+	for _, st := range snap.active {
+		if v := medianSpeed(st.speedSamples); v > 0 {
+			totalSpeed += v
+		}
+	}
+	if totalSpeed == 0 {
+		totalSpeed = s.rollingSpeedBytesPerSec()
 	}
 
-	// Live rate over the trailing speedWindow — a current-speed readout that reacts
-	// within a few seconds, rather than a cumulative average smeared over the phase.
-	speedStr := "-"
+	// ETA + elapsed
 	etaStr := "-"
-	if speedBytesPerSec := s.rollingSpeedBytesPerSec(); speedBytesPerSec > 0 {
-		speedStr = fmt.Sprintf("%s/s", formatBytes(int64(speedBytesPerSec)))
-		if total > done {
-			etaSecs := float64(total-done) / speedBytesPerSec
-			etaDuration := time.Duration(etaSecs) * time.Second
-			etaStr = formatDuration(etaDuration)
-		}
+	if totalSpeed > 0 && hasBar && barTotal > barDone {
+		eta := time.Duration(float64(barTotal-barDone)/totalSpeed) * time.Second
+		etaStr = formatDuration(eta)
+	}
+	elapsedStr := "-"
+	if !s.startedAt.IsZero() {
+		elapsedStr = formatDuration(time.Since(s.startedAt))
 	}
 
-	if total > 0 {
-		if percent < 0 {
-			percent = 0
+	// Header
+	header := s.formatHeader(phase, snap)
+	bar := renderBar(barPct, 20)
+
+	var b strings.Builder
+	b.WriteString(header)
+	b.WriteString("\n```\n")
+	if hasBar {
+		fmt.Fprintf(&b, "%s  %3d%%   %s / %s\n",
+			bar, barPct, formatBytes(barDone), formatBytes(barTotal))
+	}
+	// Stats line: speed · ETA · elapsed. The downloader may set phase to
+	// non-download values (Zipping / Uploading / Decrypting / etc.) — print the
+	// actual phase on the bar line so the user knows which stage they're at.
+	fmt.Fprintf(&b, "%s %s/s · %s %s left · %s %s\n",
+		symSpeed, formatBytes(int64(totalSpeed)),
+		symETA, etaStr,
+		symElapsed, elapsedStr,
+	)
+
+	// Per-track list (only when we have track data and not a single-track download).
+	if !snap.single && (len(snap.active) > 0 || snap.finished > 0 || snap.total > 0) {
+		b.WriteString("\n")
+		shown := 0
+		for _, st := range snap.active {
+			if shown >= statusTrackListCap {
+				break
+			}
+			fmt.Fprintf(&b, "%s%s %02d %s   %s/%s · %s/s\n",
+				workerPrefix(st.workerID),
+				symActive, st.number, truncateStatusTitle(st.title, 28),
+				formatBytes(st.done), formatBytes(st.size),
+				formatBytes(int64(medianSpeed(st.speedSamples))),
+			)
+			shown++
 		}
-		if percent > 100 {
-			percent = 100
+		if snap.finished > 0 {
+			fmt.Fprintf(&b, "     %s %d done\n", symDone, snap.finished)
 		}
-		barLength := 15
-		filledCount := (percent * barLength) / 100
-		var bar string
-		for i := 0; i < barLength; i++ {
-			if i < filledCount {
-				bar += "█"
-			} else if i == filledCount {
-				bar += "▒"
+		remaining := snap.total - snap.finished - len(snap.active)
+		if remaining > 0 {
+			if shown >= statusTrackListCap {
+				fmt.Fprintf(&b, "     %s %d more queued\n", symQueued, remaining)
 			} else {
-				bar += "░"
+				fmt.Fprintf(&b, "     %s %d queued\n", symQueued, remaining)
 			}
 		}
+	}
+	b.WriteString("```")
+	return b.String()
+}
 
-		// Progress bar wrapped in monospace format
-		barFormatted := fmt.Sprintf("`[%s]`", bar)
+// formatHeader produces the two-line task heading. The first line carries the
+// release title and the done/total counter; the second carries the user, mode,
+// and cancel command. Both are kept outside the monospace code block so they
+// use Telegram's proportional font and stand out as headings.
+func (s *DownloadStatus) formatHeader(phase string, snap progressSnapshot) string {
+	title := strings.TrimSpace(snap.releaseTitle)
+	if title == "" {
+		title = "Untitled"
+	}
+	title = truncateStatusTitle(title, 56)
 
-		return fmt.Sprintf("%s\n├ %s %d%%\n├ Progress: %s / %s\n├ Speed: %s\n├ ETA (Elapsed): %s (%s)\n├ Mode: %s\n╰ Stop: /stop_%s",
-			header, barFormatted, percent, formatBytes(done), formatBytes(total), speedStr, etaStr, totalElapsedStr, modeName, s.taskID)
+	counter := ""
+	if snap.total > 0 {
+		counter = fmt.Sprintf(" · %d/%d", snap.finished, snap.total)
 	}
 
-	if done > 0 {
-		return fmt.Sprintf("%s\n├ Processed: %s\n├ Speed: %s\n├ Elapsed: %s\n├ Mode: %s\n╰ Stop: /stop_%s",
-			header, formatBytes(done), speedStr, totalElapsedStr, modeName, s.taskID)
+	user := "@" + s.username
+	if s.username == "" {
+		user = fmt.Sprintf("ID:%d", s.userID)
 	}
 
-	return fmt.Sprintf("%s\n├ Elapsed: %s\n├ Mode: %s\n╰ Stop: /stop_%s",
-		header, totalElapsedStr, modeName, s.taskID)
+	heading := fmt.Sprintf("%s %s%s", symDownload, title, counter)
+	// The phase label sits on its own line right under the title (kept outside
+	// the code block) so the user can see the current stage at a glance.
+	sub := fmt.Sprintf("   by %s · %s · %s cancel /stop_%s",
+		user, shortMode(s.mode), symCancel, s.taskID)
+	if phase != "" {
+		return heading + "\n" + phase + "\n" + sub
+	}
+	return heading + "\n" + sub
+}
+
+// workerPrefix returns the "wm-1 " (with trailing space) prefix for a per-track
+// line, or 5 spaces of padding when the track has no worker attached yet (e.g.
+// during the "Preparing" phase before a wrapper-manager is acquired). The fixed
+// width keeps the track title column aligned across rows.
+func workerPrefix(id string) string {
+	if id == "" {
+		return "     "
+	}
+	if len(id) >= 5 {
+		return id + " "
+	}
+	return id + strings.Repeat(" ", 5-len(id))
 }
 
 func formatBytes(value int64) string {
@@ -4267,7 +4635,6 @@ func buildInlineKeyboard(count int, hasPrev bool, hasNext bool) InlineKeyboardMa
 		InlineKeyboard: rows,
 	}
 }
-
 
 // buildCoverCaption creates a caption for the album cover photo using track metadata.
 func buildCoverCaption(paths []string) string {

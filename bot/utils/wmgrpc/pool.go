@@ -21,8 +21,8 @@ func NewPool(addrs []string) (*Pool, error) {
 		ch:      make(chan *Client, len(addrs)),
 		clients: make([]*Client, 0, len(addrs)),
 	}
-	for _, addr := range addrs {
-		c, err := NewClient(addr)
+	for i, addr := range addrs {
+		c, err := NewClientWithID(addr, fmt.Sprintf("wm-%d", i+1))
 		if err != nil {
 			// Best-effort close already-dialled clients before returning error.
 			for _, existing := range p.clients {

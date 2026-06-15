@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,7 +10,6 @@ import (
 	"log"
 	"net/http"
 	"net/url"
-	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -37,32 +37,37 @@ import (
 )
 
 var (
-	forbiddenNames       = regexp.MustCompile(`[/\\<>:"|?*]`)
-	dl_atmos             bool
-	dl_aac               bool
-	dl_select            bool
-	dl_song              bool
-	wmPool               *wmgrpc.Pool
-	artist_select        bool
-	debug_mode           bool
-	alac_max             *int
-	atmos_max            *int
-	mv_max               *int
-	mv_audio_type        *string
-	aac_type             *string
-	Config               structs.ConfigSet
-	counter              structs.Counter
-	okDictMu             sync.Mutex
-	okDict               = make(map[string][]int)
-	lastPathsMu          sync.Mutex
-	lastDownloadedPaths  []string
-	activeProgress       func(phase string, done, total int64)
-	downloadedMetaMu     sync.Mutex
-	downloadedMeta       = make(map[string]AudioMeta)
-	searchMetaMu         sync.Mutex
-	searchMetaByID       = make(map[string]AudioMeta)
-	downloadFailureMu    sync.Mutex
-	lastDownloadFailures []string
+	forbiddenNames        = regexp.MustCompile(`[/\\<>:"|?*]`)
+	dl_atmos              bool
+	dl_aac                bool
+	dl_select             bool
+	dl_song               bool
+	wmPool                *wmgrpc.Pool
+	artist_select         bool
+	debug_mode            bool
+	alac_max              *int
+	atmos_max             *int
+	mv_max                *int
+	mv_audio_type         *string
+	aac_type              *string
+	Config                structs.ConfigSet
+	counter               structs.Counter
+	okDictMu              sync.Mutex
+	okDict                = make(map[string][]int)
+	lastPathsMu           sync.Mutex
+	lastDownloadedPaths   []string
+	activeProgressFactory func(track *task.Track) apputils.ProgressFunc
+	// currentWorkerID is set by download sites that have a wmgrpc.Client in hand,
+	// and read by the active progress closure so per-track progress lines can show
+	// which wrapper-manager instance is handling the track. It's process-wide
+	// because there's exactly one download worker at a time; no synchronization needed.
+	currentWorkerID        string
+	downloadedMetaMu      sync.Mutex
+	downloadedMeta        = make(map[string]AudioMeta)
+	searchMetaMu          sync.Mutex
+	searchMetaByID        = make(map[string]AudioMeta)
+	downloadFailureMu     sync.Mutex
+	lastDownloadFailures  []string
 )
 
 type AudioMeta struct {
@@ -609,21 +614,29 @@ func handleSearch(searchType string, queryParts []string, token string) (string,
 	return selection.URL, nil
 }
 
-func convertIfNeeded(track *task.Track, lrc string) {
+func convertIfNeeded(track *task.Track, lrc string, progress apputils.ProgressFunc) {
 	coverPath := ""
 	if strings.EqualFold(Config.ConvertFormat, "flac") && track.SaveDir != "" {
 		coverPath = findCoverFile(track.SaveDir)
 	}
-	apputils.ConvertIfNeeded(track, lrc, &Config, coverPath, activeProgress)
+	apputils.ConvertIfNeeded(track, lrc, &Config, coverPath, progress)
 }
 
 func ripTrack(track *task.Track, token string, ctx context.Context) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if ctx.Err() != nil { return }
+	if ctx.Err() != nil {
+		return
+	}
 	var err error
 	counter.Inc(&counter.Total)
+	var trackProgress apputils.ProgressFunc
+	if activeProgressFactory != nil {
+		trackProgress = activeProgressFactory(track)
+		trackProgress("Preparing", 0, 0)
+		defer trackProgress("Finished", 0, 0)
+	}
 	fmt.Printf("Track %d of %d: %s\n", track.TaskNum, track.TaskTotal, track.Type)
 
 	if track.PreType == "playlists" && Config.UseSongInfoForPlaylist {
@@ -797,10 +810,10 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 					track.SavePath = convertedPath
 					track.SaveName = filepath.Base(convertedPath)
 				} else {
-					convertIfNeeded(track, lrc)
+					convertIfNeeded(track, lrc, trackProgress)
 				}
 			} else {
-				convertIfNeeded(track, lrc)
+				convertIfNeeded(track, lrc, trackProgress)
 			}
 		}
 		recordDownloadedTrack(track)
@@ -827,8 +840,10 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 
 	{
 		wm := wmPool.Acquire()
+		currentWorkerID = wm.ID()
+		defer func() { currentWorkerID = "" }()
 		defer wmPool.Release(wm)
-		err = wmgrpc.DownloadAndDecrypt(ctx, wm, track.ID, downloadM3u8, trackPath, activeProgress)
+		err = wmgrpc.DownloadAndDecrypt(ctx, wm, track.ID, downloadM3u8, trackPath, wmgrpc.ProgressFunc(trackProgress))
 	}
 	if err != nil {
 		fmt.Println("Failed to download/decrypt:", err)
@@ -889,7 +904,7 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 		_ = os.Remove(track.CoverPath)
 	}
 
-	convertIfNeeded(track, lrc)
+	convertIfNeeded(track, lrc, trackProgress)
 
 	recordDownloadedTrack(track)
 	counter.Inc(&counter.Success)
