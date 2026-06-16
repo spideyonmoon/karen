@@ -3593,7 +3593,7 @@ func truncateStatusTitle(value string, maxRunes int) string {
 func shortMode(mode string) string {
 	switch mode {
 	case transferModeTelegramIndividual:
-		return "TG_Track"
+		return "TG_Individual"
 	case transferModeTelegramZip:
 		return "TG_Zip"
 	case transferModeGofileZip:
@@ -3926,9 +3926,16 @@ func (s *DownloadStatus) formatProgressRich(phase string, done, total int64, per
 		}
 	}
 
-	// Per-track table — only for multi-track releases with live data.
+	// Per-track table — only for multi-track releases with live data. The track
+	// number folds into the Track cell ("01 · Title") so there's no wide right-
+	// aligned "#" column shoving the rest of the table to the right. The table is
+	// wrapped in a collapsible <details> block (Bot API 10.1 Rich Markdown renders
+	// supported HTML directly) so the board can be collapsed; it stays open here so
+	// live progress is visible by default. Blank lines around the table keep GFM
+	// parsing it as a table inside the details block.
 	if !snap.single && len(snap.active) > 0 {
-		b.WriteString("\n| # | Track | Progress | Speed |\n|--:|:------|:--------:|------:|\n")
+		fmt.Fprintf(&b, "\n<details open>\n<summary>Tracks · %d active</summary>\n\n", len(snap.active))
+		b.WriteString("| Track | Progress | Speed |\n|:------|:--------:|------:|\n")
 		shown := 0
 		for _, st := range snap.active {
 			if shown >= statusTrackListCap {
@@ -3946,10 +3953,11 @@ func (s *DownloadStatus) formatProgressRich(phase string, done, total int64, per
 			if v := medianSpeed(st.speedSamples); v > 0 {
 				spd = formatBytes(int64(v)) + "/s"
 			}
-			fmt.Fprintf(&b, "| %02d | %s | %s | %s |\n",
+			fmt.Fprintf(&b, "| %02d · %s | %s | %s |\n",
 				st.number, escapeRichMD(truncateStatusTitle(st.title, 32)), prog, spd)
 			shown++
 		}
+		b.WriteString("\n</details>\n")
 	}
 
 	// Finished / queued task-list summary (checkboxes read naturally in rich).
@@ -3964,8 +3972,9 @@ func (s *DownloadStatus) formatProgressRich(phase string, done, total int64, per
 		}
 	}
 
-	// Footer blockquote: aggregate speed · elapsed · who · mode, then cancel.
-	fmt.Fprintf(&b, "\n> %s %s/s · %s %s\n>\n> by %s · %s · %s cancel `/stop_%s`\n",
+	// Footer blockquote: one fact per line so it reads as a tidy stack rather than
+	// a dense run-on — speed, elapsed, who/mode, then cancel.
+	fmt.Fprintf(&b, "\n> %s %s/s\n> %s %s\n> by %s · %s\n> %s cancel `/stop_%s`\n",
 		symSpeed, formatBytes(int64(totalSpeed)),
 		symElapsed, elapsedStr,
 		escapeRichMD(user), escapeRichMD(shortMode(s.mode)),
@@ -5175,18 +5184,23 @@ func (b *TelegramBot) sendDeliverySummary(chatID int64, paths []string, format s
 		heading = albumArtist + " — " + albumName
 	}
 
-	// Rich Markdown.
+	// Rich Markdown. The track list lives in a collapsible <details> block (Bot API
+	// 10.1 renders supported HTML directly) — collapsed by default since this is a
+	// historical summary the user can expand on demand. The track number folds into
+	// the Track cell ("1 · Artist — Title") so there's no wide right-aligned "#"
+	// column. Blank lines around the table keep GFM parsing it inside the details.
 	var rb strings.Builder
 	fmt.Fprintf(&rb, "## %s %s\n", symDone, escapeRichMD(truncateStatusTitle(heading, 80)))
-	fmt.Fprintf(&rb, "%d tracks · %s · %s\n\n", len(rows), formatBytes(totalBytes), escapeRichMD(fmtLabel))
-	rb.WriteString("| # | Track | Size |\n|--:|:------|-----:|\n")
+	fmt.Fprintf(&rb, "<details>\n<summary>%d tracks · %s · %s</summary>\n\n", len(rows), formatBytes(totalBytes), escapeRichMD(fmtLabel))
+	rb.WriteString("| Track | Size |\n|:------|-----:|\n")
 	for _, r := range rows {
 		t := r.title
 		if r.artist != "" {
 			t = r.artist + " — " + t
 		}
-		fmt.Fprintf(&rb, "| %d | %s | %s |\n", r.num, escapeRichMD(truncateStatusTitle(t, 48)), formatBytes(r.size))
+		fmt.Fprintf(&rb, "| %d · %s | %s |\n", r.num, escapeRichMD(truncateStatusTitle(t, 48)), formatBytes(r.size))
 	}
+	rb.WriteString("\n</details>\n")
 	fmt.Fprintf(&rb, "\n> Delivered %d files · %s total\n", len(rows), formatBytes(totalBytes))
 
 	// Plain fallback.
@@ -5418,13 +5432,10 @@ Flags:
   -aac     download in AAC-LC format
   -atmos   download in Dolby Atmos format
   -flac    convert to FLAC after download
-  -art     save artist cover art
+  -art     grab cover art + motion artwork (no audio)
   -tgu     send as individual Telegram tracks (skip keyboard)
   -tgz     send as Telegram ZIP (skip keyboard)
   -go      send as Gofile ZIP (skip keyboard)
-
-Inline:
-@bot <keywords>   search songs in any chat
 `)
 }
 
@@ -5453,7 +5464,7 @@ Rips lossless ALAC, Dolby Atmos, and AAC from Apple Music straight to your chat.
 | ` + "`-aac`" + ` | Download in AAC-LC format |
 | ` + "`-atmos`" + ` | Download in Dolby Atmos format |
 | ` + "`-flac`" + ` | Convert to FLAC after download |
-| ` + "`-art`" + ` | Save artist cover art |
+| ` + "`-art`" + ` | Grab cover art + motion artwork (no audio) |
 | ` + "`-tgu`" + ` | Send as individual Telegram tracks |
 | ` + "`-tgz`" + ` | Send as a Telegram ZIP |
 | ` + "`-go`" + ` | Send as a Gofile ZIP |
@@ -5465,9 +5476,5 @@ Rips lossless ALAC, Dolby Atmos, and AAC from Apple Music straight to your chat.
 /dl https://music.apple.com/album/123456 -aac
 /dl https://music.apple.com/song/789012 -atmos -tgz
 ` + "```" + `
-
-## Inline search
-
-Type ` + "`@bot <keywords>`" + ` in any chat to search songs directly.
 `)
 }
