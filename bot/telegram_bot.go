@@ -3953,8 +3953,15 @@ func (s *DownloadStatus) formatProgressRich(phase string, done, total int64, per
 			if v := medianSpeed(st.speedSamples); v > 0 {
 				spd = formatBytes(int64(v)) + "/s"
 			}
+			// Tag the track with the wrapper-manager instance handling it (e.g.
+			// "[wm-1]") so a slow/stuck worker is easy to spot at a glance. Omitted
+			// while a track is still between workers (Preparing phase, no worker yet).
+			title := escapeRichMD(truncateStatusTitle(st.title, 32))
+			if st.workerID != "" {
+				title += " [" + escapeRichMD(st.workerID) + "]"
+			}
 			fmt.Fprintf(&b, "| %02d · %s | %s | %s |\n",
-				st.number, escapeRichMD(truncateStatusTitle(st.title, 32)), prog, spd)
+				st.number, title, prog, spd)
 			shown++
 		}
 		b.WriteString("\n</details>\n")
