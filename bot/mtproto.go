@@ -17,7 +17,28 @@ import (
 	"github.com/gotd/td/telegram/uploader"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
+
+// mtprotoLogger builds the gotd internal logger. gotd logs transport- and
+// engine-level events (reconnects, read/write errors, the reason an engine is
+// torn down) through this zap logger; without it those reasons are invisible and
+// we only see the wrapped "engine forcibly closed: context canceled" at the call
+// site. We log at Info so we capture connection lifecycle and teardown causes
+// without the per-message Debug firehose. Output goes to stderr, interleaving
+// with the bot's existing fmt logs in `docker compose logs`.
+func mtprotoLogger() *zap.Logger {
+	cfg := zap.NewProductionEncoderConfig()
+	cfg.TimeKey = "ts"
+	cfg.EncodeTime = zapcore.ISO8601TimeEncoder
+	core := zapcore.NewCore(
+		zapcore.NewConsoleEncoder(cfg),
+		zapcore.Lock(os.Stderr),
+		zapcore.InfoLevel,
+	)
+	return zap.New(core).Named("gotd")
+}
 
 func cryptoRandID() int64 {
 	var b [8]byte
@@ -39,6 +60,7 @@ type MTProtoClient struct {
 	botToken    string
 	sessionPath string
 	storage     *FileSessionStorage
+	logger      *zap.Logger
 	parentCtx   context.Context
 	cancel      context.CancelFunc
 
@@ -238,6 +260,7 @@ func NewMTProtoClient(apiID int, apiHash string, botToken string, sessionDir str
 		botToken:    botToken,
 		sessionPath: sessionPath,
 		storage:     &FileSessionStorage{Path: sessionPath},
+		logger:      mtprotoLogger(),
 		parentCtx:   parentCtx,
 		cancel:      cancel,
 		peers:       make(map[int64]tg.InputPeerClass),
@@ -271,8 +294,12 @@ func (m *MTProtoClient) supervise(firstResult chan error) {
 		}
 
 		// Fresh client + api each cycle — Run cannot be called twice on one client.
+		// Logger is attached so gotd reports WHY a cycle ends (read timeout,
+		// transport reset, server-side close), turning the opaque "engine forcibly
+		// closed" at the upload call site into an actionable root cause.
 		client := telegram.NewClient(m.apiID, m.apiHash, telegram.Options{
 			SessionStorage: m.storage,
+			Logger:         m.logger,
 			Middlewares: []telegram.Middleware{
 				FloodWaitMiddleware{},
 			},
