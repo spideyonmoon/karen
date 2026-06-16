@@ -35,6 +35,10 @@ const (
 	defaultTelegramFormat        = "alac"
 	defaultTelegramDownloadMaxGB = 3
 	defaultTelegramTimeoutSecs   = 3600
+	// downloadPurgeInterval is how often the background routine wipes the local
+	// download cache folders. This is a hard time-based purge (separate from the
+	// size-threshold cleanupDownloadsIfNeeded) so the disk never creeps over time.
+	downloadPurgeInterval = 12 * time.Hour
 )
 
 const (
@@ -462,7 +466,87 @@ func newTelegramBot(token, appleToken string) *TelegramBot {
 	}
 	bot.loadCache()
 	bot.startDownloadWorker()
+	bot.startPurgeRoutine()
 	return bot
+}
+
+// startPurgeRoutine launches a background ticker that wipes the local download
+// cache folders every downloadPurgeInterval. It's a safety net so finished
+// downloads never accumulate on disk between the size-based cleanups.
+func (b *TelegramBot) startPurgeRoutine() {
+	go func() {
+		ticker := time.NewTicker(downloadPurgeInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			b.purgeDownloadCaches()
+		}
+	}()
+}
+
+// purgeDownloadCaches empties every configured save folder (ALAC / Atmos / AAC).
+// It skips the cycle entirely while a download is in progress so it can never
+// yank files out from under an active transfer, and it removes only the folders'
+// contents — not the folders themselves — so the volume mounts stay valid.
+func (b *TelegramBot) purgeDownloadCaches() {
+	b.queueMu.Lock()
+	busy := b.inProgress
+	b.queueMu.Unlock()
+	if busy {
+		fmt.Println("Scheduled download purge skipped: a transfer is in progress.")
+		return
+	}
+
+	cacheFile := ""
+	if cf := strings.TrimSpace(Config.TelegramCacheFile); cf != "" {
+		cacheFile = filepath.Clean(cf)
+	}
+
+	seen := make(map[string]bool)
+	for _, root := range []string{Config.AlacSaveFolder, Config.AtmosSaveFolder, Config.AacSaveFolder} {
+		root = strings.TrimSpace(root)
+		if root == "" {
+			continue
+		}
+		cleanRoot := filepath.Clean(root)
+		// Guard against wiping the working dir or filesystem root if a folder is
+		// misconfigured (mirrors cleanupDownloadsIfNeeded's safety check).
+		if cleanRoot == "." || cleanRoot == string(filepath.Separator) {
+			fmt.Printf("Skip purge for unsafe download folder: %s\n", root)
+			continue
+		}
+		if seen[cleanRoot] {
+			continue
+		}
+		seen[cleanRoot] = true
+		b.purgeFolderContents(cleanRoot, cacheFile)
+	}
+}
+
+// purgeFolderContents deletes every entry inside dir (keeping dir itself),
+// skipping the Telegram cache file in case it lives under a download root.
+func (b *TelegramBot) purgeFolderContents(dir, cacheFile string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			fmt.Printf("Purge scan failed for %s: %v\n", dir, err)
+		}
+		return
+	}
+	removed := 0
+	for _, entry := range entries {
+		p := filepath.Join(dir, entry.Name())
+		if cacheFile != "" && filepath.Clean(p) == cacheFile {
+			continue
+		}
+		if err := os.RemoveAll(p); err != nil {
+			fmt.Printf("Purge failed to remove %s: %v\n", p, err)
+			continue
+		}
+		removed++
+	}
+	if removed > 0 {
+		fmt.Printf("Purged %d item(s) from %s\n", removed, dir)
+	}
 }
 
 func (b *TelegramBot) loop() {

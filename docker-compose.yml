@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   wrapper-manager-1:
     build: ./wrapper-manager
