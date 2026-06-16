@@ -3719,24 +3719,27 @@ func (s *DownloadStatus) formatProgressText(phase string, done, total int64, per
 		elapsedStr = formatDuration(time.Since(s.startedAt))
 	}
 
-	// Header
+	// Header (plain proportional-font text — the board uses no parse_mode, so we
+	// must not wrap the body in ``` fences; Telegram would render them literally).
 	header := s.formatHeader(phase, snap)
 	bar := renderBar(barPct, 10)
 
-	// The board is sent as plain text (no parse_mode), so we must NOT wrap the
-	// body in ``` fences — Telegram would show them literally. A blank line
-	// separates the proportional-font header from the monospace-ish body.
 	var b strings.Builder
 	b.WriteString(header)
-	b.WriteString("\n")
+	b.WriteString("\n\n") // blank line between the header and the progress block
+
+	// Progress block, each element on its own line so it reads cleanly on narrow
+	// screens: bar + percent, then the byte counter, then speed · elapsed.
+	// (ETA was removed earlier — usually unknown and space-hungry.)
 	if hasBar {
-		fmt.Fprintf(&b, "%s %3d%%  %s / %s\n",
-			bar, barPct, formatBytes(barDone), formatBytes(barTotal))
+		if barPct >= 0 {
+			fmt.Fprintf(&b, "%s  %d%%\n", bar, barPct)
+		} else {
+			fmt.Fprintf(&b, "%s\n", bar)
+		}
+		fmt.Fprintf(&b, "%s / %s\n", formatBytes(barDone), formatBytes(barTotal))
 	}
-	// Stats line: speed · elapsed. ETA removed (see above). The downloader may
-	// set phase to non-download values (Zipping / Uploading / Decrypting / etc.);
-	// the phase label lives in the header so the user knows the current stage.
-	fmt.Fprintf(&b, "%s %s/s · %s %s\n",
+	fmt.Fprintf(&b, "%s %s/s  ·  %s %s\n",
 		symSpeed, formatBytes(int64(totalSpeed)),
 		symElapsed, elapsedStr,
 	)
@@ -3772,10 +3775,20 @@ func (s *DownloadStatus) formatProgressText(phase string, done, total int64, per
 	return b.String()
 }
 
-// formatHeader produces the two-line task heading. The first line carries the
-// release title and the done/total counter; the second carries the user, mode,
-// and cancel command. Both are kept outside the monospace code block so they
-// use Telegram's proportional font and stand out as headings.
+// phaseTrailingCounter matches a phase that ends in its own "i/N" progress
+// counter (e.g. "Uploading 7/7"), so we can detect it and normalize the spacing
+// to "Uploading · 7/7" rather than double up with the track counter.
+var phaseTrailingCounter = regexp.MustCompile(`^(.*\S)\s+(\d+/\d+)$`)
+
+// formatHeader produces the four-line task heading for the status board:
+//
+//	▸ <title>
+//	<phase> · <counter>
+//	by <user> · <mode>
+//	✕ cancel  /stop_<id>
+//
+// It's plain proportional-font text (the board uses no parse_mode). Each piece
+// sits on its own line so the header doesn't read as one dense run-on.
 func (s *DownloadStatus) formatHeader(phase string, snap progressSnapshot) string {
 	title := strings.TrimSpace(snap.releaseTitle)
 	if title == "" {
@@ -3783,25 +3796,34 @@ func (s *DownloadStatus) formatHeader(phase string, snap progressSnapshot) strin
 	}
 	title = truncateStatusTitle(title, 56)
 
-	counter := ""
-	if snap.total > 0 {
-		counter = fmt.Sprintf(" · %d/%d", snap.finished, snap.total)
-	}
-
 	user := "@" + s.username
 	if s.username == "" {
 		user = fmt.Sprintf("ID:%d", s.userID)
 	}
 
-	heading := fmt.Sprintf("%s %s%s", symDownload, title, counter)
-	// The phase label sits on its own line right under the title (kept outside
-	// the code block) so the user can see the current stage at a glance.
-	sub := fmt.Sprintf("   by %s · %s · %s cancel /stop_%s",
-		user, shortMode(s.mode), symCancel, s.taskID)
-	if phase != "" {
-		return heading + "\n" + phase + "\n" + sub
+	// Status line = phase plus the finished/total track counter. The upload phase
+	// bakes its own "i/N" file counter into the phase string, so only append the
+	// track counter when the phase carries none — otherwise we'd render the count
+	// twice (e.g. "Uploading 7/7 · 7/7").
+	statusLine := strings.TrimSpace(phase)
+	if m := phaseTrailingCounter.FindStringSubmatch(statusLine); m != nil {
+		statusLine = m[1] + " · " + m[2]
+	} else if snap.total > 0 {
+		counter := fmt.Sprintf("%d/%d", snap.finished, snap.total)
+		if statusLine == "" {
+			statusLine = counter
+		} else {
+			statusLine += " · " + counter
+		}
 	}
-	return heading + "\n" + sub
+
+	lines := []string{fmt.Sprintf("%s %s", symDownload, title)}
+	if statusLine != "" {
+		lines = append(lines, statusLine)
+	}
+	lines = append(lines, fmt.Sprintf("by %s · %s", user, shortMode(s.mode)))
+	lines = append(lines, fmt.Sprintf("%s cancel  /stop_%s", symCancel, s.taskID))
+	return strings.Join(lines, "\n")
 }
 
 // workerPrefix returns the "wm-1 " (with trailing space) prefix for a per-track
