@@ -65,10 +65,18 @@ DC=(docker compose --env-file /dev/null)
 echo "Waiting 20s for wrapper-manager gRPC servers to come up ..."
 sleep 20
 
-# 4. Log in each account (one-time; token persists in wm-data-N volume)
+# 4. Log in each account. Idempotent: an account that already has a token
+#    (instances.json in its volume) is skipped, so re-running setup.sh after
+#    adding accounts only logs in the NEW ones — re-authing a live account
+#    fails. Force a fresh login for all with: RELOGIN=1 ./setup.sh
 for ((i = 1; i <= N; i++)); do
   port=$((8080 + i))
   id_var="APPLE_ID_${i}"; pass_var="APPLE_PASS_${i}"
+  if [[ "${RELOGIN:-0}" != "1" ]] && \
+     "${DC[@]}" exec -T "wrapper-manager-$i" sh -c 'test -s /root/data/instances.json' 2>/dev/null; then
+    echo "=== wrapper-manager-$i already logged in — skipping (RELOGIN=1 to force) ==="
+    continue
+  fi
   echo "=== Login wrapper-manager-$i (port $port) ==="
   cp .logins/wm-1.toml.example ".logins/wm-${i}.toml"
   sed -i "s|127.0.0.1:8081|127.0.0.1:${port}|" ".logins/wm-${i}.toml"
