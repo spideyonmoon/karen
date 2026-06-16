@@ -53,9 +53,14 @@ if [[ ! -d "$AMD" ]]; then
     prompt-toolkit m3u8 regex beautifulsoup4 lxml tenacity async-lru loguru six
 fi
 
+# Compose must NOT auto-read our secrets .env for ${VAR} interpolation — a
+# password containing $ triggers "variable is not set" warnings and needless
+# parsing of secrets. Our compose files use literal values only.
+DC=(docker compose --env-file /dev/null)
+
 # 3. Build the shared wrapper image and boot all wrapper-managers
-docker compose build wrapper-manager-1
-docker compose up -d $(for ((i=1;i<=N;i++)); do echo "wrapper-manager-$i"; done)
+"${DC[@]}" build wrapper-manager-1
+"${DC[@]}" up -d $(for ((i=1;i<=N;i++)); do echo "wrapper-manager-$i"; done)
 
 echo "Waiting 20s for wrapper-manager gRPC servers to come up ..."
 sleep 20
@@ -71,5 +76,5 @@ for ((i = 1; i <= N; i++)); do
 done
 
 # 5. Start the bot
-docker compose up -d --build bot
+"${DC[@]}" up -d --build bot
 echo "Setup complete. Tail logs with: docker compose logs -f bot"

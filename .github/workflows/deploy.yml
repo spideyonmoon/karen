@@ -33,4 +33,6 @@ jobs:
             # any pushed template/script changes take effect. .env and the
             # generated docker-compose.override.yml survive `git reset` (untracked).
             ./generate.sh
-            docker compose up -d --build bot
+            # --env-file /dev/null: don't let compose parse the secrets .env for
+            # ${VAR} interpolation (a $ in a password warns "variable is not set").
+            docker compose --env-file /dev/null up -d --build bot

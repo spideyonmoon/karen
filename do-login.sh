@@ -21,13 +21,19 @@ ln -s "$AMD/main.py" "$WORK/main.py" 2>/dev/null || true
 
 cd "$WORK"
 
-# Feed creds on stdin; if 2FA comes, the script will block on `input("2FA code: ")`
-# We don't know 2FA upfront, so just feed creds and let it block if needed.
+# Feed creds on stdin, then stop as soon as the login resolves. We watch the log
+# (which `tee` writes live) for the success/failure marker instead of blocking on
+# a fixed sleep — the old `sleep 600` held the pipe open for 10 min AFTER
+# `Login Success!`, stalling the whole setup. Hard cap ~120s as a fallback; on
+# timeout stdin closes and login.py exits on EOF.
+: > "$LOG"
 {
   echo "$EMAIL"
   echo "$PASS"
-  # No 2FA pre-fed. If prompt comes, log will show it and we can relay code later.
-  sleep 600
+  for _ in $(seq 1 120); do
+    grep -qE 'Login Success!|Login Failed|Login failed' "$LOG" 2>/dev/null && break
+    sleep 1
+  done
 } | python3 tools/login.py 2>&1 | tee "$LOG"
 
 rm -rf "$WORK"
