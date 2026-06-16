@@ -1,5 +1,6 @@
 bot/config.yaml
 bot/telegram-cache.json
+bot/telegram-state.json
 bot/downloads/
 wrapper/wrapper-data/
 *.zip

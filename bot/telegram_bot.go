@@ -133,6 +133,18 @@ type TelegramBot struct {
 	cacheFile string
 	cache     map[string]CachedAudio
 	docCache  map[string]CachedDocument
+
+	// admins is built once from Config.TelegramAdminIDs and is immutable after
+	// construction (no lock needed to read).
+	admins map[int64]bool
+
+	// stateMu guards adminLock + scheduledJobs and the telegram-state.json file.
+	// It is a LEAF lock: never acquire queueMu while holding it, and never hold
+	// it across an enqueue*/cancel/purge call (those take queueMu).
+	stateMu       sync.Mutex
+	stateFile     string
+	adminLock     bool            // true => only admins may use the bot (persisted)
+	scheduledJobs []*scheduledJob // pending sleeptime rips (persisted)
 }
 
 type PendingSelection struct {
@@ -448,6 +460,10 @@ func newTelegramBot(token, appleToken string) *TelegramBot {
 	for _, id := range Config.TelegramAllowedChatIDs {
 		allowed[id] = true
 	}
+	admins := make(map[int64]bool)
+	for _, id := range Config.TelegramAdminIDs {
+		admins[id] = true
+	}
 	searchLimit := Config.TelegramSearchLimit
 	if searchLimit <= 0 {
 		searchLimit = defaultSearchLimit
@@ -459,6 +475,13 @@ func newTelegramBot(token, appleToken string) *TelegramBot {
 	cacheFile := strings.TrimSpace(Config.TelegramCacheFile)
 	if cacheFile == "" {
 		cacheFile = "telegram-cache.json"
+	}
+	// State file lives beside the cache file so a single download-folder volume
+	// covers both; defaults to telegram-state.json in the working dir (/app),
+	// which is bind-mounted in docker-compose.yml.
+	stateFile := "telegram-state.json"
+	if dir := filepath.Dir(cacheFile); dir != "." && dir != "" {
+		stateFile = filepath.Join(dir, "telegram-state.json")
 	}
 	queueSize := defaultQueueSize
 	if queueSize <= 0 {
@@ -482,10 +505,14 @@ func newTelegramBot(token, appleToken string) *TelegramBot {
 		cacheFile:        Config.TelegramCacheFile,
 		cache:            make(map[string]CachedAudio),
 		docCache:         make(map[string]CachedDocument),
+		admins:           admins,
+		stateFile:        stateFile,
 	}
 	bot.loadCache()
+	bot.loadState()
 	bot.startDownloadWorker()
 	bot.startPurgeRoutine()
+	bot.startScheduler()
 	return bot
 }
 
@@ -1024,6 +1051,12 @@ func (b *TelegramBot) handleCallback(cb *CallbackQuery) {
 		clickerID = cb.From.ID
 		username = cb.From.Username
 	}
+	// Lockdown also blocks non-admins from completing in-flight button flows
+	// (delivery-mode picker, paging, selection).
+	if b.isLocked() && !b.isAdmin(clickerID) {
+		_ = b.answerCallbackAlert(cb.ID, "The bot is currently restricted to admins.")
+		return
+	}
 	data := strings.TrimSpace(cb.Data)
 	// alert is a non-empty toast when a guarded handler rejects the click (e.g. a
 	// non-owner tapping someone else's buttons); otherwise we just ack the callback.
@@ -1141,6 +1174,12 @@ func (b *TelegramBot) handleChosenInlineResult(result *ChosenInlineResult) {
 }
 
 func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args []string, replyToID int) {
+	// Admin lockdown: when /auth is active, non-admins can't run ANY command
+	// (including /stop and /status). Admins are unaffected.
+	if b.isLocked() && !b.isAdmin(userID) {
+		_ = b.sendMessageWithReply(chatID, "The bot is currently restricted to admins.", nil, replyToID)
+		return
+	}
 	if strings.HasPrefix(cmd, "stop_") {
 		taskID := strings.TrimPrefix(cmd, "stop_")
 		b.cancelTask(chatID, userID, taskID, replyToID)
@@ -1250,12 +1289,15 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args
 			return
 		}
 
-		_, playlistID := checkUrlPlaylist(link)
+		playlistStorefront, playlistID := checkUrlPlaylist(link)
 		if playlistID != "" {
-			if headlessMode != "" {
-				b.enqueuePlaylistDownload(chatID, playlistID, replyToID, 0, headlessMode, forceAAC, forceAtmos, forceFlac, userID, "")
+			if b.isAdmin(userID) {
+				// Admins bypass the >100-track sleeptime gate entirely.
+				b.dispatchPlaylistNormal(chatID, userID, playlistID, replyToID, headlessMode, forceAAC, forceAtmos, forceFlac)
 			} else {
-				b.queueDownloadPlaylistWithReply(chatID, userID, playlistID, replyToID, forceAAC, forceAtmos, forceFlac)
+				// Non-admins: count first (blocking → goroutine); >100 tracks defers
+				// to the sleeptime window forced to Gofile ZIP.
+				go b.routePlaylistNonAdmin(chatID, userID, playlistStorefront, playlistID, link, replyToID, headlessMode, forceAAC, forceAtmos, forceFlac)
 			}
 			return
 		}
@@ -1270,13 +1312,54 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args
 			return
 		}
 
-		_, artistID := checkUrlArtist(link)
+		artistStorefront, artistID := checkUrlArtist(link)
 		if artistID != "" {
-			_ = b.sendMessageWithReply(chatID, "Downloading artist discographies is not allowed.", nil, replyToID)
+			if b.isAdmin(userID) {
+				// Admins bypass sleeptime gating — rip the whole discography now,
+				// forced to Gofile ZIP. Blocking enumeration → goroutine.
+				go b.runArtistRip(chatID, userID, "", artistStorefront, artistID, replyToID, forceAAC, forceAtmos, forceFlac)
+			} else {
+				go b.scheduleOrRun(&scheduledJob{
+					Kind:       "artist",
+					ChatID:     chatID,
+					UserID:     userID,
+					ReplyToID:  replyToID,
+					Link:       link,
+					Storefront: artistStorefront,
+					ResourceID: artistID,
+					ForceAAC:   forceAAC,
+					ForceAtmos: forceAtmos,
+					ForceFlac:  forceFlac,
+				})
+			}
 			return
 		}
 
 		_ = b.sendMessageWithReply(chatID, "Invalid Apple Music link.", nil, replyToID)
+	case "count":
+		if len(args) == 0 {
+			_ = b.sendMessageWithReply(chatID, "Usage: /count <apple-music-link>", nil, replyToID)
+			return
+		}
+		// Blocking metadata fetches — run off the update loop.
+		go b.handleCount(chatID, args[0], replyToID)
+	case "auth":
+		if !b.isAdmin(userID) {
+			return // don't reveal the command to non-admins
+		}
+		b.setAdminLock(true)
+		_ = b.sendMessageWithReply(chatID, "🔒 Bot restricted to admins. Use /unauth to reopen.", nil, replyToID)
+	case "unauth":
+		if !b.isAdmin(userID) {
+			return
+		}
+		b.setAdminLock(false)
+		_ = b.sendMessageWithReply(chatID, "🔓 Bot reopened to all allowed users.", nil, replyToID)
+	case "purge":
+		if !b.isAdmin(userID) {
+			return
+		}
+		b.adminPurge(chatID, replyToID)
 	default:
 		// Silently ignore unknown commands
 	}
@@ -5564,8 +5647,8 @@ func buildSettingsKeyboard(current string) InlineKeyboardMarkup {
 	}
 }
 
-// cancelTask cancels a task by its ID. issuerID is the user running /stop; only the
-// task's owner may cancel it (owner-only for now — admin override will come with .env).
+// cancelTask cancels a task by its ID. issuerID is the user running /stop; the
+// task's owner may cancel it, and admins may cancel anyone's task.
 func (b *TelegramBot) cancelTask(chatID int64, issuerID int64, taskID string, replyToID int) {
 	if taskID == "" {
 		_ = b.sendMessageWithReply(chatID, "Usage: /stop_<task_id>", nil, replyToID)
@@ -5575,7 +5658,7 @@ func (b *TelegramBot) cancelTask(chatID int64, issuerID int64, taskID string, re
 	b.queueMu.Lock()
 	// Check active task
 	if b.activeReq != nil && b.activeReq.taskID == taskID {
-		if b.activeReq.userID != 0 && issuerID != b.activeReq.userID {
+		if b.activeReq.userID != 0 && issuerID != b.activeReq.userID && !b.isAdmin(issuerID) {
 			b.queueMu.Unlock()
 			_ = b.sendMessageWithReply(chatID, notYours, nil, replyToID)
 			return
@@ -5597,8 +5680,8 @@ func (b *TelegramBot) cancelTask(chatID int64, issuerID int64, taskID string, re
 			switch {
 			case req.taskID != taskID:
 				b.downloadQueue <- req
-			case req.userID != 0 && issuerID != req.userID:
-				// Not the owner — put it back untouched.
+			case req.userID != 0 && issuerID != req.userID && !b.isAdmin(issuerID):
+				// Not the owner (and not an admin) — put it back untouched.
 				b.downloadQueue <- req
 				denied = true
 			default:
@@ -5631,10 +5714,15 @@ func (b *TelegramBot) cancelTask(chatID int64, issuerID int64, taskID string, re
 func botHelpText() string {
 	return strings.TrimSpace(`
 Commands:
-/dl <apple-music-link> [flags]   download a song, album, or playlist
+/dl <apple-music-link> [flags]   download a song, album, artist, or playlist
+/count <apple-music-link>        count the streamable tracks behind a link
 /status or /queue                show active task and queue count
 /stop_<task_id>                  cancel a running or queued download
 /help                            show this message
+
+Heavy rips (full artist discographies, and playlists over 100 tracks) are
+delivered as a Gofile ZIP and, outside 2:30–6:00 AM Dhaka time, are scheduled
+to run during that window.
 
 Flags:
   -aac     download in AAC-LC format
@@ -5660,10 +5748,13 @@ Rips lossless ALAC, Dolby Atmos, and AAC from Apple Music straight to your chat.
 
 | Command | What it does |
 |:--------|:-------------|
-| ` + "`/dl <link> [flags]`" + ` | Download a song, album, or playlist |
+| ` + "`/dl <link> [flags]`" + ` | Download a song, album, artist, or playlist |
+| ` + "`/count <link>`" + ` | Count the streamable tracks behind a link |
 | ` + "`/status`" + ` or ` + "`/queue`" + ` | Show the active task and queue |
 | ` + "`/stop_<task_id>`" + ` | Cancel a running or queued download |
 | ` + "`/help`" + ` | Show this message |
+
+> Heavy rips (full artist discographies, playlists over 100 tracks) deliver as a Gofile ZIP and, outside 2:30–6:00 AM Dhaka time, are scheduled for that window.
 
 ## Flags
 

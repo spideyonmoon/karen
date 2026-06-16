@@ -10,5 +10,9 @@ services:
       - ./bot/config.yaml:/app/config.yaml
       - ./bot/downloads:/downloads
       - ./bot/telegram-cache.json:/app/telegram-cache.json
+      # Admin lock + scheduled sleeptime rips. Without this mount the file lives
+      # only in the container layer and is wiped on every --build deploy.
+      # generate.sh touches the host file first so Docker mounts a file, not a dir.
+      - ./bot/telegram-state.json:/app/telegram-state.json
     command: ["--bot"]
     restart: unless-stopped

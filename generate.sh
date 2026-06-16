@@ -170,3 +170,10 @@ for ((i = 1; i <= N; i++)); do
 done
 } > docker-compose.override.yml
 echo "Wrote docker-compose.override.yml"
+
+# Ensure the persistent bot-state file exists as a FILE before `docker compose
+# up`. A bind mount to a non-existent path makes Docker create a directory,
+# which would silently break state persistence (admin lock + scheduled rips).
+# Gitignored; an empty file is treated as "defaults" by the bot on first load.
+touch bot/telegram-state.json
+echo "Ensured bot/telegram-state.json exists"
