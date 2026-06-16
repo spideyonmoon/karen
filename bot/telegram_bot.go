@@ -64,7 +64,6 @@ const (
 	symDownload = "\u25B8"          // ▸ right-pointing small triangle
 	symQueue    = "\u2261"          // ≡ identical-to (three lines)
 	symSpeed    = "\u26A1\uFE0E"    // ⚡︎ outline lightning
-	symETA      = "\u23F1\uFE0E"    // ⏱︎ outline stopwatch
 	symElapsed  = "\u231B\uFE0E"    // ⌛︎ outline hourglass
 	symActive   = "\u25B8"          // ▸ active track
 	symDone     = "\u2713"          // ✓ done
@@ -3629,12 +3628,8 @@ func (s *DownloadStatus) formatProgressText(phase string, done, total int64, per
 		totalSpeed = s.rollingSpeedBytesPerSec()
 	}
 
-	// ETA + elapsed
-	etaStr := "-"
-	if totalSpeed > 0 && hasBar && barTotal > barDone {
-		eta := time.Duration(float64(barTotal-barDone)/totalSpeed) * time.Second
-		etaStr = formatDuration(eta)
-	}
+	// Elapsed only. ETA was removed: on small screens it never had room and was
+	// frequently unknown (stuck at "-"), so it added noise without value.
 	elapsedStr := "-"
 	if !s.startedAt.IsZero() {
 		elapsedStr = formatDuration(time.Since(s.startedAt))
@@ -3642,21 +3637,23 @@ func (s *DownloadStatus) formatProgressText(phase string, done, total int64, per
 
 	// Header
 	header := s.formatHeader(phase, snap)
-	bar := renderBar(barPct, 20)
+	bar := renderBar(barPct, 10)
 
+	// The board is sent as plain text (no parse_mode), so we must NOT wrap the
+	// body in ``` fences — Telegram would show them literally. A blank line
+	// separates the proportional-font header from the monospace-ish body.
 	var b strings.Builder
 	b.WriteString(header)
-	b.WriteString("\n```\n")
+	b.WriteString("\n")
 	if hasBar {
-		fmt.Fprintf(&b, "%s  %3d%%   %s / %s\n",
+		fmt.Fprintf(&b, "%s %3d%%  %s / %s\n",
 			bar, barPct, formatBytes(barDone), formatBytes(barTotal))
 	}
-	// Stats line: speed · ETA · elapsed. The downloader may set phase to
-	// non-download values (Zipping / Uploading / Decrypting / etc.) — print the
-	// actual phase on the bar line so the user knows which stage they're at.
-	fmt.Fprintf(&b, "%s %s/s · %s %s left · %s %s\n",
+	// Stats line: speed · elapsed. ETA removed (see above). The downloader may
+	// set phase to non-download values (Zipping / Uploading / Decrypting / etc.);
+	// the phase label lives in the header so the user knows the current stage.
+	fmt.Fprintf(&b, "%s %s/s · %s %s\n",
 		symSpeed, formatBytes(int64(totalSpeed)),
-		symETA, etaStr,
 		symElapsed, elapsedStr,
 	)
 
@@ -3688,7 +3685,6 @@ func (s *DownloadStatus) formatProgressText(phase string, done, total int64, per
 			}
 		}
 	}
-	b.WriteString("```")
 	return b.String()
 }
 
