@@ -4,6 +4,7 @@ bot/downloads/
 wrapper/wrapper-data/
 *.zip
 .env
+docker-compose.override.yml
 context.md
 # Per-instance AppleMusicDecrypt login configs (contain no secrets, but are host-specific)
 .logins/wm-*.toml

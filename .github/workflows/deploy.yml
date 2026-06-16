@@ -29,4 +29,8 @@ jobs:
             # bot/config.yaml, .logins/wm-*.toml = the logged-in accounts) must survive.
             rm -f do-login.sh
             git reset --hard origin/main
+            # Regenerate bot/config.yaml from the persistent (gitignored) .env so
+            # any pushed template/script changes take effect. .env and the
+            # generated docker-compose.override.yml survive `git reset` (untracked).
+            ./generate.sh
             docker compose up -d --build bot

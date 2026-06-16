@@ -45,6 +45,7 @@ type ConfigSet struct {
 	ConvertSkipLossyToLossless bool    `yaml:"convert-skip-lossy-to-lossless"`
 	TelegramBotToken           string  `yaml:"telegram-bot-token"`
 	TelegramAllowedChatIDs     []int64 `yaml:"telegram-allowed-chat-ids"`
+	TelegramAdminIDs           []int64 `yaml:"telegram-admin-ids"`
 	TelegramCacheChatID        int64   `yaml:"telegram-cache-chat-id"`
 	TelegramSearchLimit        int     `yaml:"telegram-search-limit"`
 	TelegramSearchLanguage     string  `yaml:"telegram-search-language"`

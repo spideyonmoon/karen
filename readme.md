@@ -36,93 +36,58 @@ Karen rips lossless ALAC, Atmos, and AAC from Apple Music and delivers files dir
 
 ## Setup
 
-### 1. Clone and configure
+### 1. Clone and configure `.env`
+
+Everything is driven by a single `.env` file. The number of Apple accounts you put in it decides how many wrapper-manager instances are created — no manual `docker-compose.yml` or `config.yaml` editing.
 
 ```bash
 git clone -b feat/wrapper-manager https://github.com/spideyonmoon/karen.git ~/karen
 cd ~/karen
-cp bot/config.yaml.example bot/config.yaml
-nano bot/config.yaml
+cp .env.example .env
+nano .env
 ```
 
-Fill in the required fields:
-
-```yaml
-telegram-bot-token: "YOUR_BOT_TOKEN"
-telegram-allowed-chat-ids: [-100123456789]   # your chat/group IDs
-storefront: "us"                              # account region (us, jp, etc.)
-media-user-token: "YOUR_MEDIA_USER_TOKEN"     # from browser devtools on music.apple.com
-
-# MTProto (optional, for >50MB uploads)
-telegram-api-id: 0
-telegram-api-hash: ""
-
-gofile-token: ""
-
-# Wrapper-manager addresses — one per instance
-wrapper-manager-addrs:
-  - "karen-wm-1:8081"
-  - "karen-wm-2:8082"
-```
-
-### 2. Build wrapper-manager image
+Fill in your secrets and one `APPLE_ID_N` / `APPLE_PASS_N` pair per account:
 
 ```bash
-docker compose build wrapper-manager
+TELEGRAM_BOT_TOKEN="YOUR_BOT_TOKEN"
+TELEGRAM_API_ID=12345
+TELEGRAM_API_HASH="YOUR_API_HASH"
+TELEGRAM_ALLOWED_CHAT_IDS="-100123456789"   # comma-separated
+ADMIN_IDS="111111111"                        # comma-separated, sudo users
+MEDIA_USER_TOKEN="YOUR_MEDIA_USER_TOKEN"     # from browser devtools on music.apple.com
+GOFILE_TOKEN=""
+
+APPLE_ID_1="apple-id-1@example.com"
+APPLE_PASS_1="password1"
+APPLE_ID_2="apple-id-2@example.com"
+APPLE_PASS_2="password2"
+# add APPLE_ID_3 / APPLE_PASS_3 ... to scale up
 ```
 
-This builds a single shared image (`karen-wrapper-manager:local`) used by all instances. It clones the upstream wrapper-manager, patches the WebPlayback nil-safety bug, and increases the emulator timeout from 5s to 25s.
+`storefront` is fixed to `us` in the generated config and is intentionally not in `.env`.
 
-### 3. Login Apple Music accounts
-
-Each wrapper-manager instance holds exactly one account. Login is a one-time event per account: the wrapper-manager persists the resulting Music-Token in its named volume (`wm-data-N`) and reuses it on every subsequent container start, so you only ever log in once per account.
-
-**How login actually works.** The wrapper-manager exposes a bidirectional gRPC `Login` RPC on its configured port. The client sends `{username, password}`; the wrapper-manager launches the Apple Music app in its Android emulator, types the credentials, taps Sign In, and replies with the result. If 2FA is required, the server replies with a "need code" message and the client sends the 6-digit code in a follow-up request. There is no CLI flag for it — login is exclusively via gRPC.
-
-**Prerequisites on the VPS:**
+### 2. Run the one-time setup
 
 ```bash
-# Clone the upstream login client next to karen
-git clone --depth 1 https://github.com/WorldObservationLog/AppleMusicDecrypt.git ~/AppleMusicDecrypt
-
-# Install its Python deps (one-time)
-pip3 install --break-system-packages creart grpcio 'protobuf>=6' pydantic \
-    prompt-toolkit m3u8 regex beautifulsoup4 lxml tenacity async-lru loguru six
+./setup.sh
 ```
 
-**Boot the wrapper-managers** so their gRPC servers are listening:
+`setup.sh` is the whole bootstrap. It:
 
-```bash
-docker compose up -d wrapper-manager-1 wrapper-manager-2
-```
-
-The `docker-compose.yml` in this repo exposes each instance's gRPC port on `127.0.0.1:808N` (localhost only) so the login client on the host can reach them. Do not expose these ports to the public internet.
-
-**Per-instance login.** Copy the example config for each instance and adjust the port:
-
-```bash
-cp .logins/wm-1.toml.example .logins/wm-1.toml
-cp .logins/wm-2.toml.example .logins/wm-2.toml
-# Edit each .logins/wm-N.toml and set `url = "127.0.0.1:808N"` to match the instance
-```
-
-Then run `do-login.sh` from the karen repo root:
-
-```bash
-./do-login.sh wm-1 "APPLE_ID_1" "PASSWORD_1"
-./do-login.sh wm-2 "APPLE_ID_2" "PASSWORD_2"
-```
-
-`do-login.sh` stages AMD's `tools/login.py` with your `config.toml`, pipes the credentials on stdin, and tees everything to `.logins/login-wm-N.log`. On success you'll see `Login Success!` and the wrapper-manager writes `instances.json` into the corresponding `wm-data-N` volume. If a 2FA prompt appears, the script blocks on `2FA code:` — paste the 6-digit code from your trusted device to continue.
+1. Runs `./generate.sh`, which reads `.env` and writes `bot/config.yaml` and `docker-compose.override.yml` (the N wrapper-manager services + volumes). Both are gitignored.
+2. Clones the AppleMusicDecrypt login client to `/tmp/AppleMusicDecrypt` and installs its Python deps (first run only).
+3. Builds the shared `karen-wrapper-manager:local` image (clones upstream wrapper-manager, patches the WebPlayback nil-safety bug, bumps the emulator timeout 5s → 25s) and boots every wrapper-manager.
+4. Logs in each Apple account once via the gRPC `Login` RPC (see below). The token persists in that instance's `wm-data-N` volume and is reused on every subsequent start, so you never log in again unless the volume is lost.
+5. Builds and starts the bot.
 
 > [!NOTE]
-> Earlier versions of this README documented a `docker compose run --rm wrapper-manager-N -L "id:pass"` shortcut. The `-L` flag was removed from the upstream `wrapper-manager` binary; that command now exits immediately with `flag provided but not defined: -L`. Login is exclusively via the gRPC `Login` RPC using a client like `AppleMusicDecrypt`'s `tools/login.py`.
+> The accounts used here are assumed to have 2FA disabled. The login path does not handle an interactive 2FA prompt.
 
-### 4. Start the stack
+<details>
+<summary>How login actually works (for reference)</summary>
 
-```bash
-docker compose up -d --build
-```
+Each wrapper-manager instance holds exactly one account. The wrapper-manager exposes a bidirectional gRPC `Login` RPC on its configured port. The client sends `{username, password}`; the wrapper-manager launches the Apple Music app in its Android emulator, types the credentials, taps Sign In, and replies with the result. There is no CLI flag for it — login is exclusively via gRPC, driven from the host by AppleMusicDecrypt's `tools/login.py` (wrapped by `do-login.sh`). `setup.sh` calls `do-login.sh` for each account automatically; you normally never run it by hand.</details>
 
 Monitor startup:
 
@@ -130,120 +95,30 @@ Monitor startup:
 docker compose logs -f bot
 ```
 
-You should see both wrapper-managers report `Wrapper ready` and the bot print `Telegram bot started. Waiting for updates...`.
+You should see each wrapper-manager report `Wrapper ready` and the bot print `Telegram bot started. Waiting for updates...`.
+
+> [!NOTE]
+> The upstream `wrapper-manager` binary has no login CLI flag (the old `-L "id:pass"` shortcut was removed and now errors with `flag provided but not defined: -L`). Login is exclusively via the gRPC `Login` RPC, which `setup.sh` drives for you through `do-login.sh`.
 
 ---
 
-## Scaling to N accounts
+## Deploys and scaling
 
-To add more wrapper-manager instances (e.g., 6-8 accounts):
+**Deploys are automatic.** Once `.env` exists on the VPS and the GitHub Actions SSH secrets are set, every push to `main` redeploys: the workflow pulls, re-runs `./generate.sh` (so config/template changes land), and rebuilds the bot. `.env` and the generated `docker-compose.override.yml` are gitignored, so they persist untouched across deploys. You never edit files on the VPS for a normal code change.
 
-### 1. Add services to `docker-compose.yml`
-
-Each instance needs its own service definition and named volume:
-
-```yaml
-services:
-  wrapper-manager-1:
-    build: ./wrapper-manager
-    image: karen-wrapper-manager:local
-    privileged: true
-    container_name: karen-wm-1
-    volumes:
-      - wm-data-1:/root/data
-    command: ["--host", "0.0.0.0", "--port", "8081", "-debug"]
-    restart: unless-stopped
-
-  wrapper-manager-2:
-    build: ./wrapper-manager
-    image: karen-wrapper-manager:local
-    privileged: true
-    container_name: karen-wm-2
-    volumes:
-      - wm-data-2:/root/data
-    command: ["--host", "0.0.0.0", "--port", "8082", "-debug"]
-    restart: unless-stopped
-
-  wrapper-manager-3:
-    build: ./wrapper-manager
-    image: karen-wrapper-manager:local
-    privileged: true
-    container_name: karen-wm-3
-    volumes:
-      - wm-data-3:/root/data
-    command: ["--host", "0.0.0.0", "--port", "8083", "-debug"]
-    restart: unless-stopped
-
-  # ... repeat for wrapper-manager-4, 5, 6, etc.
-
-  bot:
-    build: ./bot
-    container_name: karen-bot
-    depends_on:
-      - wrapper-manager-1
-      - wrapper-manager-2
-      - wrapper-manager-3
-      # ... list all instances here
-    volumes:
-      - ./bot/config.yaml:/app/config.yaml
-      - ./bot/downloads:/downloads
-      - ./bot/telegram-cache.json:/app/telegram-cache.json
-    command: ["--bot"]
-    restart: unless-stopped
-
-volumes:
-  wm-data-1:
-  wm-data-2:
-  wm-data-3:
-  # ... one volume per instance
-```
-
-**Key rules:**
-
-- Each instance gets a unique **port** (8081, 8082, 8083, ...)
-- Each instance gets a unique **volume** (wm-data-1, wm-data-2, wm-data-3, ...)
-- Each instance gets a unique **container name** (karen-wm-1, karen-wm-2, ...)
-- All instances share the same `karen-wrapper-manager:local` image
-- The bot's `depends_on` must list all instances
-
-### 2. Update `bot/config.yaml`
-
-Add all instance addresses:
-
-```yaml
-wrapper-manager-addrs:
-  - "karen-wm-1:8081"
-  - "karen-wm-2:8082"
-  - "karen-wm-3:8083"
-  - "karen-wm-4:8084"
-  - "karen-wm-5:8085"
-  - "karen-wm-6:8086"
-  - "karen-wm-7:8087"
-  - "karen-wm-8:8088"
-```
-
-### 3. Login each account
-
-For each instance `N` in `1..N`, copy the example config, set the port, and run `do-login.sh`:
+**To add or remove accounts**, edit the `APPLE_ID_N` / `APPLE_PASS_N` pairs in `.env` and re-run:
 
 ```bash
-for i in 1 2 3 4 5 6 7 8; do
-  echo "=== Login wrapper-manager-$i ==="
-  cp ".logins/wm-1.toml.example" ".logins/wm-$i.toml"
-  sed -i "s|127.0.0.1:8081|127.0.0.1:808$i|" ".logins/wm-$i.toml"
-  ./do-login.sh "wm-$i" "APPLE_ID_$i" "PASSWORD_$i"
-done
+./setup.sh
 ```
 
-(Substitute your own account credentials. If any account triggers 2FA, the script will block on `2FA code:` — paste the 6-digit code from your trusted device.)
+The account count drives everything — `generate.sh` rewrites `config.yaml` (the `wrapper-manager-addrs` list) and `docker-compose.override.yml` (the wrapper services + volumes), and `setup.sh` logs in any new accounts. Already-logged-in accounts keep their token in their `wm-data-N` volume and are not touched.
 
-### 4. Start everything
+**Key invariants** (handled automatically, listed for reference):
 
-```bash
-docker compose up -d --build
-```
-
-The bot's pool automatically discovers and distributes across all configured instances. No code changes needed.
+- Instance `N` uses port `8080+N`, container `karen-wm-N`, volume `wm-data-N`, address `karen-wm-N:808N`.
+- All instances share the `karen-wrapper-manager:local` image.
+- gRPC ports bind to `127.0.0.1` only — never expose them publicly.
 
 ---
 
@@ -374,8 +249,12 @@ karen/
 ├── wrapper-manager/
 │   ├── Dockerfile              # Builds upstream wrapper-manager + patches
 │   └── webplay.go              # Nil-safety patch for WebPlayback handler
+├── .env.example                # Single source of truth — copy to .env, fill in
+├── setup.sh                    # One-time bootstrap: generate + login + start
+├── generate.sh                 # Writes config.yaml + docker-compose.override.yml from .env
 ├── do-login.sh                 # Wrapper around AppleMusicDecrypt/tools/login.py
 ├── .logins/                    # Per-instance AppleMusicDecrypt configs (host-only)
-├── docker-compose.yml          # Stack: N wrapper-managers + bot
+├── docker-compose.yml          # Base: bot service only
+├── docker-compose.override.yml # Generated: N wrapper-managers + volumes (gitignored)
 └── SESSION_HISTORY.md          # Development log
 ```

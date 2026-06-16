@@ -7,14 +7,17 @@
 
 ## Quick start
 ```bash
-cp bot/config.yaml.example bot/config.yaml
-# edit config, then:
-docker compose up -d --build
+cp .env.example .env
+# edit .env (secrets + APPLE_ID_N/APPLE_PASS_N pairs), then one-time bootstrap:
+./setup.sh
 ```
 
-## Config
-- Copy `bot/config.yaml.example` -> `bot/config.yaml`, fill in all fields
-- Gitignored: `bot/config.yaml`, `bot/telegram-cache.json`, `bot/downloads/`
+## Config — .env is the single source of truth
+- Edit `.env` only. `./generate.sh` reads it and writes `bot/config.yaml` + `docker-compose.override.yml`; both are GENERATED — never hand-edit.
+- The count of `APPLE_ID_N`/`APPLE_PASS_N` pairs in `.env` drives instance count: wrapper services, volumes, ports (`8080+N`), and the `wrapper-manager-addrs` list all follow from it.
+- `storefront` is fixed to `us` in the generator (not in `.env`). Authoritative non-secret config values live in `generate.sh`'s heredoc, NOT `bot/config.yaml.example` (kept only as human reference and may drift).
+- `setup.sh` = full bootstrap (generate + clone AMD login client + build + per-account login + start). Re-run it only when the account list changes.
+- Gitignored: `.env`, `docker-compose.override.yml`, `bot/config.yaml`, `bot/telegram-cache.json`, `bot/downloads/`, `.logins/wm-*.toml`.
 
 ## CLI flags (binary has two modes)
 - `--bot` — Telegram bot mode (production)
@@ -36,18 +39,16 @@ docker compose up -d --build
   3. Gofile — fallback for oversized packages
 - Bot API (long-polling `getUpdates`) for receiving messages; MTProto only for file uploads
 
-## Docker services (docker-compose.yml)
-- `wrapper-manager-1` — port 8081, volume `wm-data-1`
-- `wrapper-manager-2` — port 8082, volume `wm-data-2`
-- `bot` — depends on both wrapper-managers
+## Docker services
+- `docker-compose.yml` (tracked) — base, defines only the `bot` service. No `depends_on` (wrappers aren't in this file; bot reaches them via gRPC at runtime).
+- `docker-compose.override.yml` (generated, gitignored) — `wrapper-manager-N` services + `wm-data-N` volumes, one per account. Compose auto-merges both files.
+- Instance `N`: container `karen-wm-N`, port `8080+N` bound to `127.0.0.1`, volume `wm-data-N`.
 
-## Wrapper-manager setup (one-time per account)
-```bash
-docker compose build wrapper-manager
-# For each account, run interactively:
-docker compose run --rm wrapper-manager-1 -L "APPLE_ID:PASSWORD"
-```
-Wrapper-manager needs `--privileged` (Frida hooks inside Android emulator).
+## Wrapper-manager setup (handled by setup.sh)
+- `./setup.sh` builds the shared `karen-wrapper-manager:local` image, boots the wrappers, and logs in each account via the gRPC `Login` RPC (through `do-login.sh`, which reads `AMD=/tmp/AppleMusicDecrypt`).
+- There is NO login CLI flag — the upstream `-L "id:pass"` shortcut was removed and now errors `flag provided but not defined: -L`. gRPC only.
+- 2FA is not handled (accounts in use have it disabled); `do-login.sh` feeds creds on a non-interactive stdin pipe.
+- Wrapper-manager needs `--privileged` (Frida hooks inside Android emulator).
 
 ## Required external binaries (bundled in Docker)
 - `ffmpeg` — fMP4 to flat MP4 remuxing, format conversion
