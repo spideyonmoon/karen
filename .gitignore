@@ -5,3 +5,7 @@ wrapper/wrapper-data/
 *.zip
 .env
 context.md
+# Per-instance AppleMusicDecrypt login configs (contain no secrets, but are host-specific)
+.logins/wm-*.toml
+.logins/login-*.log
+.logins/*.nohup.log

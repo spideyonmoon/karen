@@ -6,6 +6,8 @@ services:
     image: karen-wrapper-manager:local
     privileged: true
     container_name: karen-wm-1
+    ports:
+      - "127.0.0.1:8081:8081"
     volumes:
       - wm-data-1:/root/data
     command: ["--host", "0.0.0.0", "--port", "8081", "-debug"]
@@ -16,9 +18,47 @@ services:
     image: karen-wrapper-manager:local
     privileged: true
     container_name: karen-wm-2
+    ports:
+      - "127.0.0.1:8082:8082"
     volumes:
       - wm-data-2:/root/data
     command: ["--host", "0.0.0.0", "--port", "8082", "-debug"]
+    restart: unless-stopped
+
+  wrapper-manager-3:
+    build: ./wrapper-manager
+    image: karen-wrapper-manager:local
+    privileged: true
+    container_name: karen-wm-3
+    ports:
+      - "127.0.0.1:8083:8083"
+    volumes:
+      - wm-data-3:/root/data
+    command: ["--host", "0.0.0.0", "--port", "8083", "-debug"]
+    restart: unless-stopped
+
+  wrapper-manager-4:
+    build: ./wrapper-manager
+    image: karen-wrapper-manager:local
+    privileged: true
+    container_name: karen-wm-4
+    ports:
+      - "127.0.0.1:8084:8084"
+    volumes:
+      - wm-data-4:/root/data
+    command: ["--host", "0.0.0.0", "--port", "8084", "-debug"]
+    restart: unless-stopped
+
+  wrapper-manager-5:
+    build: ./wrapper-manager
+    image: karen-wrapper-manager:local
+    privileged: true
+    container_name: karen-wm-5
+    ports:
+      - "127.0.0.1:8085:8085"
+    volumes:
+      - wm-data-5:/root/data
+    command: ["--host", "0.0.0.0", "--port", "8085", "-debug"]
     restart: unless-stopped
 
   bot:
@@ -27,6 +67,9 @@ services:
     depends_on:
       - wrapper-manager-1
       - wrapper-manager-2
+      - wrapper-manager-3
+      - wrapper-manager-4
+      - wrapper-manager-5
     volumes:
       - ./bot/config.yaml:/app/config.yaml
       - ./bot/downloads:/downloads
@@ -37,3 +80,6 @@ services:
 volumes:
   wm-data-1:
   wm-data-2:
+  wm-data-3:
+  wm-data-4:
+  wm-data-5:

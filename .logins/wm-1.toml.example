@@ -1,0 +1,47 @@
+version = "0.0.10"
+
+[instance]
+url = "127.0.0.1:8081"
+secure = false
+
+[localInstance]
+enable = false
+enableHardwareAcceleration = false
+hardwareAccelerator = ""
+memorySize = "512M"
+cpuModel = "Cascadelake-Server-v5"
+showWindow = false
+startArgs = "-host 0.0.0.0 -port 32767 -debug"
+
+[region]
+language = "en-US"
+languageNotExistWarning = false
+
+[download]
+proxy = ""
+parallelNum = 1
+maxRunningTasks = 128
+appleCDNIP = ""
+codecAlternative = true
+codecPriority = ["alac", "ec3", "ac3", "aac"]
+atmosConventToM4a = true
+failedSongNotPassIntegrityCheck = false
+audioInfoFormat = ""
+songNameFormat = "{disk}-{tracknum:02d} {title}"
+dirPathFormat = "downloads/{album_artist}/{album}"
+playlistDirPathFormat = "downloads/playlists/{playlistName}"
+playlistSongNameFormat = "{playlistSongIndex:02d}. {artist} - {title}"
+saveLyrics = true
+lyricsFormat = "lrc"
+lyricsExtra = ["translation", "pronunciation"]
+saveCover = true
+coverFormat = "jpg"
+coverSize = "5000x5000"
+maxSampleRate = 192000
+maxBitDepth = 24
+afterDownloaded = ""
+retryTime = 8
+maxWaitTime = 30
+
+[metadata]
+embedMetadata = ["title", "artist", "album", "album_artist", "composer", "album_created", "genre", "created", "tracknum", "disk", "lyrics", "cover", "copyright", "record_company", "upc", "isrc", "rtng"]
