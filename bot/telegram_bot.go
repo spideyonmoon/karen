@@ -1896,9 +1896,13 @@ func (b *TelegramBot) runDownload(req *downloadRequest) {
 		if single {
 			totalTracks = 1
 		}
-		// releaseTitle: prefer the album name (albums / playlists-of-an-album);
-		// fall back to the track's own name for a single-track download.
+		// releaseTitle: for a playlist use the playlist's own name (otherwise the
+		// board would show the first track's album); for albums prefer the album
+		// name; fall back to the track's own name for a single-track download.
 		releaseTitle := strings.TrimSpace(track.Resp.Attributes.AlbumName)
+		if track.PreType == "playlists" && strings.TrimSpace(track.PlaylistData.Attributes.Name) != "" {
+			releaseTitle = strings.TrimSpace(track.PlaylistData.Attributes.Name)
+		}
 		if releaseTitle == "" {
 			releaseTitle = track.Resp.Attributes.Name
 		}
@@ -4754,6 +4758,8 @@ func buildCoverCaption(paths []string) string {
 	contentRating := ""
 	quality := ""
 	codec := ""
+	playlistName := ""
+	playlistArtist := ""
 
 	downloadedMetaMu.Lock()
 	for _, p := range paths {
@@ -4776,9 +4782,22 @@ func buildCoverCaption(paths []string) string {
 			if codec == "" && meta.Codec != "" {
 				codec = meta.Codec
 			}
+			if playlistName == "" && meta.PlaylistName != "" {
+				playlistName = meta.PlaylistName
+				playlistArtist = meta.PlaylistArtist
+			}
 		}
 	}
 	downloadedMetaMu.Unlock()
+
+	// For a playlist, the per-track album/artist describe individual songs, so the
+	// aggregate caption would otherwise masquerade as the first track's album.
+	// Present the playlist's own identity instead (track count already correct).
+	if playlistName != "" {
+		albumName = playlistName
+		artist = playlistArtist
+		releaseDate = ""
+	}
 
 	if albumName == "" {
 		albumName = filepath.Base(filepath.Dir(paths[0]))
@@ -4794,15 +4813,21 @@ func buildCoverCaption(paths []string) string {
 		explicit = "True"
 	}
 
-	return fmt.Sprintf(
-		"Artist : %s\nAlbum : %s\nRelease Date : %s\nTotal Tracks : %d\nQuality : %s\nExplicit : %s",
-		artist,
-		albumName,
-		releaseDate,
-		len(paths),
-		qualityDisplay,
-		explicit,
+	lines := []string{
+		fmt.Sprintf("Artist : %s", artist),
+		fmt.Sprintf("Album : %s", albumName),
+	}
+	// Release Date is omitted for playlists (it has no single meaningful value)
+	// and whenever it's otherwise unknown, rather than printing a blank field.
+	if releaseDate != "" {
+		lines = append(lines, fmt.Sprintf("Release Date : %s", releaseDate))
+	}
+	lines = append(lines,
+		fmt.Sprintf("Total Tracks : %d", len(paths)),
+		fmt.Sprintf("Quality : %s", qualityDisplay),
+		fmt.Sprintf("Explicit : %s", explicit),
 	)
+	return strings.Join(lines, "\n")
 }
 
 func formatQualityDisplay(quality string, codec string) string {

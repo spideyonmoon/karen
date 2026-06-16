@@ -80,6 +80,11 @@ type AudioMeta struct {
 	ContentRating  string
 	Quality        string
 	Codec          string
+	// PlaylistName / PlaylistArtist are set only when the track was downloaded as
+	// part of a playlist, so the Telegram caption can show the playlist's identity
+	// instead of masquerading as the first track's album. Empty for albums/songs.
+	PlaylistName   string
+	PlaylistArtist string
 }
 
 func loadConfig() error {
@@ -121,6 +126,10 @@ func recordDownloadedTrack(track *task.Track) {
 		ContentRating:  strings.TrimSpace(track.Resp.Attributes.ContentRating),
 		Quality:        strings.TrimSpace(track.Quality),
 		Codec:          strings.TrimSpace(track.Codec),
+	}
+	if track.PreType == "playlists" {
+		meta.PlaylistName = strings.TrimSpace(track.PlaylistData.Attributes.Name)
+		meta.PlaylistArtist = strings.TrimSpace(track.PlaylistData.Attributes.ArtistName)
 	}
 	if meta.TrackID != "" {
 		if override, ok := popSearchMeta(meta.TrackID); ok {

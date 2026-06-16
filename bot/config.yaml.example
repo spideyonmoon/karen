@@ -34,9 +34,10 @@ explicit-choice : "[E]"
 clean-choice : "[C]"
 apple-master-choice : "[M]"
 #if set true,for playlst,will use songinfo for meta #albumname track disk
-use-songinfo-for-playlist: false
-#if set true,will download album cover for playlist
-dl-albumcover-for-playlist: false
+#true keeps each track's own album/artist/date tags instead of the playlist's
+use-songinfo-for-playlist: true
+#if set true,will download each song's own album cover instead of the playlist cover
+dl-albumcover-for-playlist: true
 mv-audio-type: aac  #atmos ac3 aac — aac stereo plays inline in Telegram's video player
 mv-max: 1080
 # storefront will be used only in searching.
