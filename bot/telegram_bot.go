@@ -1959,7 +1959,7 @@ func (b *TelegramBot) runDownload(req *downloadRequest) {
 			releaseTitle = track.Resp.Attributes.Name
 		}
 		return func(phase string, done, total int64) {
-			status.UpdateTrack(track.ID, track.Resp.Attributes.Name, releaseTitle, currentWorkerID, track.TaskNum, totalTracks, phase, done, total)
+			status.UpdateTrack(track.ID, track.Resp.Attributes.Name, releaseTitle, track.WorkerID, track.TaskNum, totalTracks, phase, done, total)
 		}
 	}
 	defer func() { activeProgressFactory = nil }()

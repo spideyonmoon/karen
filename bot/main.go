@@ -57,11 +57,6 @@ var (
 	lastPathsMu           sync.Mutex
 	lastDownloadedPaths   []string
 	activeProgressFactory func(track *task.Track) apputils.ProgressFunc
-	// currentWorkerID is set by download sites that have a wmgrpc.Client in hand,
-	// and read by the active progress closure so per-track progress lines can show
-	// which wrapper-manager instance is handling the track. It's process-wide
-	// because there's exactly one download worker at a time; no synchronization needed.
-	currentWorkerID        string
 	downloadedMetaMu      sync.Mutex
 	downloadedMeta        = make(map[string]AudioMeta)
 	searchMetaMu          sync.Mutex
@@ -854,9 +849,8 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 		// a single bad wrapper takes the whole track down.
 		for attempt := 0; attempt < 2; attempt++ {
 			wm := wmPool.Acquire()
-			currentWorkerID = wm.ID()
+			track.WorkerID = wm.ID()
 			err = wmgrpc.DownloadAndDecrypt(ctx, wm, track.ID, downloadM3u8, trackPath, wmgrpc.ProgressFunc(trackProgress))
-			currentWorkerID = ""
 			wmPool.Release(wm)
 			if err == nil {
 				break
