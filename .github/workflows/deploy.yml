@@ -17,6 +17,16 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
           script: |
+            set -e
             cd ~/karen
-            git pull origin main
+            git fetch origin main
+            # The VPS working tree carries a pre-commit hand-edited docker-compose.yml
+            # (now identical to the tracked version) and a manually-created do-login.sh
+            # that collides with the tracked file, which makes a plain `git pull` abort.
+            # `git reset --hard` discards the tracked edit; the untracked do-login.sh must
+            # be removed by hand so the reset can land.
+            # NOTE: we never run `git clean` — gitignored data (bot/downloads,
+            # bot/config.yaml, .logins/wm-*.toml = the logged-in accounts) must survive.
+            rm -f do-login.sh
+            git reset --hard origin/main
             docker compose up -d --build bot
