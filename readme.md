@@ -75,24 +75,48 @@ This builds a single shared image (`karen-wrapper-manager:local`) used by all in
 
 ### 3. Login Apple Music accounts
 
-Each wrapper-manager instance holds exactly one account. Login is a one-time interactive step per account.
+Each wrapper-manager instance holds exactly one account. Login is a one-time event per account: the wrapper-manager persists the resulting Music-Token in its named volume (`wm-data-N`) and reuses it on every subsequent container start, so you only ever log in once per account.
 
-**For the first instance:**
+**How login actually works.** The wrapper-manager exposes a bidirectional gRPC `Login` RPC on its configured port. The client sends `{username, password}`; the wrapper-manager launches the Apple Music app in its Android emulator, types the credentials, taps Sign In, and replies with the result. If 2FA is required, the server replies with a "need code" message and the client sends the 6-digit code in a follow-up request. There is no CLI flag for it — login is exclusively via gRPC.
 
-```bash
-docker compose run --rm wrapper-manager-1 -L "APPLE_ID:PASSWORD"
-```
-
-**For the second instance:**
+**Prerequisites on the VPS:**
 
 ```bash
-docker compose run --rm wrapper-manager-2 -L "APPLE_ID:PASSWORD"
+# Clone the upstream login client next to karen
+git clone --depth 1 https://github.com/WorldObservationLog/AppleMusicDecrypt.git ~/AppleMusicDecrypt
+
+# Install its Python deps (one-time)
+pip3 install --break-system-packages creart grpcio 'protobuf>=6' pydantic \
+    prompt-toolkit m3u8 regex beautifulsoup4 lxml tenacity async-lru loguru six
 ```
 
-Wait for `Login successful` or the wrapper ready message, then `Ctrl+C`. The account data persists in the Docker volume (`wm-data-X`).
+**Boot the wrapper-managers** so their gRPC servers are listening:
 
-> [!IMPORTANT]
-> Login must go through the wrapper-manager's gRPC interface (the `-L` flag), not the raw wrapper binary. The manager registers the instance in `instances.json` and manages the emulator lifecycle. Raw `wrapper -L` login does NOT persist under the correct volume path.
+```bash
+docker compose up -d wrapper-manager-1 wrapper-manager-2
+```
+
+The `docker-compose.yml` in this repo exposes each instance's gRPC port on `127.0.0.1:808N` (localhost only) so the login client on the host can reach them. Do not expose these ports to the public internet.
+
+**Per-instance login.** Copy the example config for each instance and adjust the port:
+
+```bash
+cp .logins/wm-1.toml.example .logins/wm-1.toml
+cp .logins/wm-2.toml.example .logins/wm-2.toml
+# Edit each .logins/wm-N.toml and set `url = "127.0.0.1:808N"` to match the instance
+```
+
+Then run `do-login.sh` from the karen repo root:
+
+```bash
+./do-login.sh wm-1 "APPLE_ID_1" "PASSWORD_1"
+./do-login.sh wm-2 "APPLE_ID_2" "PASSWORD_2"
+```
+
+`do-login.sh` stages AMD's `tools/login.py` with your `config.toml`, pipes the credentials on stdin, and tees everything to `.logins/login-wm-N.log`. On success you'll see `Login Success!` and the wrapper-manager writes `instances.json` into the corresponding `wm-data-N` volume. If a 2FA prompt appears, the script blocks on `2FA code:` — paste the 6-digit code from your trusted device to continue.
+
+> [!NOTE]
+> Earlier versions of this README documented a `docker compose run --rm wrapper-manager-N -L "id:pass"` shortcut. The `-L` flag was removed from the upstream `wrapper-manager` binary; that command now exits immediately with `flag provided but not defined: -L`. Login is exclusively via the gRPC `Login` RPC using a client like `AppleMusicDecrypt`'s `tools/login.py`.
 
 ### 4. Start the stack
 
@@ -200,12 +224,18 @@ wrapper-manager-addrs:
 
 ### 3. Login each account
 
+For each instance `N` in `1..N`, copy the example config, set the port, and run `do-login.sh`:
+
 ```bash
 for i in 1 2 3 4 5 6 7 8; do
   echo "=== Login wrapper-manager-$i ==="
-  docker compose run --rm wrapper-manager-$i -L "APPLE_ID_$i:PASSWORD_$i"
+  cp ".logins/wm-1.toml.example" ".logins/wm-$i.toml"
+  sed -i "s|127.0.0.1:8081|127.0.0.1:808$i|" ".logins/wm-$i.toml"
+  ./do-login.sh "wm-$i" "APPLE_ID_$i" "PASSWORD_$i"
 done
 ```
+
+(Substitute your own account credentials. If any account triggers 2FA, the script will block on `2FA code:` — paste the 6-digit code from your trusted device.)
 
 ### 4. Start everything
 
@@ -333,7 +363,7 @@ karen/
 │   ├── config.yaml.example     # Config template
 │   ├── utils/
 │   │   ├── wmgrpc/
-│   │   │   ├── client.go       # gRPC client: M3U8, WebPlayback, Decrypt, Login
+│   │   │   ├── client.go       # gRPC client: M3U8, WebPlayback, Decrypt
 │   │   │   ├── decrypt.go      # HLS download + decrypt pipeline
 │   │   │   └── pool.go         # Channel-based FIFO client pool
 │   │   ├── structs/            # Shared data structures
@@ -344,6 +374,8 @@ karen/
 ├── wrapper-manager/
 │   ├── Dockerfile              # Builds upstream wrapper-manager + patches
 │   └── webplay.go              # Nil-safety patch for WebPlayback handler
+├── do-login.sh                 # Wrapper around AppleMusicDecrypt/tools/login.py
+├── .logins/                    # Per-instance AppleMusicDecrypt configs (host-only)
 ├── docker-compose.yml          # Stack: N wrapper-managers + bot
 └── SESSION_HISTORY.md          # Development log
 ```
