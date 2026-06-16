@@ -1,11 +1,17 @@
 name: Build Check
 
-# Compiles the bot on every push and pull request so a broken build is caught on
-# GitHub BEFORE it can be merged to main and shipped to the VPS. This job never
+# Compiles the bot on feature branches and pull requests so a broken build is caught
+# on GitHub BEFORE it can be merged to main and shipped to the VPS. This job never
 # touches the server — it only answers "does it compile?" on a throwaway runner.
 # It runs independently of deploy.yml (separate file = separate workflow).
+#
+# Excludes pushes to main: a main push already triggers deploy.yml, whose own
+# `docker compose up --build` is the build gate there, so a Build Check run on main
+# would be redundant. PRs targeting main are still checked (that's the pre-merge gate).
 on:
   push:
+    branches-ignore:
+      - main
   pull_request:
 
 jobs:
