@@ -100,11 +100,17 @@ const (
 // uploadPartSize is Telegram's maximum upload part size (512 KB) — cannot go higher.
 // uploadThreads is how many parts gotd keeps in flight concurrently over the single
 // DC connection. On a high-bandwidth, high-latency path (e.g. NZ→Telegram DC, ~150-280ms
-// RTT) the throughput ceiling is roughly (uploadThreads × uploadPartSize) ÷ RTT, so 8
-// threads (4 MB in flight) starves a fat pipe. 16 keeps ~8 MB in flight to fill it.
+// RTT) the throughput ceiling is roughly (uploadThreads × uploadPartSize) ÷ RTT, so the
+// thread count trades raw throughput against keepalive headroom.
+//
+// Trialing 8 (4 MB in flight): at 16 (~8 MB in flight) the single-connection TCP send
+// buffer to DC5 saturated, starving gotd's keepalive ping write → "pong missed" i/o
+// timeout → engine teardown → the upload drop/resume sawtooth (see AGENTS.md). 8 leaves
+// more buffer headroom for the ping at some cost to peak speed; revert to 16 (or make
+// this a per-DC config) if throughput regresses without curing the sawtooth.
 const (
 	uploadPartSize = 512 * 1024
-	uploadThreads  = 16
+	uploadThreads  = 8
 )
 
 // awaitReady blocks until the supervisor has a live, authenticated client again and
