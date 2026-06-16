@@ -13,10 +13,28 @@ if [[ ! -f .env ]]; then
   exit 1
 fi
 
-set -a
-# shellcheck disable=SC1091
-source .env
-set +a
+# Parse .env literally — do NOT `source` it. Sourcing runs values as shell, so a
+# password containing $, backticks or \ would be expanded/mangled (and break
+# under `set -u`). Here values are taken verbatim; only matching outer quotes
+# are stripped.
+load_env() {
+  local line key val
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    line="${line#"${line%%[![:space:]]*}"}"   # ltrim
+    [[ -z "$line" || "$line" == \#* || "$line" != *=* ]] && continue
+    key="${line%%=*}"
+    val="${line#*=}"
+    key="${key%"${key##*[![:space:]]}"}"       # rtrim key
+    case "$val" in
+      \"*\") val="${val#\"}"; val="${val%\"}" ;;
+      \'*\') val="${val#\'}"; val="${val%\'}" ;;
+    esac
+    printf -v "$key" '%s' "$val"
+    export "${key?}"
+  done < .env
+}
+load_env
 
 # --- Count Apple accounts (sequential APPLE_ID_1..N, no gaps) ---
 N=0

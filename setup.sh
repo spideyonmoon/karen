@@ -17,10 +17,26 @@ fi
 # 1. Generate bot/config.yaml + docker-compose.override.yml from .env
 ./generate.sh
 
-set -a
-# shellcheck disable=SC1091
-source .env
-set +a
+# Parse .env literally — do NOT `source` it (see note in generate.sh): a password
+# containing $, backticks or \ would be expanded/mangled and break under `set -u`.
+load_env() {
+  local line key val
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    [[ -z "$line" || "$line" == \#* || "$line" != *=* ]] && continue
+    key="${line%%=*}"
+    val="${line#*=}"
+    key="${key%"${key##*[![:space:]]}"}"
+    case "$val" in
+      \"*\") val="${val#\"}"; val="${val%\"}" ;;
+      \'*\') val="${val#\'}"; val="${val%\'}" ;;
+    esac
+    printf -v "$key" '%s' "$val"
+    export "${key?}"
+  done < .env
+}
+load_env
 
 # Recount accounts (same logic as generate.sh) to drive the login loop.
 N=0
