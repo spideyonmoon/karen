@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	apputils "main/utils"
@@ -95,6 +96,12 @@ type TelegramBot struct {
 	searchLimit  int
 	maxFileBytes int64
 	mtproto      *MTProtoClient
+
+	// richUnavailable latches true the first time the Bot API rejects a Rich
+	// Message (Bot API 10.1+) — e.g. when pointed at a self-hosted API server
+	// that predates 10.1. Once latched, all rich helpers transparently fall back
+	// to plain text so we never spam the API with calls it can't serve.
+	richUnavailable atomic.Bool
 
 	formatMu    sync.Mutex
 	chatFormats map[int64]string
@@ -1119,7 +1126,7 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args
 
 	switch cmd {
 	case "start", "help":
-		_ = b.sendMessage(chatID, "Send /dl <apple-music-link> to download a song or album.\nSend /status to view the download queue.", nil)
+		_, _ = b.sendRichMessage(chatID, botHelpRich(), botHelpText(), nil, replyToID)
 	case "status", "queue":
 		b.queueMu.Lock()
 		active := b.activeStatus
@@ -2116,6 +2123,7 @@ func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, re
 	if sentAny {
 		status.Stop()
 		_ = b.deleteMessage(chatID, status.MessageID())
+		b.sendDeliverySummary(chatID, paths, format, replyToID)
 	}
 }
 
@@ -2169,6 +2177,7 @@ func (b *TelegramBot) deliverTelegramIndividualFallback(chatID int64, paths []st
 	if sentAny {
 		status.Stop()
 		_ = b.deleteMessage(chatID, status.MessageID())
+		b.sendDeliverySummary(chatID, paths, format, replyToID)
 		return
 	}
 	b.reportDeliveryFailure(chatID, replyToID, status, lastErr)
@@ -2220,6 +2229,7 @@ func (b *TelegramBot) deliverTelegramZip(chatID int64, paths []string, replyToID
 		} else {
 			status.Stop()
 			_ = b.deleteMessage(chatID, status.MessageID())
+			b.sendDeliverySummary(chatID, paths, format, replyToID)
 		}
 	} else {
 		// No MTProto — fallback to Gofile
@@ -3076,6 +3086,34 @@ func (b *TelegramBot) queueBoardSuffix() string {
 	return sb.String()
 }
 
+// queueBoardSuffixRich is the Rich-Markdown counterpart of queueBoardSuffix. It
+// renders the waiting queue as a small heading + ordered list so the leading
+// "#N" can't be mistaken for an H1 heading and pipes/underscores in usernames
+// can't smuggle in formatting.
+func (b *TelegramBot) queueBoardSuffixRich() string {
+	b.queueMu.Lock()
+	reqs := make([]*downloadRequest, len(b.queuedReqs))
+	copy(reqs, b.queuedReqs)
+	b.queueMu.Unlock()
+	if len(reqs) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "\n\n### %s Queue · %d waiting\n", symQueue, len(reqs))
+	for i, r := range reqs {
+		user := r.username
+		if user == "" {
+			user = fmt.Sprintf("ID:%d", r.userID)
+		}
+		if user != "" && user[0] != '@' {
+			user = "@" + user
+		}
+		fmt.Fprintf(&sb, "%d. %s · %s · `/stop_%s`\n",
+			i+1, escapeRichMD(user), escapeRichMD(shortMode(r.transferMode)), r.taskID)
+	}
+	return sb.String()
+}
+
 // removeQueuedReqLocked drops a task from the display-only queue mirror.
 // The caller must hold queueMu.
 func (b *TelegramBot) removeQueuedReqLocked(taskID string) {
@@ -3472,7 +3510,8 @@ func (s *DownloadStatus) flush(force bool) {
 		}
 	}
 
-	text := s.formatProgressText(phase, done, total, percent) + s.bot.queueBoardSuffix()
+	suffix := s.bot.queueBoardSuffix()
+	text := s.formatProgressText(phase, done, total, percent) + suffix
 	now := time.Now()
 	if !force {
 		if text == lastText {
@@ -3486,7 +3525,11 @@ func (s *DownloadStatus) flush(force bool) {
 		}
 	}
 
-	if err := s.bot.editMessageText(s.chatID, msgID, text, nil); err != nil {
+	// Prefer a Rich Message edit (Bot API 10.1); editMessageRich transparently
+	// falls back to a plain-text edit if the API can't serve rich content. We
+	// dedup on the plain `text` (cheap and stable) regardless of which path ran.
+	richText := s.formatProgressRich(phase, done, total, percent) + s.bot.queueBoardSuffixRich()
+	if _, err := s.bot.editMessageRich(s.chatID, msgID, richText, text, nil); err != nil {
 		s.mu.Lock()
 		s.dirty = true
 		s.mu.Unlock()
@@ -3776,6 +3819,158 @@ func (s *DownloadStatus) formatProgressText(phase string, done, total int64, per
 			}
 		}
 	}
+	return b.String()
+}
+
+// richMDEscaper backslash-escapes the GitHub-Flavored-Markdown metacharacters
+// that Rich Messages (Bot API 10.1) interpret, so user/track text can't smuggle
+// in stray formatting. The pipe is the critical one inside table cells.
+var richMDEscaper = strings.NewReplacer(
+	`\`, `\\`,
+	"`", "\\`",
+	"*", `\*`,
+	"_", `\_`,
+	"~", `\~`,
+	"|", `\|`,
+	"[", `\[`,
+	"]", `\]`,
+	"#", `\#`,
+	">", `\>`,
+	"=", `\=`,
+)
+
+// escapeRichMD escapes inline text and collapses newlines (which would break a
+// table row or a single-line heading) into spaces.
+func escapeRichMD(s string) string {
+	return richMDEscaper.Replace(strings.ReplaceAll(s, "\n", " "))
+}
+
+// formatProgressRich renders the live status board as Bot API 10.1 Rich Markdown:
+// an H1 release heading, a status line, an aggregate progress bar, a per-track
+// table (active tracks with live percent + speed), a finished/queued task-list
+// summary, and a blockquote footer with the aggregate speed and elapsed time. It
+// reads from the same snapshot() the plain renderer uses, so the two stay in
+// lockstep; flush() falls back to formatProgressText if the rich edit is
+// rejected.
+func (s *DownloadStatus) formatProgressRich(phase string, done, total int64, percent int) string {
+	snap := s.snapshot()
+
+	// Aggregate bar denominator — identical logic to formatProgressText.
+	barDone, barTotal, hasBar := int64(0), int64(0), false
+	if snap.hasActiveData || snap.finished > 0 {
+		barDone, barTotal, hasBar = snap.aggDone, snap.aggTotal, true
+	}
+	if !hasBar {
+		barDone, barTotal, hasBar = done, total, total > 0
+	}
+	barPct := -1
+	if hasBar && barTotal > 0 {
+		barPct = int(barDone * 100 / barTotal)
+		if barPct < 0 {
+			barPct = 0
+		}
+		if barPct > 100 {
+			barPct = 100
+		}
+	}
+
+	var totalSpeed float64
+	for _, st := range snap.active {
+		if v := medianSpeed(st.speedSamples); v > 0 {
+			totalSpeed += v
+		}
+	}
+	if totalSpeed == 0 {
+		totalSpeed = s.rollingSpeedBytesPerSec()
+	}
+	elapsedStr := "-"
+	if !s.startedAt.IsZero() {
+		elapsedStr = formatDuration(time.Since(s.startedAt))
+	}
+
+	title := strings.TrimSpace(snap.releaseTitle)
+	if title == "" {
+		title = "Untitled"
+	}
+	user := "@" + s.username
+	if s.username == "" {
+		user = fmt.Sprintf("ID:%d", s.userID)
+	}
+
+	// Status line: phase + finished/total counter, mirroring formatHeader's
+	// double-counter guard for upload phases that bake in their own "i/N".
+	statusLine := strings.TrimSpace(phase)
+	if m := phaseTrailingCounter.FindStringSubmatch(statusLine); m != nil {
+		statusLine = m[1] + " · " + m[2]
+	} else if snap.total > 0 {
+		counter := fmt.Sprintf("%d/%d", snap.finished, snap.total)
+		if statusLine == "" {
+			statusLine = counter
+		} else {
+			statusLine += " · " + counter
+		}
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "# %s %s\n", symDownload, escapeRichMD(truncateStatusTitle(title, 80)))
+	if statusLine != "" {
+		fmt.Fprintf(&b, "%s\n", escapeRichMD(statusLine))
+	}
+
+	if hasBar {
+		bar := renderBar(barPct, 12)
+		if barPct >= 0 {
+			fmt.Fprintf(&b, "\n`%s`  **%d%%**  ·  %s / %s\n", bar, barPct, formatBytes(barDone), formatBytes(barTotal))
+		} else {
+			fmt.Fprintf(&b, "\n`%s`\n", bar)
+		}
+	}
+
+	// Per-track table — only for multi-track releases with live data.
+	if !snap.single && len(snap.active) > 0 {
+		b.WriteString("\n| # | Track | Progress | Speed |\n|--:|:------|:--------:|------:|\n")
+		shown := 0
+		for _, st := range snap.active {
+			if shown >= statusTrackListCap {
+				break
+			}
+			prog := "…"
+			if st.size > 0 {
+				p := int(st.done * 100 / st.size)
+				if p > 100 {
+					p = 100
+				}
+				prog = fmt.Sprintf("%d%%", p)
+			}
+			spd := "—"
+			if v := medianSpeed(st.speedSamples); v > 0 {
+				spd = formatBytes(int64(v)) + "/s"
+			}
+			fmt.Fprintf(&b, "| %02d | %s | %s | %s |\n",
+				st.number, escapeRichMD(truncateStatusTitle(st.title, 32)), prog, spd)
+			shown++
+		}
+	}
+
+	// Finished / queued task-list summary (checkboxes read naturally in rich).
+	if !snap.single && (snap.finished > 0 || snap.total > 0) {
+		b.WriteString("\n")
+		if snap.finished > 0 {
+			fmt.Fprintf(&b, "- [x] %d done\n", snap.finished)
+		}
+		remaining := snap.total - snap.finished - len(snap.active)
+		if remaining > 0 {
+			fmt.Fprintf(&b, "- [ ] %d queued\n", remaining)
+		}
+	}
+
+	// Footer blockquote: aggregate speed · elapsed · who · mode, then cancel.
+	fmt.Fprintf(&b, "\n> %s %s/s · %s %s\n>\n> by %s · %s · %s cancel `/stop_%s`\n",
+		symSpeed, formatBytes(int64(totalSpeed)),
+		symElapsed, elapsedStr,
+		escapeRichMD(user), escapeRichMD(shortMode(s.mode)),
+		symCancel, s.taskID,
+	)
 	return b.String()
 }
 
@@ -4194,6 +4389,168 @@ func (b *TelegramBot) sendMessageWithReplyReturn(chatID int64, text string, mark
 		return 0, fmt.Errorf("telegram sendMessage error: %s", b.sanitizeTelegramText(apiResp.Description))
 	}
 	return apiResp.Result.MessageID, nil
+}
+
+// InputRichMessage mirrors the Bot API 10.1 type. Exactly one of Markdown or
+// HTML must be set; Telegram parses it into a structured block tree server-side.
+type InputRichMessage struct {
+	Markdown            string `json:"markdown,omitempty"`
+	HTML                string `json:"html,omitempty"`
+	IsRTL               bool   `json:"is_rtl,omitempty"`
+	SkipEntityDetection bool   `json:"skip_entity_detection,omitempty"`
+}
+
+// richSendResult is the value returned by the rich send/edit helpers so callers
+// can learn the message ID and whether the rich path was actually taken (vs. a
+// plain-text fallback) without threading two return values everywhere.
+type richSendResult struct {
+	messageID int
+	rich      bool // true if sent as a Rich Message; false if it fell back to plain
+}
+
+// isNotModified reports whether a Telegram error description is the benign
+// "message is not modified" — expected when a live-edited board lands on an
+// identical render between ticks.
+func isNotModified(desc string) bool {
+	return strings.Contains(desc, "message is not modified")
+}
+
+// richSupported reports whether we should still attempt Rich Messages. Once the
+// API has rejected one with an "unsupported"/"unknown method/field" style error
+// we latch off and stop trying for the lifetime of the process.
+func (b *TelegramBot) richSupported() bool {
+	return !b.richUnavailable.Load()
+}
+
+// markRichUnsupported latches the rich path off after a capability-style
+// rejection, logging once so the operator knows why boards went plain.
+func (b *TelegramBot) markRichUnsupported(method, desc string) {
+	if b.richUnavailable.CompareAndSwap(false, true) {
+		fmt.Printf("[rich] %s rejected (%s); falling back to plain text for the rest of this run\n", method, b.sanitizeTelegramText(desc))
+	}
+}
+
+// looksLikeCapabilityError distinguishes "this server/method doesn't know about
+// Rich Messages" (latch off, fall back) from ordinary content errors like a
+// malformed table (don't latch — that would be a bug we want surfaced).
+func looksLikeCapabilityError(desc string) bool {
+	d := strings.ToLower(desc)
+	switch {
+	case strings.Contains(d, "method not found"),
+		strings.Contains(d, "not found: rich"),
+		strings.Contains(d, "unknown field"),
+		strings.Contains(d, "unsupported"),
+		strings.Contains(d, "rich_message"),
+		strings.Contains(d, "rich message"):
+		return true
+	}
+	return false
+}
+
+// sendRichMessage posts a Rich Message (Bot API 10.1). On any capability error
+// it latches the rich path off and falls back to plainFallback via the normal
+// sendMessage path, so callers always get a usable message. markup may be nil.
+func (b *TelegramBot) sendRichMessage(chatID int64, markdown, plainFallback string, markup any, replyToID int) (richSendResult, error) {
+	if !b.richSupported() {
+		id, err := b.sendMessageWithReplyReturn(chatID, plainFallback, markup, replyToID)
+		return richSendResult{messageID: id, rich: false}, err
+	}
+	payload := map[string]any{
+		"chat_id":      chatID,
+		"rich_message": InputRichMessage{Markdown: markdown},
+	}
+	if markup != nil {
+		payload["reply_markup"] = markup
+	}
+	if replyToID > 0 {
+		payload["reply_parameters"] = map[string]any{"message_id": replyToID}
+	}
+	id, desc, ok, err := b.doRichRequest("sendRichMessage", payload)
+	if err == nil && ok {
+		return richSendResult{messageID: id, rich: true}, nil
+	}
+	if desc != "" && looksLikeCapabilityError(desc) {
+		b.markRichUnsupported("sendRichMessage", desc)
+		id, ferr := b.sendMessageWithReplyReturn(chatID, plainFallback, markup, replyToID)
+		return richSendResult{messageID: id, rich: false}, ferr
+	}
+	if err != nil {
+		return richSendResult{}, err
+	}
+	return richSendResult{}, fmt.Errorf("telegram sendRichMessage error: %s", b.sanitizeTelegramText(desc))
+}
+
+// editMessageRich edits an existing message into rich content (Bot API 10.1),
+// preserving its inline keyboard. Returns rich=false (and edits as plain text)
+// when the rich path is unavailable, so the live board degrades gracefully. A
+// benign "message is not modified" is treated as success.
+func (b *TelegramBot) editMessageRich(chatID int64, messageID int, markdown, plainFallback string, markup any) (bool, error) {
+	if messageID == 0 {
+		return false, nil
+	}
+	if !b.richSupported() {
+		return false, b.editMessageText(chatID, messageID, plainFallback, markup)
+	}
+	payload := map[string]any{
+		"chat_id":      chatID,
+		"message_id":   messageID,
+		"rich_message": InputRichMessage{Markdown: markdown},
+	}
+	if markup != nil {
+		payload["reply_markup"] = markup
+	}
+	_, desc, ok, err := b.doRichRequest("editMessageText", payload)
+	if err == nil && ok {
+		return true, nil
+	}
+	if desc != "" && isNotModified(desc) {
+		return true, nil
+	}
+	if desc != "" && looksLikeCapabilityError(desc) {
+		b.markRichUnsupported("editMessageText(rich)", desc)
+		return false, b.editMessageText(chatID, messageID, plainFallback, markup)
+	}
+	if err != nil {
+		return false, err
+	}
+	return false, fmt.Errorf("telegram editMessageText(rich) error: %s", b.sanitizeTelegramText(desc))
+}
+
+// doRichRequest performs a POST for a rich method and decodes the standard
+// envelope. It returns (messageID, description, ok, transportErr). messageID is
+// 0 when the result isn't a Message (e.g. editing an inline message yields
+// True). A non-nil transportErr is a network/HTTP failure; a false ok with a
+// description is an API-level rejection the caller decides how to handle.
+func (b *TelegramBot) doRichRequest(method string, payload map[string]any) (int, string, bool, error) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return 0, "", false, err
+	}
+	req, err := http.NewRequest("POST", b.apiURL(method), bytes.NewReader(body))
+	if err != nil {
+		return 0, "", false, b.sanitizeTelegramError(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return 0, "", false, b.sanitizeTelegramError(err)
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, "", false, err
+	}
+	envelope := sendMessageResponse{}
+	if jerr := json.Unmarshal(respBody, &envelope); jerr != nil {
+		// Result may be a bare `true` (inline edits) which doesn't fit Message;
+		// retry with a description-only envelope before giving up.
+		alt := apiResponse{}
+		if aerr := json.Unmarshal(respBody, &alt); aerr == nil {
+			return 0, alt.Description, alt.OK, nil
+		}
+		return 0, "", false, jerr
+	}
+	return envelope.Result.MessageID, envelope.Description, envelope.OK, nil
 }
 
 func (b *TelegramBot) sendAudioByFileID(chatID int64, entry CachedAudio, replyToID int, trackID string) error {
@@ -4748,6 +5105,104 @@ func buildInlineKeyboard(count int, hasPrev bool, hasNext bool) InlineKeyboardMa
 }
 
 // buildCoverCaption creates a caption for the album cover photo using track metadata.
+// sendDeliverySummary posts a Bot API 10.1 Rich Message summarizing a completed
+// multi-track delivery: an H2 release heading and a table of (#, track, size,
+// format) plus a footer with the total. Single-track and music-video/artwork
+// deliveries skip it (the file itself is the summary). It is best-effort — a
+// failure is swallowed so it never blocks the delivery flow — and degrades to a
+// plain-text list when the API can't serve rich content.
+func (b *TelegramBot) sendDeliverySummary(chatID int64, paths []string, format string, replyToID int) {
+	if len(paths) < 2 {
+		return
+	}
+
+	type row struct {
+		num    int
+		title  string
+		artist string
+		size   int64
+	}
+	rows := make([]row, 0, len(paths))
+	var totalBytes int64
+	albumName, albumArtist, quality, codec, playlistName, playlistArtist := "", "", "", "", "", ""
+
+	downloadedMetaMu.Lock()
+	for i, p := range paths {
+		r := row{num: i + 1, title: filepath.Base(p)}
+		if meta, ok := downloadedMeta[p]; ok {
+			if meta.Title != "" {
+				r.title = meta.Title
+			}
+			r.artist = meta.Performer
+			if albumName == "" {
+				albumName = meta.AlbumName
+				albumArtist = meta.Performer
+			}
+			if quality == "" {
+				quality = meta.Quality
+				codec = meta.Codec
+			}
+			if playlistName == "" && meta.PlaylistName != "" {
+				playlistName = meta.PlaylistName
+				playlistArtist = meta.PlaylistArtist
+			}
+		}
+		if info, err := os.Stat(p); err == nil {
+			r.size = info.Size()
+			totalBytes += r.size
+		}
+		rows = append(rows, r)
+	}
+	downloadedMetaMu.Unlock()
+
+	if playlistName != "" {
+		albumName = playlistName
+		albumArtist = playlistArtist
+	}
+	if albumName == "" {
+		albumName = filepath.Base(filepath.Dir(paths[0]))
+		if albumName == "." || albumName == "" {
+			albumName = "Unknown"
+		}
+	}
+	fmtLabel := strings.ToUpper(normalizeTelegramFormat(format))
+	if q := formatQualityDisplay(quality, codec); q != "" {
+		fmtLabel = q
+	}
+
+	heading := albumName
+	if albumArtist != "" {
+		heading = albumArtist + " — " + albumName
+	}
+
+	// Rich Markdown.
+	var rb strings.Builder
+	fmt.Fprintf(&rb, "## %s %s\n", symDone, escapeRichMD(truncateStatusTitle(heading, 80)))
+	fmt.Fprintf(&rb, "%d tracks · %s · %s\n\n", len(rows), formatBytes(totalBytes), escapeRichMD(fmtLabel))
+	rb.WriteString("| # | Track | Size |\n|--:|:------|-----:|\n")
+	for _, r := range rows {
+		t := r.title
+		if r.artist != "" {
+			t = r.artist + " — " + t
+		}
+		fmt.Fprintf(&rb, "| %d | %s | %s |\n", r.num, escapeRichMD(truncateStatusTitle(t, 48)), formatBytes(r.size))
+	}
+	fmt.Fprintf(&rb, "\n> Delivered %d files · %s total\n", len(rows), formatBytes(totalBytes))
+
+	// Plain fallback.
+	var pb strings.Builder
+	fmt.Fprintf(&pb, "%s %s\n%d tracks · %s · %s\n", symDone, heading, len(rows), formatBytes(totalBytes), fmtLabel)
+	for _, r := range rows {
+		t := r.title
+		if r.artist != "" {
+			t = r.artist + " — " + t
+		}
+		fmt.Fprintf(&pb, "%2d. %s  (%s)\n", r.num, t, formatBytes(r.size))
+	}
+
+	_, _ = b.sendRichMessage(chatID, rb.String(), strings.TrimRight(pb.String(), "\n"), nil, replyToID)
+}
+
 func buildCoverCaption(paths []string) string {
 	if len(paths) == 0 {
 		return ""
@@ -4954,15 +5409,65 @@ func (b *TelegramBot) cancelTask(chatID int64, taskID string, replyToID int) {
 func botHelpText() string {
 	return strings.TrimSpace(`
 Commands:
-/dl <apple-music-link> [-aac|-atmos] [-flac] [-art] [-tgu|-tgz|-go]  download a song, album, or playlist
-/status or /queue                     show active task and queue count
-/help                                 show this message
+/dl <apple-music-link> [flags]   download a song, album, or playlist
+/status or /queue                show active task and queue count
+/stop_<task_id>                  cancel a running or queued download
+/help                            show this message
 
 Flags:
-  -aac       download in AAC-LC format
-  -atmos     download in Dolby Atmos format
+  -aac     download in AAC-LC format
+  -atmos   download in Dolby Atmos format
+  -flac    convert to FLAC after download
+  -art     save artist cover art
+  -tgu     send as individual Telegram tracks (skip keyboard)
+  -tgz     send as Telegram ZIP (skip keyboard)
+  -go      send as Gofile ZIP (skip keyboard)
 
 Inline:
-@bot <keywords>            search songs
+@bot <keywords>   search songs in any chat
+`)
+}
+
+// botHelpRich is the Bot API 10.1 Rich Markdown rendering of the help text:
+// real headings, a flags table, and code-formatted command examples. Falls back
+// to botHelpText() when the API can't serve rich content.
+func botHelpRich() string {
+	return strings.TrimSpace(`
+# Karen — Apple Music downloader
+
+Rips lossless ALAC, Dolby Atmos, and AAC from Apple Music straight to your chat.
+
+## Commands
+
+| Command | What it does |
+|:--------|:-------------|
+| ` + "`/dl <link> [flags]`" + ` | Download a song, album, or playlist |
+| ` + "`/status`" + ` or ` + "`/queue`" + ` | Show the active task and queue |
+| ` + "`/stop_<task_id>`" + ` | Cancel a running or queued download |
+| ` + "`/help`" + ` | Show this message |
+
+## Flags
+
+| Flag | Effect |
+|:-----|:-------|
+| ` + "`-aac`" + ` | Download in AAC-LC format |
+| ` + "`-atmos`" + ` | Download in Dolby Atmos format |
+| ` + "`-flac`" + ` | Convert to FLAC after download |
+| ` + "`-art`" + ` | Save artist cover art |
+| ` + "`-tgu`" + ` | Send as individual Telegram tracks |
+| ` + "`-tgz`" + ` | Send as a Telegram ZIP |
+| ` + "`-go`" + ` | Send as a Gofile ZIP |
+
+## Examples
+
+` + "```" + `
+/dl https://music.apple.com/album/123456
+/dl https://music.apple.com/album/123456 -aac
+/dl https://music.apple.com/song/789012 -atmos -tgz
+` + "```" + `
+
+## Inline search
+
+Type ` + "`@bot <keywords>`" + ` in any chat to search songs directly.
 `)
 }
