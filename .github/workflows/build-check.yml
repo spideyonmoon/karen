@@ -1,0 +1,22 @@
+name: Build Check
+
+# Compiles the bot on every push and pull request so a broken build is caught on
+# GitHub BEFORE it can be merged to main and shipped to the VPS. This job never
+# touches the server — it only answers "does it compile?" on a throwaway runner.
+# It runs independently of deploy.yml (separate file = separate workflow).
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          # Read the exact Go version from the module so CI matches local.
+          go-version-file: bot/go.mod
+      - name: go build
+        working-directory: bot
+        run: go build ./...
