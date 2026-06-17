@@ -314,6 +314,38 @@ func checkUrlArtist(url string) (string, string) {
 		return matches[0][1], matches[0][2]
 	}
 }
+func resolveAppleMusicURL(rawURL string) string {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return ""
+	}
+	if strings.Contains(rawURL, "/album/") || strings.Contains(rawURL, "/playlist/") || strings.Contains(rawURL, "/station/") || strings.Contains(rawURL, "/song/") || strings.Contains(rawURL, "/music-video/") || strings.Contains(rawURL, "/artist/") {
+		return rawURL
+	}
+	if !strings.Contains(rawURL, "music.apple.com") {
+		return rawURL
+	}
+	req, err := http.NewRequest("GET", rawURL, nil)
+	if err != nil {
+		return rawURL
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return rawURL
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return rawURL
+	}
+	pat := regexp.MustCompile(`https://(?:beta\.)?music\.apple\.com/[a-z]{2}/(?:album|song|playlist|station|music-video|artist)/[^"'<>\s?]+(?:\?[^"'<>\s]*)?`)
+	if match := pat.Find(body); match != nil {
+		return string(match)
+	}
+	return rawURL
+}
 func getUrlSong(songUrl string, token string) (string, error) {
 	storefront, songId := checkUrlSong(songUrl)
 	manifest, err := ampapi.GetSongResp(storefront, songId, Config.Language, token)
@@ -1929,9 +1961,13 @@ func main() {
 			pflag.Usage()
 			return
 		}
+		for i := range args {
+			args[i] = resolveAppleMusicURL(args[i])
+		}
 		os.Args = args
 	}
 
+	os.Args[0] = resolveAppleMusicURL(os.Args[0])
 	if strings.Contains(os.Args[0], "/artist/") {
 		urlArtistName, urlArtistID, err := getUrlArtistName(os.Args[0], token)
 		if err != nil {
@@ -1958,6 +1994,7 @@ func main() {
 		for albumNum, urlRaw := range os.Args {
 			fmt.Printf("Queue %d of %d: ", albumNum+1, albumTotal)
 			var storefront, albumId string
+			urlRaw = resolveAppleMusicURL(urlRaw)
 
 			if strings.Contains(urlRaw, "/music-video/") {
 				fmt.Println("Music Video")
