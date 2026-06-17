@@ -16,3 +16,12 @@ services:
       - ./bot/telegram-state.json:/app/telegram-state.json
     command: ["--bot"]
     restart: unless-stopped
+    # MTProto uploads to DC5 (Singapore, ~176ms RTT) drop/resume because
+    # uploadThreads=16 (~8MB in flight) saturates the single TCP send buffer,
+    # starving gotd's keepalive ping write() -> i/o timeout -> engine torn down.
+    # Raise the per-socket send buffer ceiling so upload data + the ping coexist.
+    # tcp_wmem is net-namespaced, so it must be set on the container (a host
+    # sysctl won't reach it). Reversible: delete this block and redeploy.
+    # Format: "min default max" (bytes). Default max is ~4MB; 16MB clears the BDP.
+    sysctls:
+      - net.ipv4.tcp_wmem=4096 262144 16777216

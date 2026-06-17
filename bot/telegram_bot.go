@@ -1754,7 +1754,7 @@ func (b *TelegramBot) enqueueMvDownload(chatID int64, userID int64, storefront s
 		saveDir = "."
 	}
 	b.enqueueDownload(chatID, userID, "", replyToID, statusMessageID, true, "", transferMode, "", func(ctx context.Context) error {
-		return mvDownloader(ctx, mvID, saveDir, b.appleToken, storefront, nil)
+		return mvDownloader(ctx, mvID, saveDir, b.appleToken, storefront, nil, nil)
 	})
 }
 

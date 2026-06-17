@@ -681,7 +681,7 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 	}
 
 	if track.Type == "music-videos" {
-		err := mvDownloader(ctx, track.ID, track.SaveDir, token, track.Storefront, track)
+		err := mvDownloader(ctx, track.ID, track.SaveDir, token, track.Storefront, track, trackProgress)
 		if err != nil {
 			fmt.Println("\u26A0 Failed to dl MV:", err)
 			counter.Inc(&counter.Error)
@@ -2014,7 +2014,7 @@ func main() {
 					mvSaveDir = Config.AlacSaveFolder
 				}
 				storefront, albumId = checkUrlMv(urlRaw)
-				err := mvDownloader(context.Background(), albumId, mvSaveDir, token, storefront, nil)
+				err := mvDownloader(context.Background(), albumId, mvSaveDir, token, storefront, nil, nil)
 				if err != nil {
 					fmt.Println("\u26A0 Failed to dl MV:", err)
 					counter.Error++
@@ -2078,7 +2078,7 @@ func main() {
 	}
 }
 
-func mvDownloader(ctx context.Context, adamID string, saveDir string, token string, storefront string, track *task.Track) error {
+func mvDownloader(ctx context.Context, adamID string, saveDir string, token string, storefront string, track *task.Track, progress apputils.ProgressFunc) error {
 	MVInfo, err := ampapi.GetMusicVideoResp(storefront, adamID, Config.Language, token)
 	if err != nil {
 		fmt.Println("\u26A0 Failed to get MV manifest:", err)
@@ -2121,7 +2121,7 @@ func mvDownloader(ctx context.Context, adamID string, saveDir string, token stri
 	if err != nil {
 		return fmt.Errorf("video key retrieval failed: %w", err)
 	}
-	if err := runv3.ExtMvData(ctx, videokeyAndUrls, vidPath); err != nil {
+	if err := runv3.ExtMvData(ctx, videokeyAndUrls, vidPath, runv3.ProgressFunc(progress)); err != nil {
 		return fmt.Errorf("video track download failed: %w", err)
 	}
 	defer os.Remove(vidPath)
@@ -2130,7 +2130,7 @@ func mvDownloader(ctx context.Context, adamID string, saveDir string, token stri
 	if err != nil {
 		return fmt.Errorf("audio key retrieval failed: %w", err)
 	}
-	if err := runv3.ExtMvData(ctx, audiokeyAndUrls, audPath); err != nil {
+	if err := runv3.ExtMvData(ctx, audiokeyAndUrls, audPath, runv3.ProgressFunc(progress)); err != nil {
 		return fmt.Errorf("audio track download failed: %w", err)
 	}
 	defer os.Remove(audPath)
@@ -2201,6 +2201,9 @@ func mvDownloader(ctx context.Context, adamID string, saveDir string, token stri
 	defer os.Remove(covPath)
 
 	tagsString := strings.Join(tags, ":")
+	if progress != nil {
+		progress("Remuxing", 0, 0)
+	}
 	muxCmd := exec.CommandContext(ctx, "MP4Box", "-itags", tagsString, "-quiet", "-add", vidPath, "-add", audPath, "-keep-utc", "-new", mvOutPath)
 	fmt.Printf("MV Remuxing...")
 	if err := muxCmd.Run(); err != nil {

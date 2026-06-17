@@ -455,7 +455,7 @@ func fileWriter(wg *sync.WaitGroup, segmentsChan <-chan Segment, outputFile io.W
 	}
 }
 
-func ExtMvData(ctx context.Context, keyAndUrls string, savePath string) error {
+func ExtMvData(ctx context.Context, keyAndUrls string, savePath string, progress ProgressFunc) error {
 	segments := strings.Split(keyAndUrls, ";")
 	key := segments[0]
 	//fmt.Println(key)
@@ -476,9 +476,18 @@ func ExtMvData(ctx context.Context, keyAndUrls string, savePath string) error {
 	limiter := make(chan struct{}, maxConcurrency)
 	client := &http.Client{}
 
-	// 初始化进度条
-	bar := progressbar.DefaultBytes(-1, "Downloading...")
-	barWriter := io.MultiWriter(tempFile, bar)
+	// 初始化进度条。When the bot supplies a progress callback, feed byte counts to
+	// the status board (total is unknown for the concatenated HLS segments, so it
+	// stays 0 — the board still renders bytes-downloaded and speed). Otherwise fall
+	// back to the stdout progressbar.
+	var barWriter io.Writer
+	if progress != nil {
+		pw := &progressWriter{cb: progress, phase: "Downloading", total: 0}
+		barWriter = io.MultiWriter(tempFile, pw)
+	} else {
+		bar := progressbar.DefaultBytes(-1, "Downloading...")
+		barWriter = io.MultiWriter(tempFile, bar)
+	}
 
 	// 启动写入 Goroutine
 	writerWg.Add(1)
@@ -512,6 +521,9 @@ func ExtMvData(ctx context.Context, keyAndUrls string, savePath string) error {
 	}
 	fmt.Println("\nDownloaded.")
 
+	if progress != nil {
+		progress("Decrypting", 0, 0)
+	}
 	cmd1 := exec.CommandContext(ctx, "mp4decrypt", "--key", key, tempFile.Name(), filepath.Base(savePath))
 	cmd1.Dir = filepath.Dir(savePath) //设置mp4decrypt的工作目录以解决中文路径错误
 	outlog, err := cmd1.CombinedOutput()
@@ -521,6 +533,9 @@ func ExtMvData(ctx context.Context, keyAndUrls string, savePath string) error {
 		return err
 	} else {
 		fmt.Println("Decrypted.")
+	}
+	if progress != nil {
+		progress("Decrypting", 1, 1)
 	}
 	return nil
 }
