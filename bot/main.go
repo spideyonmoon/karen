@@ -24,6 +24,7 @@ import (
 	apputils "main/utils"
 	"main/utils/ampapi"
 	"main/utils/lyrics"
+	"main/utils/runv3"
 	"main/utils/structs"
 	"main/utils/task"
 	"main/utils/wmgrpc"
@@ -2106,29 +2107,30 @@ func mvDownloader(ctx context.Context, adamID string, saveDir string, token stri
 		return nil
 	}
 
-	wm := wmPool.Acquire()
-	mvm3u8url, err := wm.WebPlayback(ctx, adamID)
-	if err != nil {
-		wmPool.Release(wm)
-		return fmt.Errorf("MV WebPlayback lookup failed: %w", err)
-	}
+	// Music videos are Widevine-encrypted (PSSH keys), not FairPlay (skd://).
+	// wrapper-manager only decrypts FairPlay, so MV uses the bundled Widevine CDM
+	// (runv3) + mp4decrypt path instead of the wmgrpc decrypt stream.
+	mvm3u8url, _, _, _ := runv3.GetWebplayback(adamID, token, Config.MediaUserToken, true)
 	if mvm3u8url == "" {
-		wmPool.Release(wm)
-		return errors.New("MV WebPlayback returned empty URL")
+		return errors.New("media-user-token may be wrong or expired")
 	}
 
 	os.MkdirAll(saveDir, os.ModePerm)
 	videom3u8url, _ := extractVideo(mvm3u8url)
-	err = wmgrpc.DownloadAndDecrypt(ctx, wm, adamID+"_video", videom3u8url, vidPath, nil)
+	videokeyAndUrls, err := runv3.Run(ctx, adamID, videom3u8url, token, Config.MediaUserToken, true, "", nil)
 	if err != nil {
-		wmPool.Release(wm)
+		return fmt.Errorf("video key retrieval failed: %w", err)
+	}
+	if err := runv3.ExtMvData(ctx, videokeyAndUrls, vidPath); err != nil {
 		return fmt.Errorf("video track download failed: %w", err)
 	}
 	defer os.Remove(vidPath)
 	audiom3u8url, _ := extractMvAudio(mvm3u8url)
-	err = wmgrpc.DownloadAndDecrypt(ctx, wm, adamID+"_audio", audiom3u8url, audPath, nil)
-	wmPool.Release(wm)
+	audiokeyAndUrls, err := runv3.Run(ctx, adamID, audiom3u8url, token, Config.MediaUserToken, true, "", nil)
 	if err != nil {
+		return fmt.Errorf("audio key retrieval failed: %w", err)
+	}
+	if err := runv3.ExtMvData(ctx, audiokeyAndUrls, audPath); err != nil {
 		return fmt.Errorf("audio track download failed: %w", err)
 	}
 	defer os.Remove(audPath)

@@ -3,10 +3,14 @@ module main
 go 1.25.5
 
 require (
+	github.com/aead/cmac v0.0.0-20160719120800-7af84192f0b1
+	github.com/go-resty/resty/v2 v2.16.5
 	github.com/gotd/td v0.144.0
 	github.com/grafov/m3u8 v0.11.1
+	github.com/schollz/progressbar/v3 v3.14.6
 	github.com/spf13/pflag v1.0.5
 	google.golang.org/protobuf v1.36.11
+	lukechampine.com/frand v1.5.1
 )
 
 require (
@@ -30,7 +34,9 @@ require (
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/mattn/go-runewidth v0.0.9 // indirect
 	github.com/mgutz/ansi v0.0.0-20200706080929-d51e80ef957d // indirect
+	github.com/mitchellh/colorstring v0.0.0-20190213212951-d06e56a500db // indirect
 	github.com/ogen-go/ogen v1.19.0 // indirect
+	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/segmentio/asm v1.2.1 // indirect
 	github.com/shopspring/decimal v1.4.0 // indirect
@@ -48,6 +54,7 @@ require (
 	golang.org/x/sys v0.42.0 // indirect
 	golang.org/x/term v0.41.0 // indirect
 	golang.org/x/text v0.35.0 // indirect
+	golang.org/x/time v0.8.0 // indirect
 	golang.org/x/tools v0.43.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260226221140-a57be14db171 // indirect
 	gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c // indirect
