@@ -400,6 +400,11 @@ func (b *TelegramBot) handleCount(chatID int64, link string, replyToID int) {
 		return
 	}
 	if sf, albumID := checkUrl(link); albumID != "" {
+		// A shared-song link is an album URL with ?i=<songID>; count it as one track.
+		if songIDFromURLParam(link) != "" {
+			_ = b.sendMessageWithReply(chatID, "🎵 1 streamable track.", nil, replyToID)
+			return
+		}
 		resp, err := ampapi.GetAlbumResp(orStorefront(sf), albumID, b.searchLanguage(), b.appleToken)
 		if err != nil || resp == nil || len(resp.Data) == 0 {
 			_ = b.sendMessageWithReply(chatID, "Couldn't load that album.", nil, replyToID)

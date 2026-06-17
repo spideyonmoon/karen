@@ -12,6 +12,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1271,6 +1272,14 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args
 		}
 
 		_, songID := checkUrlSong(link)
+		if songID == "" {
+			// Apple Music's "Share Song" copies an album URL with the song id in
+			// the ?i= query param (…/album/name/123?i=456). Treat that as a single
+			// song so we don't rip the whole album.
+			if _, albumID := checkUrl(link); albumID != "" {
+				songID = songIDFromURLParam(link)
+			}
+		}
 		if songID != "" {
 			if headlessMode != "" {
 				format := b.resolveFormat(chatID, forceFlac)
@@ -5348,6 +5357,16 @@ func normalizeInlineSongSearchTerm(query string) string {
 
 func inlineSearchResultID(kind string, itemID string, index int) string {
 	return fmt.Sprintf("%s:%s:%d", kind, itemID, index)
+}
+
+// songIDFromURLParam returns the song id carried in an Apple Music album link's
+// ?i= query param, or "" if absent/unparseable.
+func songIDFromURLParam(link string) string {
+	parsed, err := url.Parse(link)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(parsed.Query().Get("i"))
 }
 
 func songIDFromInlineResultID(resultID string) string {
