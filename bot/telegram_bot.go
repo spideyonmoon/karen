@@ -173,6 +173,7 @@ type PendingTransfer struct {
 	ForceAAC         bool
 	ForceAtmos       bool
 	ForceFlac        bool
+	NoCache          bool
 	ReplyToMessageID int
 	MessageID        int
 	CreatedAt        time.Time
@@ -192,6 +193,7 @@ type downloadRequest struct {
 	transferMode    string
 	albumID         string
 	forceAtmos      bool
+	noCache         bool
 	fn              func(ctx context.Context) error
 	after           func()
 	ctx             context.Context
@@ -1215,7 +1217,7 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args
 			return
 		}
 		if len(args) == 0 {
-			_ = b.sendMessageWithReply(chatID, "Usage: /dl <apple-music-link> [-aac|-atmos] [-flac] [-art] [-tgu|-tgz|-go]", nil, replyToID)
+			_ = b.sendMessageWithReply(chatID, "Usage: /dl <apple-music-link> [-aac|-atmos] [-flac] [-art] [-nc] [-tgu|-tgz|-go]", nil, replyToID)
 			return
 		}
 
@@ -1223,6 +1225,7 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args
 		forceAtmos := false
 		forceFlac := false
 		forceArt := false
+		forceNoCache := false
 		headlessMode := "" // -tgu / -tgz / -go: skip delivery keyboard
 		var link string
 		for _, arg := range args {
@@ -1235,6 +1238,8 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args
 				forceFlac = true
 			case "-art", "art":
 				forceArt = true
+			case "-nc", "nc":
+				forceNoCache = true
 			case "-tgu", "tgu":
 				headlessMode = transferModeTelegramIndividual
 			case "-tgz", "tgz":
@@ -1258,9 +1263,9 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args
 		mvStorefront, mvID := checkUrlMv(link)
 		if mvID != "" {
 			if headlessMode != "" {
-				b.queueDownloadMvHeadless(chatID, userID, mvStorefront, mvID, replyToID, headlessMode)
+				b.queueDownloadMvHeadless(chatID, userID, mvStorefront, mvID, replyToID, headlessMode, forceNoCache)
 			} else {
-				b.queueDownloadMvWithReply(chatID, mvStorefront, mvID, replyToID, userID)
+				b.queueDownloadMvWithReply(chatID, mvStorefront, mvID, replyToID, userID, forceNoCache)
 			}
 			return
 		}
@@ -1269,13 +1274,13 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args
 		if songID != "" {
 			if headlessMode != "" {
 				format := b.resolveFormat(chatID, forceFlac)
-				if !b.trySendCachedTrack(chatID, replyToID, songID, format) {
-					b.enqueueDownload(chatID, userID, "", replyToID, 0, true, format, headlessMode, "", func(ctx context.Context) error {
+				if forceNoCache || !b.trySendCachedTrack(chatID, replyToID, songID, format) {
+					b.enqueueDownload(chatID, userID, "", replyToID, 0, true, format, headlessMode, "", forceNoCache, func(ctx context.Context) error {
 						return ripSong(songID, b.appleToken, Config.Storefront, forceAAC, ctx)
 					})
 				}
 			} else {
-				b.queueDownloadSongWithReply(chatID, userID, songID, replyToID, forceAAC, forceAtmos, forceFlac)
+				b.queueDownloadSongWithReply(chatID, userID, songID, replyToID, forceAAC, forceAtmos, forceFlac, forceNoCache)
 			}
 			return
 		}
@@ -1283,9 +1288,9 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args
 		_, albumID := checkUrl(link)
 		if albumID != "" {
 			if headlessMode != "" {
-				b.enqueueAlbumDownload(chatID, albumID, replyToID, 0, headlessMode, forceAAC, forceAtmos, forceFlac, userID, "")
+				b.enqueueAlbumDownload(chatID, albumID, replyToID, 0, headlessMode, forceAAC, forceAtmos, forceFlac, forceNoCache, userID, "")
 			} else {
-				b.queueDownloadAlbumWithReply(chatID, userID, albumID, replyToID, forceAAC, forceAtmos, forceFlac)
+				b.queueDownloadAlbumWithReply(chatID, userID, albumID, replyToID, forceAAC, forceAtmos, forceFlac, forceNoCache)
 			}
 			return
 		}
@@ -1294,11 +1299,11 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args
 		if playlistID != "" {
 			if b.isAdmin(userID) {
 				// Admins bypass the >100-track sleeptime gate entirely.
-				b.dispatchPlaylistNormal(chatID, userID, playlistID, replyToID, headlessMode, forceAAC, forceAtmos, forceFlac)
+				b.dispatchPlaylistNormal(chatID, userID, playlistID, replyToID, headlessMode, forceAAC, forceAtmos, forceFlac, forceNoCache)
 			} else {
 				// Non-admins: count first (blocking → goroutine); >100 tracks defers
 				// to the sleeptime window forced to Gofile ZIP.
-				go b.routePlaylistNonAdmin(chatID, userID, playlistStorefront, playlistID, link, replyToID, headlessMode, forceAAC, forceAtmos, forceFlac)
+				go b.routePlaylistNonAdmin(chatID, userID, playlistStorefront, playlistID, link, replyToID, headlessMode, forceAAC, forceAtmos, forceFlac, forceNoCache)
 			}
 			return
 		}
@@ -1306,9 +1311,9 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args
 		_, stationID := checkUrlStation(link)
 		if stationID != "" {
 			if headlessMode != "" {
-				b.enqueueStationDownload(chatID, stationID, replyToID, 0, headlessMode, forceAAC, forceAtmos, forceFlac, userID, "")
+				b.enqueueStationDownload(chatID, stationID, replyToID, 0, headlessMode, forceAAC, forceAtmos, forceFlac, forceNoCache, userID, "")
 			} else {
-				b.queueDownloadStationWithReply(chatID, userID, stationID, replyToID, forceAAC, forceAtmos, forceFlac)
+				b.queueDownloadStationWithReply(chatID, userID, stationID, replyToID, forceAAC, forceAtmos, forceFlac, forceNoCache)
 			}
 			return
 		}
@@ -1443,9 +1448,9 @@ func (b *TelegramBot) handleSelection(chatID int64, messageID int, choice int, c
 	switch pending.Kind {
 	case "song":
 		setSearchMeta(selected.ID, selected.Name, selected.Artist)
-		b.queueDownloadSongWithReply(chatID, owner, selected.ID, replyToID, false, false, false)
+		b.queueDownloadSongWithReply(chatID, owner, selected.ID, replyToID, false, false, false, false)
 	case "album", "artist_album":
-		b.queueDownloadAlbumWithReply(chatID, owner, selected.ID, replyToID, false, false, false)
+		b.queueDownloadAlbumWithReply(chatID, owner, selected.ID, replyToID, false, false, false, false)
 	case "artist":
 		b.showArtistAlbums(chatID, owner, selected.ID, selected.Name, replyToID)
 	default:
@@ -1528,26 +1533,26 @@ func (b *TelegramBot) handleTransferMode(chatID int64, messageID int, mode strin
 		if mode == transferModeGofileZip {
 			mvMode = transferModeMvGofile
 		}
-		b.enqueueMvDownload(chatID, userID, pending.MvStorefront, pending.MvID, replyToID, messageID, mvMode)
+		b.enqueueMvDownload(chatID, userID, pending.MvStorefront, pending.MvID, replyToID, messageID, mvMode, pending.NoCache)
 		return ""
 	}
 
 	if pending.Single && pending.SongID != "" {
-		b.enqueueDownload(chatID, userID, username, replyToID, messageID, true, b.resolveFormat(chatID, pending.ForceFlac), mode, "", func(ctx context.Context) error {
+		b.enqueueDownload(chatID, userID, username, replyToID, messageID, true, b.resolveFormat(chatID, pending.ForceFlac), mode, "", pending.NoCache, func(ctx context.Context) error {
 			return ripSong(pending.SongID, b.appleToken, Config.Storefront, pending.ForceAAC, ctx)
 		})
 	} else if pending.PlaylistID != "" {
-		b.enqueuePlaylistDownload(chatID, pending.PlaylistID, replyToID, messageID, mode, pending.ForceAAC, pending.ForceAtmos, pending.ForceFlac, userID, username)
+		b.enqueuePlaylistDownload(chatID, pending.PlaylistID, replyToID, messageID, mode, pending.ForceAAC, pending.ForceAtmos, pending.ForceFlac, pending.NoCache, userID, username)
 	} else if pending.StationID != "" {
-		b.enqueueStationDownload(chatID, pending.StationID, replyToID, messageID, mode, pending.ForceAAC, pending.ForceAtmos, pending.ForceFlac, userID, username)
+		b.enqueueStationDownload(chatID, pending.StationID, replyToID, messageID, mode, pending.ForceAAC, pending.ForceAtmos, pending.ForceFlac, pending.NoCache, userID, username)
 	} else if pending.AlbumID != "" {
 		format := b.resolveFormat(chatID, pending.ForceFlac)
-		if mode == transferModeGofileZip {
+		if mode == transferModeGofileZip && !pending.NoCache {
 			if b.trySendCachedAlbumZip(chatID, pending.AlbumID, replyToID, format) {
 				return ""
 			}
 		}
-		b.enqueueAlbumDownload(chatID, pending.AlbumID, replyToID, messageID, mode, pending.ForceAAC, pending.ForceAtmos, pending.ForceFlac, userID, username)
+		b.enqueueAlbumDownload(chatID, pending.AlbumID, replyToID, messageID, mode, pending.ForceAAC, pending.ForceAtmos, pending.ForceFlac, pending.NoCache, userID, username)
 	}
 	return ""
 }
@@ -1615,19 +1620,20 @@ func (b *TelegramBot) resolveFormat(chatID int64, forceFlac bool) string {
 }
 
 func (b *TelegramBot) queueDownloadSong(chatID int64, songID string) {
-	b.queueDownloadSongWithReply(chatID, 0, songID, 0, false, false, false)
+	b.queueDownloadSongWithReply(chatID, 0, songID, 0, false, false, false, false)
 }
 
-func (b *TelegramBot) queueDownloadSongWithReply(chatID int64, userID int64, songID string, replyToID int, forceAAC bool, forceAtmos bool, forceFlac bool) {
+func (b *TelegramBot) queueDownloadSongWithReply(chatID int64, userID int64, songID string, replyToID int, forceAAC bool, forceAtmos bool, forceFlac bool, noCache bool) {
 	if songID == "" {
 		_ = b.sendMessage(chatID, "Song ID is empty.", nil)
 		return
 	}
 	format := b.resolveFormat(chatID, forceFlac)
-	if b.trySendCachedTrack(chatID, replyToID, songID, format) {
+	// --no-cache bypasses the file_id cache so the track is genuinely re-ripped.
+	if !noCache && b.trySendCachedTrack(chatID, replyToID, songID, format) {
 		return
 	}
-	b.promptTransferMode(chatID, userID, "", songID, "", "", replyToID, true, forceAAC, forceAtmos, forceFlac)
+	b.promptTransferMode(chatID, userID, "", songID, "", "", replyToID, true, forceAAC, forceAtmos, forceFlac, noCache)
 }
 
 func (b *TelegramBot) queueInlineSongDownload(chatID int64, songID string, inlineMessageID string) {
@@ -1656,7 +1662,7 @@ func (b *TelegramBot) queueInlineSongDownload(chatID int64, songID string, inlin
 		}
 		_ = b.editInlineMessageText(inlineMessageID, "Download failed. Please check bot logs or cache chat permissions.")
 	}
-	ok := b.enqueueDownloadWithAfter(uploadChatID, 0, "", 0, 0, true, format, transferModeOneByOne, "", func(ctx context.Context) error {
+	ok := b.enqueueDownloadWithAfter(uploadChatID, 0, "", 0, 0, true, format, transferModeOneByOne, "", false, func(ctx context.Context) error {
 		return ripSong(songID, b.appleToken, Config.Storefront, false, ctx)
 	}, after)
 	if !ok && inlineMessageID != "" {
@@ -1665,37 +1671,37 @@ func (b *TelegramBot) queueInlineSongDownload(chatID int64, songID string, inlin
 }
 
 func (b *TelegramBot) queueDownloadAlbum(chatID int64, albumID string) {
-	b.queueDownloadAlbumWithReply(chatID, 0, albumID, 0, false, false, false)
+	b.queueDownloadAlbumWithReply(chatID, 0, albumID, 0, false, false, false, false)
 }
 
-func (b *TelegramBot) queueDownloadAlbumWithReply(chatID int64, userID int64, albumID string, replyToID int, forceAAC bool, forceAtmos bool, forceFlac bool) {
+func (b *TelegramBot) queueDownloadAlbumWithReply(chatID int64, userID int64, albumID string, replyToID int, forceAAC bool, forceAtmos bool, forceFlac bool, noCache bool) {
 	if albumID == "" {
 		_ = b.sendMessage(chatID, "Album ID is empty.", nil)
 		return
 	}
-	b.promptTransferMode(chatID, userID, albumID, "", "", "", replyToID, false, forceAAC, forceAtmos, forceFlac)
+	b.promptTransferMode(chatID, userID, albumID, "", "", "", replyToID, false, forceAAC, forceAtmos, forceFlac, noCache)
 }
 
-func (b *TelegramBot) queueDownloadPlaylistWithReply(chatID int64, userID int64, playlistID string, replyToID int, forceAAC bool, forceAtmos bool, forceFlac bool) {
+func (b *TelegramBot) queueDownloadPlaylistWithReply(chatID int64, userID int64, playlistID string, replyToID int, forceAAC bool, forceAtmos bool, forceFlac bool, noCache bool) {
 	if playlistID == "" {
 		_ = b.sendMessage(chatID, "Playlist ID is empty.", nil)
 		return
 	}
-	b.promptTransferMode(chatID, userID, "", "", playlistID, "", replyToID, false, forceAAC, forceAtmos, forceFlac)
+	b.promptTransferMode(chatID, userID, "", "", playlistID, "", replyToID, false, forceAAC, forceAtmos, forceFlac, noCache)
 }
 
-func (b *TelegramBot) queueDownloadStationWithReply(chatID int64, userID int64, stationID string, replyToID int, forceAAC bool, forceAtmos bool, forceFlac bool) {
+func (b *TelegramBot) queueDownloadStationWithReply(chatID int64, userID int64, stationID string, replyToID int, forceAAC bool, forceAtmos bool, forceFlac bool, noCache bool) {
 	if stationID == "" {
 		_ = b.sendMessage(chatID, "Station ID is empty.", nil)
 		return
 	}
-	b.promptTransferMode(chatID, userID, "", "", "", stationID, replyToID, false, forceAAC, forceAtmos, forceFlac)
+	b.promptTransferMode(chatID, userID, "", "", "", stationID, replyToID, false, forceAAC, forceAtmos, forceFlac, noCache)
 }
 
 // queueDownloadMvWithReply validates the preconditions for a music-video rip and then
 // prompts for the delivery target. userID is the initiator; it's stored on the pending
 // transfer so only they can pick the mode via the inline button callback.
-func (b *TelegramBot) queueDownloadMvWithReply(chatID int64, storefront string, mvID string, replyToID int, userID int64) {
+func (b *TelegramBot) queueDownloadMvWithReply(chatID int64, storefront string, mvID string, replyToID int, userID int64, noCache bool) {
 	if mvID == "" {
 		_ = b.sendMessage(chatID, "Music video ID is empty.", nil)
 		return
@@ -1703,12 +1709,12 @@ func (b *TelegramBot) queueDownloadMvWithReply(chatID int64, storefront string, 
 	if storefront == "" {
 		storefront = Config.Storefront
 	}
-	b.promptMvTransferMode(chatID, userID, storefront, mvID, replyToID)
+	b.promptMvTransferMode(chatID, userID, storefront, mvID, replyToID, noCache)
 }
 
 // queueDownloadMvHeadless runs the same validation as queueDownloadMvWithReply but
 // skips the delivery keyboard and enqueues immediately with the supplied mode.
-func (b *TelegramBot) queueDownloadMvHeadless(chatID int64, userID int64, storefront string, mvID string, replyToID int, headlessMode string) {
+func (b *TelegramBot) queueDownloadMvHeadless(chatID int64, userID int64, storefront string, mvID string, replyToID int, headlessMode string, noCache bool) {
 	if mvID == "" {
 		_ = b.sendMessage(chatID, "Music video ID is empty.", nil)
 		return
@@ -1720,12 +1726,12 @@ func (b *TelegramBot) queueDownloadMvHeadless(chatID int64, userID int64, storef
 	if headlessMode == transferModeGofileZip {
 		mvMode = transferModeMvGofile
 	}
-	b.enqueueMvDownload(chatID, userID, storefront, mvID, replyToID, 0, mvMode)
+	b.enqueueMvDownload(chatID, userID, storefront, mvID, replyToID, 0, mvMode, noCache)
 }
 
 // promptMvTransferMode shows the music-video delivery keyboard and stores the pending
 // MV selection; handleTransferMode picks it up on the button press.
-func (b *TelegramBot) promptMvTransferMode(chatID int64, userID int64, storefront string, mvID string, replyToID int) {
+func (b *TelegramBot) promptMvTransferMode(chatID int64, userID int64, storefront string, mvID string, replyToID int, noCache bool) {
 	messageID, err := b.sendMessageWithReplyReturn(chatID, "Choose transfer method:", buildMvTransferKeyboard(), replyToID)
 	if err != nil {
 		return
@@ -1735,6 +1741,7 @@ func (b *TelegramBot) promptMvTransferMode(chatID int64, userID int64, storefron
 		MvID:             mvID,
 		MvStorefront:     storefront,
 		Single:           true,
+		NoCache:          noCache,
 		ReplyToMessageID: replyToID,
 		MessageID:        messageID,
 		CreatedAt:        time.Now(),
@@ -1745,7 +1752,7 @@ func (b *TelegramBot) promptMvTransferMode(chatID int64, userID int64, storefron
 
 // enqueueMvDownload queues a music-video rip with the chosen delivery mode
 // (transferModeMv for native video, transferModeMvGofile for a direct Gofile link).
-func (b *TelegramBot) enqueueMvDownload(chatID int64, userID int64, storefront string, mvID string, replyToID int, statusMessageID int, transferMode string) {
+func (b *TelegramBot) enqueueMvDownload(chatID int64, userID int64, storefront string, mvID string, replyToID int, statusMessageID int, transferMode string, noCache bool) {
 	if storefront == "" {
 		storefront = Config.Storefront
 	}
@@ -1753,12 +1760,12 @@ func (b *TelegramBot) enqueueMvDownload(chatID int64, userID int64, storefront s
 	if saveDir == "" {
 		saveDir = "."
 	}
-	b.enqueueDownload(chatID, userID, "", replyToID, statusMessageID, true, "", transferMode, "", func(ctx context.Context) error {
+	b.enqueueDownload(chatID, userID, "", replyToID, statusMessageID, true, "", transferMode, "", noCache, func(ctx context.Context) error {
 		return mvDownloader(ctx, mvID, saveDir, b.appleToken, storefront, nil, nil)
 	})
 }
 
-func (b *TelegramBot) promptTransferMode(chatID int64, userID int64, albumID string, songID string, playlistID string, stationID string, replyToID int, single bool, forceAAC bool, forceAtmos bool, forceFlac bool) {
+func (b *TelegramBot) promptTransferMode(chatID int64, userID int64, albumID string, songID string, playlistID string, stationID string, replyToID int, single bool, forceAAC bool, forceAtmos bool, forceFlac bool, noCache bool) {
 	mtprotoReady := b.mtproto != nil && b.mtproto.IsReady()
 	messageID, err := b.sendMessageWithReplyReturn(chatID, "Choose transfer method:", buildTransferKeyboard(mtprotoReady), replyToID)
 	if err != nil {
@@ -1774,6 +1781,7 @@ func (b *TelegramBot) promptTransferMode(chatID int64, userID int64, albumID str
 		ForceAAC:         forceAAC,
 		ForceAtmos:       forceAtmos,
 		ForceFlac:        forceFlac,
+		NoCache:          noCache,
 		ReplyToMessageID: replyToID,
 		MessageID:        messageID,
 		CreatedAt:        time.Now(),
@@ -1782,13 +1790,13 @@ func (b *TelegramBot) promptTransferMode(chatID int64, userID int64, albumID str
 	b.transferMu.Unlock()
 }
 
-func (b *TelegramBot) enqueueAlbumDownload(chatID int64, albumID string, replyToID int, statusMessageID int, transferMode string, forceAAC bool, forceAtmos bool, forceFlac bool, userID int64, username string) {
+func (b *TelegramBot) enqueueAlbumDownload(chatID int64, albumID string, replyToID int, statusMessageID int, transferMode string, forceAAC bool, forceAtmos bool, forceFlac bool, noCache bool, userID int64, username string) {
 	if albumID == "" {
 		_ = b.sendMessage(chatID, "Album ID is empty.", nil)
 		return
 	}
 	format := b.resolveFormat(chatID, forceFlac)
-	b.enqueueDownload(chatID, userID, username, replyToID, statusMessageID, false, format, transferMode, albumID, func(ctx context.Context) error {
+	b.enqueueDownload(chatID, userID, username, replyToID, statusMessageID, false, format, transferMode, albumID, noCache, func(ctx context.Context) error {
 		if forceAtmos {
 			dl_atmos = true
 		}
@@ -1796,13 +1804,13 @@ func (b *TelegramBot) enqueueAlbumDownload(chatID int64, albumID string, replyTo
 	})
 }
 
-func (b *TelegramBot) enqueuePlaylistDownload(chatID int64, playlistID string, replyToID int, statusMessageID int, transferMode string, forceAAC bool, forceAtmos bool, forceFlac bool, userID int64, username string) {
+func (b *TelegramBot) enqueuePlaylistDownload(chatID int64, playlistID string, replyToID int, statusMessageID int, transferMode string, forceAAC bool, forceAtmos bool, forceFlac bool, noCache bool, userID int64, username string) {
 	if playlistID == "" {
 		_ = b.sendMessage(chatID, "Playlist ID is empty.", nil)
 		return
 	}
 	format := b.resolveFormat(chatID, forceFlac)
-	b.enqueueDownload(chatID, userID, username, replyToID, statusMessageID, false, format, transferMode, playlistID, func(ctx context.Context) error {
+	b.enqueueDownload(chatID, userID, username, replyToID, statusMessageID, false, format, transferMode, playlistID, noCache, func(ctx context.Context) error {
 		if forceAtmos {
 			dl_atmos = true
 		}
@@ -1813,13 +1821,13 @@ func (b *TelegramBot) enqueuePlaylistDownload(chatID int64, playlistID string, r
 // enqueueStationDownload queues an Apple Music radio/station rip. ripStation reads
 // the codec from the dl_atmos/dl_aac globals (it takes no forceAAC param), so we set
 // them inside the closure — runDownload resets both before fn runs.
-func (b *TelegramBot) enqueueStationDownload(chatID int64, stationID string, replyToID int, statusMessageID int, transferMode string, forceAAC bool, forceAtmos bool, forceFlac bool, userID int64, username string) {
+func (b *TelegramBot) enqueueStationDownload(chatID int64, stationID string, replyToID int, statusMessageID int, transferMode string, forceAAC bool, forceAtmos bool, forceFlac bool, noCache bool, userID int64, username string) {
 	if stationID == "" {
 		_ = b.sendMessage(chatID, "Station ID is empty.", nil)
 		return
 	}
 	format := b.resolveFormat(chatID, forceFlac)
-	b.enqueueDownload(chatID, userID, username, replyToID, statusMessageID, false, format, transferMode, "", func(ctx context.Context) error {
+	b.enqueueDownload(chatID, userID, username, replyToID, statusMessageID, false, format, transferMode, "", noCache, func(ctx context.Context) error {
 		if forceAtmos {
 			dl_atmos = true
 		}
@@ -1841,16 +1849,16 @@ func (b *TelegramBot) queueDownloadArtwork(chatID int64, link string, replyToID 
 		_ = b.sendMessageWithReply(chatID, "Artwork extraction supports album, playlist, and station links.", nil, replyToID)
 		return
 	}
-	b.enqueueDownload(chatID, userID, "", replyToID, 0, true, "", transferModeArt, "", func(ctx context.Context) error {
+	b.enqueueDownload(chatID, userID, "", replyToID, 0, true, "", transferModeArt, "", false, func(ctx context.Context) error {
 		return ripArtwork(link, b.appleToken, Config.Storefront, ctx)
 	})
 }
 
-func (b *TelegramBot) enqueueDownload(chatID int64, userID int64, username string, replyToID int, statusMessageID int, single bool, format string, transferMode string, albumID string, fn func(ctx context.Context) error) {
-	_ = b.enqueueDownloadWithAfter(chatID, userID, username, replyToID, statusMessageID, single, format, transferMode, albumID, fn, nil)
+func (b *TelegramBot) enqueueDownload(chatID int64, userID int64, username string, replyToID int, statusMessageID int, single bool, format string, transferMode string, albumID string, noCache bool, fn func(ctx context.Context) error) {
+	_ = b.enqueueDownloadWithAfter(chatID, userID, username, replyToID, statusMessageID, single, format, transferMode, albumID, noCache, fn, nil)
 }
 
-func (b *TelegramBot) enqueueDownloadWithAfter(chatID int64, userID int64, username string, replyToID int, statusMessageID int, single bool, format string, transferMode string, albumID string, fn func(ctx context.Context) error, after func()) bool {
+func (b *TelegramBot) enqueueDownloadWithAfter(chatID int64, userID int64, username string, replyToID int, statusMessageID int, single bool, format string, transferMode string, albumID string, noCache bool, fn func(ctx context.Context) error, after func()) bool {
 	// Accept all valid transfer modes
 	taskID := generateTaskID()
 	ctx, cancelFn := context.WithCancel(context.Background())
@@ -1864,6 +1872,7 @@ func (b *TelegramBot) enqueueDownloadWithAfter(chatID int64, userID int64, usern
 		format:          format,
 		transferMode:    transferMode,
 		albumID:         albumID,
+		noCache:         noCache,
 		fn:              fn,
 		after:           after,
 		ctx:             ctx,
@@ -1977,6 +1986,9 @@ func (b *TelegramBot) runDownload(req *downloadRequest) {
 	dl_atmos = false
 	dl_aac = false
 	dl_select = false
+	// Per-request --no-cache: applied here (serial worker) so each queued rip honors
+	// its own flag regardless of what the next/previous request set.
+	dl_noCache = req.noCache
 	if single {
 		dl_song = true
 	} else {
@@ -2126,18 +2138,49 @@ func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, re
 		}
 	}
 
-	// Chunk paths into groups of up to 10
+	// Music videos that land inside an album/playlist rip (e.g. a playlist that mixes
+	// songs and MVs) must go out as native Telegram video, not as an audio message —
+	// otherwise Telegram tags the .mp4 with an audio attribute and plays it as a song.
+	// Partition them out and send the videos first; the rest go through the audio group.
+	var audioPaths []string
+	for _, p := range paths {
+		if !isVideoFile(p) {
+			audioPaths = append(audioPaths, p)
+			continue
+		}
+		if ctx != nil && ctx.Err() != nil {
+			status.UpdateSync("Cancelled", 0, 0)
+			return
+		}
+		if err := b.sendVideoFileMTProto(chatID, p, replyToID, status, ctx); err != nil {
+			if errors.Is(err, context.Canceled) {
+				status.UpdateSync("Cancelled", 0, 0)
+				return
+			}
+			// Last resort for this one file: Gofile.
+			if link, gerr := apputils.UploadToGofile(ctx, p, Config.GofileToken); gerr == nil {
+				_ = b.sendMessageWithReply(chatID, fmt.Sprintf("File: %s\nDownload Link: %s", filepath.Base(p), link), nil, replyToID)
+				sentAny = true
+			} else {
+				fmt.Printf("MV delivery failed for %s: %v (gofile: %v)\n", filepath.Base(p), err, gerr)
+			}
+		} else {
+			sentAny = true
+		}
+	}
+
+	// Chunk the audio tracks into groups of up to 10
 	const maxGroupSize = 10
-	for i := 0; i < len(paths); i += maxGroupSize {
+	for i := 0; i < len(audioPaths); i += maxGroupSize {
 		if ctx != nil && ctx.Err() != nil {
 			status.UpdateSync("Cancelled", 0, 0)
 			return
 		}
 		end := i + maxGroupSize
-		if end > len(paths) {
-			end = len(paths)
+		if end > len(audioPaths) {
+			end = len(audioPaths)
 		}
-		chunk := paths[i:end]
+		chunk := audioPaths[i:end]
 
 		// Prepare AudioGroupItem slice
 		var groupItems []AudioGroupItem
@@ -2467,18 +2510,38 @@ func (b *TelegramBot) reportDeliveryFailure(chatID int64, replyToID int, status 
 	_ = b.sendMessageWithReply(chatID, fmt.Sprintf("❌ Upload failed — no files could be delivered.\n%s", detail), nil, replyToID)
 }
 
-// deliverMusicVideo sends a downloaded music video as a native Telegram video (inline
-// player + thumbnail), falling back to a document and then Gofile. The status board is
-// always resolved to a terminal state.
-func (b *TelegramBot) deliverMusicVideo(chatID int64, path string, replyToID int, status *DownloadStatus, ctx context.Context) {
+// isVideoFile reports whether a downloaded path is a music video (or other video)
+// rather than an audio track, by extension. Used to route MVs that land inside an
+// album/playlist rip to the native-video sender instead of the audio-group path.
+func isVideoFile(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".mp4", ".m4v", ".mov":
+		return true
+	}
+	return false
+}
+
+// sendVideoFileMTProto uploads a single video as a native Telegram video (inline player +
+// thumbnail) via MTProto, falling back to a document. It does NOT resolve the status board
+// or attempt Gofile — callers decide terminal handling and any further fallback. Returns nil
+// once the file is delivered (as video or document), context.Canceled if cancelled mid-send,
+// or the last error otherwise (including when MTProto is unavailable or the file is too large).
+func (b *TelegramBot) sendVideoFileMTProto(chatID int64, path string, replyToID int, status *DownloadStatus, ctx context.Context) error {
 	if ctx != nil && ctx.Err() != nil {
-		status.UpdateSync("Cancelled", 0, 0)
-		return
+		return context.Canceled
+	}
+	if b.mtproto == nil || !b.mtproto.IsReady() {
+		return fmt.Errorf("mtproto not ready")
 	}
 
 	var sizeBytes int64
 	if info, err := os.Stat(path); err == nil {
 		sizeBytes = info.Size()
+	}
+	// MTProto upload ceiling (~2GB).
+	const mtprotoMaxBytes = 2 * 1000 * 1000 * 1024
+	if sizeBytes > mtprotoMaxBytes {
+		return fmt.Errorf("file exceeds MTProto size ceiling (%d bytes)", sizeBytes)
 	}
 
 	// Caption from metadata when available.
@@ -2506,35 +2569,57 @@ func (b *TelegramBot) deliverMusicVideo(chatID int64, path string, replyToID int
 		defer os.Remove(thumbPath)
 	}
 
+	// Try native video first.
+	err := b.mtproto.UploadAndSendVideo(chatID, path, caption, durationSecs, width, height, thumbPath, replyToID, status, ctx)
+	if err == nil {
+		return nil
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return context.Canceled
+	}
+	fmt.Printf("MV video upload failed: %v. Trying document...\n", err)
+	status.Update(fmt.Sprintf("⚠️ Video send failed: %v. Sending as document...", err), 0, 0)
+
+	// Fall back to sending the same file as a document.
+	errDoc := b.mtproto.UploadAndSendDocument(chatID, path, filepath.Base(path), caption, replyToID, status, ctx)
+	if errDoc == nil {
+		return nil
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return context.Canceled
+	}
+	fmt.Printf("MV document upload failed: %v.\n", errDoc)
+	return errDoc
+}
+
+// deliverMusicVideo sends a downloaded music video as a native Telegram video (inline
+// player + thumbnail), falling back to a document and then Gofile. The status board is
+// always resolved to a terminal state.
+func (b *TelegramBot) deliverMusicVideo(chatID int64, path string, replyToID int, status *DownloadStatus, ctx context.Context) {
+	if ctx != nil && ctx.Err() != nil {
+		status.UpdateSync("Cancelled", 0, 0)
+		return
+	}
+
+	var sizeBytes int64
+	if info, err := os.Stat(path); err == nil {
+		sizeBytes = info.Size()
+	}
+
 	// MTProto upload ceiling (~2GB). Above it, or when MTProto is down, go straight to Gofile.
 	const mtprotoMaxBytes = 2 * 1000 * 1000 * 1024
 	if b.mtproto != nil && b.mtproto.IsReady() && (sizeBytes == 0 || sizeBytes <= mtprotoMaxBytes) {
-		// Try native video first.
-		err := b.mtproto.UploadAndSendVideo(chatID, path, caption, durationSecs, width, height, thumbPath, replyToID, status, ctx)
+		err := b.sendVideoFileMTProto(chatID, path, replyToID, status, ctx)
 		if err == nil {
 			status.Stop()
 			_ = b.deleteMessage(chatID, status.messageID)
 			return
 		}
-		if ctx != nil && ctx.Err() != nil {
+		if errors.Is(err, context.Canceled) || (ctx != nil && ctx.Err() != nil) {
 			status.UpdateSync("Cancelled", 0, 0)
 			return
 		}
-		fmt.Printf("MV video upload failed: %v. Trying document...\n", err)
-		status.Update(fmt.Sprintf("⚠️ Video send failed: %v. Sending as document...", err), 0, 0)
-
-		// Fall back to sending the same file as a document.
-		errDoc := b.mtproto.UploadAndSendDocument(chatID, path, filepath.Base(path), caption, replyToID, status, ctx)
-		if errDoc == nil {
-			status.Stop()
-			_ = b.deleteMessage(chatID, status.messageID)
-			return
-		}
-		if ctx != nil && ctx.Err() != nil {
-			status.UpdateSync("Cancelled", 0, 0)
-			return
-		}
-		fmt.Printf("MV document upload failed: %v. Falling back to Gofile...\n", errDoc)
+		fmt.Printf("MV upload failed: %v. Falling back to Gofile...\n", err)
 	}
 
 	// Gofile fallback.
@@ -5730,6 +5815,7 @@ Flags:
   -atmos   download in Dolby Atmos format
   -flac    convert to FLAC after download
   -art     grab cover art + motion artwork (no audio)
+  -nc      no-cache: delete any cached copy and re-rip fresh
   -tgu     send as individual Telegram tracks (skip keyboard)
   -tgz     send as Telegram ZIP (skip keyboard)
   -go      send as Gofile ZIP (skip keyboard)
@@ -5765,6 +5851,7 @@ Rips lossless ALAC, Dolby Atmos, and AAC from Apple Music straight to your chat.
 | ` + "`-atmos`" + ` | Download in Dolby Atmos format |
 | ` + "`-flac`" + ` | Convert to FLAC after download |
 | ` + "`-art`" + ` | Grab cover art + motion artwork (no audio) |
+| ` + "`-nc`" + ` | No-cache: delete any cached copy and re-rip fresh |
 | ` + "`-tgu`" + ` | Send as individual Telegram tracks |
 | ` + "`-tgz`" + ` | Send as a Telegram ZIP |
 | ` + "`-go`" + ` | Send as a Gofile ZIP |

@@ -222,7 +222,7 @@ func (b *TelegramBot) releaseJob(j *scheduledJob) {
 	switch j.Kind {
 	case "playlist":
 		_ = b.sendMessageWithReply(j.ChatID, "🌙 Sleeptime reached — starting your scheduled playlist rip (Gofile ZIP).", nil, j.ReplyToID)
-		b.enqueuePlaylistDownload(j.ChatID, j.ResourceID, j.ReplyToID, 0, transferModeGofileZip, j.ForceAAC, j.ForceAtmos, j.ForceFlac, j.UserID, j.Username)
+		b.enqueuePlaylistDownload(j.ChatID, j.ResourceID, j.ReplyToID, 0, transferModeGofileZip, j.ForceAAC, j.ForceAtmos, j.ForceFlac, false, j.UserID, j.Username)
 	case "artist":
 		_ = b.sendMessageWithReply(j.ChatID, "🌙 Sleeptime reached — starting your scheduled artist rip (Gofile ZIP).", nil, j.ReplyToID)
 		b.runArtistRip(j.ChatID, j.UserID, j.Username, j.Storefront, j.ResourceID, j.ReplyToID, j.ForceAAC, j.ForceAtmos, j.ForceFlac)
@@ -310,7 +310,7 @@ func (b *TelegramBot) enqueueAlbumDownloadChecked(chatID int64, albumID string, 
 		return true
 	}
 	format := b.resolveFormat(chatID, forceFlac)
-	return b.enqueueDownloadWithAfter(chatID, userID, username, replyToID, 0, false, format, transferMode, albumID, func(ctx context.Context) error {
+	return b.enqueueDownloadWithAfter(chatID, userID, username, replyToID, 0, false, format, transferMode, albumID, false, func(ctx context.Context) error {
 		if forceAtmos {
 			dl_atmos = true
 		}
@@ -326,10 +326,10 @@ const playlistSleeptimeThreshold = 100
 // threshold, schedules it for the sleeptime window; otherwise it runs the normal
 // delivery path. A count failure falls through to the normal path so a transient
 // API error never blocks the user. Blocking HTTP — call in a goroutine.
-func (b *TelegramBot) routePlaylistNonAdmin(chatID, userID int64, storefront, playlistID, link string, replyToID int, headlessMode string, forceAAC, forceAtmos, forceFlac bool) {
+func (b *TelegramBot) routePlaylistNonAdmin(chatID, userID int64, storefront, playlistID, link string, replyToID int, headlessMode string, forceAAC, forceAtmos, forceFlac, noCache bool) {
 	resp, err := ampapi.GetPlaylistResp(orStorefront(storefront), playlistID, b.searchLanguage(), b.appleToken)
 	if err != nil || resp == nil || len(resp.Data) == 0 {
-		b.dispatchPlaylistNormal(chatID, userID, playlistID, replyToID, headlessMode, forceAAC, forceAtmos, forceFlac)
+		b.dispatchPlaylistNormal(chatID, userID, playlistID, replyToID, headlessMode, forceAAC, forceAtmos, forceFlac, noCache)
 		return
 	}
 	if len(resp.Data[0].Relationships.Tracks.Data) > playlistSleeptimeThreshold {
@@ -347,16 +347,16 @@ func (b *TelegramBot) routePlaylistNonAdmin(chatID, userID int64, storefront, pl
 		})
 		return
 	}
-	b.dispatchPlaylistNormal(chatID, userID, playlistID, replyToID, headlessMode, forceAAC, forceAtmos, forceFlac)
+	b.dispatchPlaylistNormal(chatID, userID, playlistID, replyToID, headlessMode, forceAAC, forceAtmos, forceFlac, noCache)
 }
 
 // dispatchPlaylistNormal is the pre-existing playlist behavior: headless enqueue
 // when a delivery flag was given, otherwise the delivery-mode keyboard prompt.
-func (b *TelegramBot) dispatchPlaylistNormal(chatID, userID int64, playlistID string, replyToID int, headlessMode string, forceAAC, forceAtmos, forceFlac bool) {
+func (b *TelegramBot) dispatchPlaylistNormal(chatID, userID int64, playlistID string, replyToID int, headlessMode string, forceAAC, forceAtmos, forceFlac, noCache bool) {
 	if headlessMode != "" {
-		b.enqueuePlaylistDownload(chatID, playlistID, replyToID, 0, headlessMode, forceAAC, forceAtmos, forceFlac, userID, "")
+		b.enqueuePlaylistDownload(chatID, playlistID, replyToID, 0, headlessMode, forceAAC, forceAtmos, forceFlac, noCache, userID, "")
 	} else {
-		b.queueDownloadPlaylistWithReply(chatID, userID, playlistID, replyToID, forceAAC, forceAtmos, forceFlac)
+		b.queueDownloadPlaylistWithReply(chatID, userID, playlistID, replyToID, forceAAC, forceAtmos, forceFlac, noCache)
 	}
 }
 

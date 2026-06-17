@@ -43,6 +43,11 @@ var (
 	dl_aac                bool
 	dl_select             bool
 	dl_song               bool
+	// dl_noCache forces a fresh re-rip even when the file already exists on disk:
+	// the skip checks delete the stale original/converted file and download anew.
+	// Set per-request from downloadRequest.noCache in runDownload (serial worker),
+	// reset there before each rip — mirrors how dl_atmos/dl_aac are managed.
+	dl_noCache            bool
 	wmPool                *wmgrpc.Pool
 	artist_select         bool
 	debug_mode            bool
@@ -835,6 +840,17 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 	existsOriginal, err := fileExists(trackPath)
 	if err != nil {
 		fmt.Println("Failed to check if track exists.")
+	}
+	// --no-cache: drop any cached copy so the checks below fall through to a fresh rip.
+	if dl_noCache {
+		if existsOriginal {
+			fmt.Println("--no-cache: removing existing track to re-rip fresh.")
+		}
+		_ = os.Remove(trackPath)
+		if considerConverted {
+			_ = os.Remove(convertedPath)
+		}
+		existsOriginal = false
 	}
 	if existsOriginal {
 		fmt.Println("Track already exists locally.")
@@ -1904,6 +1920,7 @@ func main() {
 	pflag.BoolVar(&dl_aac, "aac", false, "Enable adm-aac download mode")
 	pflag.BoolVar(&dl_select, "select", false, "Enable selective download")
 	pflag.BoolVar(&dl_song, "song", false, "Enable single song download mode")
+	pflag.BoolVar(&dl_noCache, "no-cache", false, "Force re-rip: delete any existing file and download fresh")
 	pflag.BoolVar(&artist_select, "all-album", false, "Download all artist albums")
 	pflag.BoolVar(&debug_mode, "debug", false, "Enable debug mode to show audio quality information")
 	alac_max = pflag.Int("alac-max", Config.AlacMax, "Specify the max quality for download alac")
@@ -2102,6 +2119,11 @@ func mvDownloader(ctx context.Context, adamID string, saveDir string, token stri
 	fmt.Println(MVInfo.Data[0].Attributes.Name)
 
 	exists, _ := fileExists(mvOutPath)
+	if dl_noCache && exists {
+		fmt.Println("--no-cache: removing existing MV to re-rip fresh.")
+		_ = os.Remove(mvOutPath)
+		exists = false
+	}
 	if exists {
 		fmt.Println("MV already exists locally.")
 		return nil
