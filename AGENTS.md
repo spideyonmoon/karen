@@ -19,6 +19,19 @@ cp .env.example .env
 - `setup.sh` = full bootstrap (generate + clone AMD login client + build + per-account login + start). Re-run it only when the account list changes.
 - Gitignored: `.env`, `docker-compose.override.yml`, `bot/config.yaml`, `bot/telegram-cache.json`, `bot/downloads/`, `.logins/wm-*.toml`.
 
+## Day-2 operations (steady state)
+| Goal | Action |
+| --- | --- |
+| Ship a code/script change | `git push origin main` — deploy SSHes in, `git reset --hard origin/main`, regenerates config, rebuilds bot |
+| Add / remove Apple accounts | edit `.env` on the VPS, then `./setup.sh` (logs in only NEW accounts) |
+| Force fresh login of all accounts | `RELOGIN=1 ./setup.sh` |
+
+- **No manual `git pull` on the VPS, ever.** The deploy's `git reset --hard origin/main` syncs all tracked files (incl. the `*.sh` scripts) on every push to `main`. So when you next run `./setup.sh` to add accounts, it's already the latest version. `.env` / `docker-compose.override.yml` / `.logins/wm-*.toml` are gitignored, so the reset never touches them.
+- **Login is idempotent.** `setup.sh` skips any wrapper whose volume already has `/root/data/instances.json` (a token). Re-authing an already-logged-in account FAILS — that's what made wm-1 fail on a second run. Only ever log in new/failed accounts.
+- **`.env` is parsed literally, never `source`d.** A password with `$`/backtick/`\` would be shell-expanded and break under `set -u`. `generate.sh`/`setup.sh` have a `load_env()` that strips only outer quotes and takes the value verbatim. Proven on a `$`-containing password (wm-2).
+- **Compose runs with `--env-file /dev/null`** (in `setup.sh` and `deploy.yml`) so it doesn't parse the secrets `.env` for `${VAR}` interpolation (a `$` in a password warned "variable is not set"). Our compose files use literal values only.
+- **OPEN THREAD (unverified):** the idempotency skip assumes the token path is `/root/data/instances.json`. Never confirmed on the box. If wrong, the skip silently no-ops and `setup.sh` re-logs ALL accounts (no worse than before, but risks the re-auth failure). Confirm with `docker compose --env-file /dev/null exec -T wrapper-manager-2 sh -c 'ls -la /root/data'`; fix the one path in `setup.sh` step 4 if the filename differs.
+
 ## CLI flags (binary has two modes)
 - `--bot` — Telegram bot mode (production)
 - `--search [album|song|artist] <query>` — interactive search

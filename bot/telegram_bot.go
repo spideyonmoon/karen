@@ -1248,6 +1248,7 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args
 
 		// -art short-circuits everything else: grab only the cover + motion artwork
 		// for an album/playlist/station, ignoring any codec flags (there's no audio).
+		link = resolveAppleMusicURL(link)
 		if forceArt {
 			b.queueDownloadArtwork(chatID, link, replyToID, userID)
 			return
