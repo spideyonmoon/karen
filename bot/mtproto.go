@@ -73,6 +73,25 @@ type MTProtoClient struct {
 
 	peerMu sync.Mutex
 	peers  map[int64]tg.InputPeerClass
+
+	// uploadGate serializes all uploads to a single in-flight transfer. Telegram
+	// uploads share one DC connection, and concurrent multi-part uploads from two
+	// tasks starve each other and trip FloodWait; one TG upload at a time is the
+	// safe ceiling. It is a size-1 channel rather than a sync.Mutex so a queued
+	// upload still honors ctx cancellation (/stop, shutdown) while it waits.
+	uploadGate chan struct{}
+}
+
+// acquireUploadGate blocks until the single upload slot is free or ctx is done.
+// Returns a release func (nil if ctx fired first, in which case the returned error
+// is non-nil and the caller must not upload).
+func (m *MTProtoClient) acquireUploadGate(ctx context.Context) (func(), error) {
+	select {
+	case m.uploadGate <- struct{}{}:
+		return func() { <-m.uploadGate }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 // snapshot returns the current api client, its per-cycle context, and readiness
@@ -173,6 +192,15 @@ func (m *MTProtoClient) withUploadRetry(ctx context.Context, op string, fn func(
 // (the audio group) pass a larger budget because each retry only re-sends what hasn't
 // already succeeded, so a higher cap costs reconnect-waits rather than re-uploaded bytes.
 func (m *MTProtoClient) withUploadRetryN(ctx context.Context, op string, maxAttempts int, fn func(api *tg.Client) error) error {
+	// Serialize to one in-flight upload across all tasks. Held across the retry
+	// loop so a reconnect-retry of the same upload doesn't yield the slot to a
+	// different task mid-transfer.
+	release, err := m.acquireUploadGate(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		api, ok := m.awaitReady(ctx, uploadReadyWait)
@@ -270,6 +298,7 @@ func NewMTProtoClient(apiID int, apiHash string, botToken string, sessionDir str
 		parentCtx:   parentCtx,
 		cancel:      cancel,
 		peers:       make(map[int64]tg.InputPeerClass),
+		uploadGate:  make(chan struct{}, 1),
 	}
 
 	// firstResult delivers the outcome of the FIRST connection cycle only, so
