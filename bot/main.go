@@ -1166,6 +1166,9 @@ func ripStation(albumId string, token string, storefront string, ctx context.Con
 	}
 
 	concurrency := rs.wrapperBudget()
+	// Record the full planned track count up front so the scheduler's head
+	// remaining-tracks gate sees album-remaining, not the sem-capped in-flight count.
+	rs.planTracks(len(selected))
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 	for i := range station.Tracks {
@@ -1175,7 +1178,6 @@ func ripStation(albumId string, token string, storefront string, ctx context.Con
 		}
 		trackIdx := i - 1
 		wg.Add(1)
-		rs.planTrack()
 		sem <- struct{}{}
 		go func(idx int) {
 			defer wg.Done()
@@ -1542,6 +1544,11 @@ func ripAlbum(albumId string, token string, storefront string, urlArg_i string, 
 	// head (and for CLI / flag-off), a smaller k for a borrower — so we never hold
 	// more wrapper clients than granted.
 	concurrency := rs.wrapperBudget()
+	// Record the full planned track count up front so the scheduler's head
+	// remaining-tracks gate sees album-remaining, not the sem-capped in-flight count.
+	// (Already-downloaded tracks skipped on resume keep this slightly conservative,
+	// which only makes the head marginally more willing to lend — harmless.)
+	rs.planTracks(len(selected))
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 	for i := range album.Tracks {
@@ -1556,7 +1563,6 @@ func ripAlbum(albumId string, token string, storefront string, urlArg_i string, 
 		}
 		trackIdx := i - 1
 		wg.Add(1)
-		rs.planTrack()
 		sem <- struct{}{}
 		go func(idx int) {
 			defer wg.Done()
@@ -1774,6 +1780,11 @@ func ripPlaylist(playlistId string, token string, storefront string, forceAAC bo
 	}
 
 	concurrency := rs.wrapperBudget()
+	// Record the full planned track count up front so the scheduler's head
+	// remaining-tracks gate sees album-remaining, not the sem-capped in-flight count.
+	// (Already-downloaded tracks skipped on resume keep this slightly conservative,
+	// which only makes the head marginally more willing to lend — harmless.)
+	rs.planTracks(len(selected))
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 	for i := range playlist.Tracks {
@@ -1788,7 +1799,6 @@ func ripPlaylist(playlistId string, token string, storefront string, forceAAC bo
 		}
 		trackIdx := i - 1
 		wg.Add(1)
-		rs.planTrack()
 		sem <- struct{}{}
 		go func(idx int) {
 			defer wg.Done()
