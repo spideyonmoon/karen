@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	apputils "main/utils"
 	"main/utils/structs"
@@ -48,6 +49,20 @@ type RipState struct {
 
 	failMu   sync.Mutex
 	failures []string
+
+	// WrapperBudget caps how many wrapper-manager clients this rip may hold
+	// concurrently — its slice of the shared wmgrpc.Pool. The head runs with the
+	// full pool; a borrower is granted a small k. A value <= 0 (or above the pool
+	// size) means "no per-rip cap" → use the full pool. Set by the scheduler.
+	WrapperBudget int
+
+	// Live track accounting the scheduler reads to make its lend decision (head
+	// remaining-tracks threshold). planTrack increments totalTracks as each track
+	// download is launched; trackDone increments doneTracks as each finishes.
+	// remainingTracks() = total - done. Read from the scheduler goroutine while the
+	// rip writes, so both are atomic.
+	totalTracks atomic.Int64
+	doneTracks  atomic.Int64
 
 	// progressFactory builds the per-track progress callback for the status board.
 	progressFactory func(track *task.Track) apputils.ProgressFunc
@@ -147,6 +162,59 @@ func (rs *RipState) convertConfig() structs.ConfigSet {
 	cfg.ConvertKeepOriginal = rs.ConvertKeepOriginal
 	cfg.ConvertSkipLossyToLossless = rs.ConvertSkipLossyToLossless
 	return cfg
+}
+
+// --- wrapper budget + track accounting -------------------------------------
+
+// poolSize returns the configured wrapper-manager pool size (>= 1).
+func poolSize() int {
+	n := len(Config.WrapperManagerAddrs)
+	if n < 1 {
+		return 1
+	}
+	return n
+}
+
+// wrapperBudget returns the max wrapper clients this rip may hold concurrently.
+// A nil receiver, an unset budget, or one exceeding the pool size all mean "full
+// pool" — so the CLI / flag-off path and the head both get every client, exactly
+// as before. Only a borrower carries a smaller positive budget.
+func (rs *RipState) wrapperBudget() int {
+	n := poolSize()
+	if rs == nil || rs.WrapperBudget <= 0 || rs.WrapperBudget > n {
+		return n
+	}
+	return rs.WrapperBudget
+}
+
+// planTrack records that one more track download has been launched. trackDone
+// records one finishing (success or failure). Both are no-ops on a nil receiver
+// (CLI / flag-off), where the scheduler never reads the counts.
+func (rs *RipState) planTrack() {
+	if rs == nil {
+		return
+	}
+	rs.totalTracks.Add(1)
+}
+
+func (rs *RipState) trackDone() {
+	if rs == nil {
+		return
+	}
+	rs.doneTracks.Add(1)
+}
+
+// remainingTracks reports launched-but-not-yet-finished tracks. The scheduler
+// uses it for the head's lend-eligibility threshold. Zero on a nil receiver.
+func (rs *RipState) remainingTracks() int {
+	if rs == nil {
+		return 0
+	}
+	r := rs.totalTracks.Load() - rs.doneTracks.Load()
+	if r < 0 {
+		return 0
+	}
+	return int(r)
 }
 
 // --- progress factory ------------------------------------------------------

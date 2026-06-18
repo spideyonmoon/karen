@@ -1155,10 +1155,7 @@ func ripStation(albumId string, token string, storefront string, ctx context.Con
 		selected = arr
 	}
 
-	concurrency := len(Config.WrapperManagerAddrs)
-	if concurrency < 1 {
-		concurrency = 1
-	}
+	concurrency := rs.wrapperBudget()
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 	for i := range station.Tracks {
@@ -1168,9 +1165,11 @@ func ripStation(albumId string, token string, storefront string, ctx context.Con
 		}
 		trackIdx := i - 1
 		wg.Add(1)
+		rs.planTrack()
 		sem <- struct{}{}
 		go func(idx int) {
 			defer wg.Done()
+			defer rs.trackDone()
 			defer func() { <-sem }()
 			ripTrack(&station.Tracks[idx], token, ctx)
 		}(trackIdx)
@@ -1528,13 +1527,11 @@ func ripAlbum(albumId string, token string, storefront string, urlArg_i string, 
 		selected = album.ShowSelect()
 	}
 
-	// Run track downloads in parallel, one goroutine per pool slot.
-	// The semaphore (sem) limits concurrency to the number of wrapper-manager
-	// instances so we never have more goroutines contending than we have clients.
-	concurrency := len(Config.WrapperManagerAddrs)
-	if concurrency < 1 {
-		concurrency = 1
-	}
+	// Run track downloads in parallel, one goroutine per pool slot. The semaphore
+	// (sem) limits concurrency to this rip's wrapper budget — the full pool for the
+	// head (and for CLI / flag-off), a smaller k for a borrower — so we never hold
+	// more wrapper clients than granted.
+	concurrency := rs.wrapperBudget()
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 	for i := range album.Tracks {
@@ -1549,9 +1546,11 @@ func ripAlbum(albumId string, token string, storefront string, urlArg_i string, 
 		}
 		trackIdx := i - 1
 		wg.Add(1)
+		rs.planTrack()
 		sem <- struct{}{}
 		go func(idx int) {
 			defer wg.Done()
+			defer rs.trackDone()
 			defer func() { <-sem }()
 			ripTrack(&album.Tracks[idx], token, ctx)
 		}(trackIdx)
@@ -1764,10 +1763,7 @@ func ripPlaylist(playlistId string, token string, storefront string, forceAAC bo
 		selected = playlist.ShowSelect()
 	}
 
-	concurrency := len(Config.WrapperManagerAddrs)
-	if concurrency < 1 {
-		concurrency = 1
-	}
+	concurrency := rs.wrapperBudget()
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 	for i := range playlist.Tracks {
@@ -1782,9 +1778,11 @@ func ripPlaylist(playlistId string, token string, storefront string, forceAAC bo
 		}
 		trackIdx := i - 1
 		wg.Add(1)
+		rs.planTrack()
 		sem <- struct{}{}
 		go func(idx int) {
 			defer wg.Done()
+			defer rs.trackDone()
 			defer func() { <-sem }()
 			ripTrack(&playlist.Tracks[idx], token, ctx)
 		}(trackIdx)
