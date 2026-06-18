@@ -19,10 +19,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-go@v5
         with:
           # Read the exact Go version from the module so CI matches local.
           go-version-file: bot/go.mod
+
+          # Enable built-in caching
+          cache: true
+
+          # Crucial: Direct the cache to your subdirectory's checksum file
+          cache-dependency-path: bot/go.sum
+
       - name: go build
         working-directory: bot
         run: go build ./...

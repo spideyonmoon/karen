@@ -312,7 +312,11 @@ func (b *TelegramBot) enqueueAlbumDownloadChecked(chatID int64, albumID string, 
 	format := b.resolveFormat(chatID, forceFlac)
 	return b.enqueueDownloadWithAfter(chatID, userID, username, replyToID, 0, false, format, transferMode, albumID, false, func(ctx context.Context) error {
 		if forceAtmos {
-			dl_atmos = true
+			if rs := ripStateFrom(ctx); rs != nil {
+				rs.Atmos = true
+			} else {
+				dl_atmos = true
+			}
 		}
 		return ripAlbum(albumID, b.appleToken, Config.Storefront, "", forceAAC, ctx)
 	}, nil)

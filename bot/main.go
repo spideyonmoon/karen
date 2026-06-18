@@ -107,16 +107,25 @@ func loadConfig() error {
 	if Config.MVAudioType == "" {
 		Config.MVAudioType = "aac"
 	}
+	// Task-concurrency lend thresholds. These are read directly (no fallback) by
+	// the scheduler, so default them here: an unset BorrowerMaxTracks (0) would make
+	// `count >= max` always true and silently disable all borrowing. Inert when
+	// task-concurrency is off.
+	if Config.LendHeadRemainingThreshold <= 0 {
+		Config.LendHeadRemainingThreshold = 50
+	}
+	if Config.BorrowerMaxTracks <= 0 {
+		Config.BorrowerMaxTracks = 30
+	}
 	return nil
 }
 
-func recordDownloadedTrack(track *task.Track) {
+func recordDownloadedTrack(ctx context.Context, track *task.Track) {
 	if track == nil || track.SavePath == "" {
 		return
 	}
-	lastPathsMu.Lock()
-	lastDownloadedPaths = append(lastDownloadedPaths, track.SavePath)
-	lastPathsMu.Unlock()
+	rs := ripStateFrom(ctx)
+	rs.addPath(track.SavePath)
 	meta := AudioMeta{
 		TrackID:        strings.TrimSpace(track.ID),
 		Title:          strings.TrimSpace(track.Resp.Attributes.Name),
@@ -143,19 +152,17 @@ func recordDownloadedTrack(track *task.Track) {
 		}
 	}
 	if meta.Title != "" || meta.Performer != "" {
-		downloadedMetaMu.Lock()
-		downloadedMeta[track.SavePath] = meta
-		downloadedMetaMu.Unlock()
+		rs.putMeta(track.SavePath, meta)
 	}
 }
 
-func getDownloadedMeta(path string) (AudioMeta, bool) {
-	downloadedMetaMu.Lock()
-	defer downloadedMetaMu.Unlock()
-	meta, ok := downloadedMeta[path]
-	return meta, ok
+func getDownloadedMeta(ctx context.Context, path string) (AudioMeta, bool) {
+	return ripStateFrom(ctx).getMeta(path)
 }
 
+// clearDownloadState clears the package-global download state. It is only used by
+// the CLI single-shot path and the flag-off serial worker; per-rip state lives on
+// the RipState and is garbage-collected with the request, so nothing to clear there.
 func clearDownloadState() {
 	lastPathsMu.Lock()
 	lastDownloadedPaths = nil
@@ -172,34 +179,27 @@ func resetDownloadFailures() {
 	downloadFailureMu.Unlock()
 }
 
-func recordDownloadFailure(format string, args ...any) {
-	msg := strings.TrimSpace(fmt.Sprintf(format, args...))
-	if msg == "" {
-		return
-	}
-	downloadFailureMu.Lock()
-	defer downloadFailureMu.Unlock()
-	for _, existing := range lastDownloadFailures {
-		if existing == msg {
-			return
-		}
-	}
-	lastDownloadFailures = append(lastDownloadFailures, msg)
+func recordDownloadFailure(ctx context.Context, format string, args ...any) {
+	ripStateFrom(ctx).recordFailure(fmt.Sprintf(format, args...))
 }
 
-func downloadFailureSummary() string {
-	downloadFailureMu.Lock()
-	defer downloadFailureMu.Unlock()
-	if len(lastDownloadFailures) == 0 {
+func downloadFailureSummary(ctx context.Context) string {
+	return ripStateFrom(ctx).failureSummary()
+}
+
+// summarizeFailures renders up to the first 3 failure messages plus an overflow
+// count. Shared by the global and per-rip failure logs.
+func summarizeFailures(failures []string) string {
+	if len(failures) == 0 {
 		return ""
 	}
-	limit := len(lastDownloadFailures)
+	limit := len(failures)
 	if limit > 3 {
 		limit = 3
 	}
-	summary := strings.Join(lastDownloadFailures[:limit], "; ")
-	if len(lastDownloadFailures) > limit {
-		summary += fmt.Sprintf("; and %d more", len(lastDownloadFailures)-limit)
+	summary := strings.Join(failures[:limit], "; ")
+	if len(failures) > limit {
+		summary += fmt.Sprintf("; and %d more", len(failures)-limit)
 	}
 	return summary
 }
@@ -656,12 +656,12 @@ func handleSearch(searchType string, queryParts []string, token string) (string,
 	return selection.URL, nil
 }
 
-func convertIfNeeded(track *task.Track, lrc string, progress apputils.ProgressFunc) {
+func convertIfNeeded(cfg *structs.ConfigSet, track *task.Track, lrc string, progress apputils.ProgressFunc) {
 	coverPath := ""
-	if strings.EqualFold(Config.ConvertFormat, "flac") && track.SaveDir != "" {
+	if strings.EqualFold(cfg.ConvertFormat, "flac") && track.SaveDir != "" {
 		coverPath = findCoverFile(track.SaveDir)
 	}
-	apputils.ConvertIfNeeded(track, lrc, &Config, coverPath, progress)
+	apputils.ConvertIfNeeded(track, lrc, cfg, coverPath, progress)
 }
 
 func ripTrack(track *task.Track, token string, ctx context.Context) {
@@ -672,10 +672,13 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 		return
 	}
 	var err error
-	counter.Inc(&counter.Total)
+	rs := ripStateFrom(ctx)
+	ctr := rs.ctr()
+	cfg := rs.convertConfig()
+	ctr.Inc(&ctr.Total)
 	var trackProgress apputils.ProgressFunc
-	if activeProgressFactory != nil {
-		trackProgress = activeProgressFactory(track)
+	if tp := rs.progress(track); tp != nil {
+		trackProgress = tp
 		trackProgress("Preparing", 0, 0)
 		defer trackProgress("Finished", 0, 0)
 	}
@@ -689,22 +692,22 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 		err := mvDownloader(ctx, track.ID, track.SaveDir, token, track.Storefront, track, trackProgress)
 		if err != nil {
 			fmt.Println("\u26A0 Failed to dl MV:", err)
-			counter.Inc(&counter.Error)
+			ctr.Inc(&ctr.Error)
 			return
 		}
-		counter.Inc(&counter.Success)
+		ctr.Inc(&ctr.Success)
 		return
 	}
 
 	needDlAacLc := false
-	if (dl_aac || track.Codec == "AAC") && (Config.AacType == "aac-lc" || track.Codec == "AAC") {
+	if (rs.aac() || track.Codec == "AAC") && (Config.AacType == "aac-lc" || track.Codec == "AAC") {
 		needDlAacLc = true
 	}
 	if track.WebM3u8 == "" && !needDlAacLc {
-		if dl_atmos {
+		if rs.atmos() {
 			fmt.Println("Unavailable")
-			recordDownloadFailure("%s: Dolby Atmos is unavailable", track.Name)
-			counter.Inc(&counter.Unavailable)
+			recordDownloadFailure(ctx, "%s: Dolby Atmos is unavailable", track.Name)
+			ctr.Inc(&ctr.Unavailable)
 			return
 		}
 		fmt.Println("Unavailable, trying to dl aac-lc")
@@ -728,8 +731,8 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 		}
 		if err != nil {
 			fmt.Println("Failed to get AAC-LC playback URL:", err)
-			recordDownloadFailure("%s: AAC-LC WebPlayback failed: %v", track.Name, err)
-			counter.Inc(&counter.Unavailable)
+			recordDownloadFailure(ctx, "%s: AAC-LC WebPlayback failed: %v", track.Name, err)
+			ctr.Inc(&ctr.Unavailable)
 			return
 		}
 	} else {
@@ -747,24 +750,24 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 		}
 		if err != nil {
 			fmt.Println("Failed to get ALAC/Atmos playback URL:", err)
-			recordDownloadFailure("%s: ALAC/Atmos M3U8 failed: %v", track.Name, err)
-			counter.Inc(&counter.Unavailable)
+			recordDownloadFailure(ctx, "%s: ALAC/Atmos M3U8 failed: %v", track.Name, err)
+			ctr.Inc(&ctr.Unavailable)
 			return
 		}
 	}
 
 	var Quality string
-	if dl_atmos {
+	if rs.atmos() {
 		Quality = fmt.Sprintf("%dKbps", Config.AtmosMax-2000)
 	} else if needDlAacLc {
 		Quality = "256Kbps"
 	} else {
 		var variantURL string
-		variantURL, Quality, err = extractMedia(downloadM3u8, true)
+		variantURL, Quality, err = extractMedia(ctx, downloadM3u8, true)
 		if err != nil {
 			fmt.Println("Failed to extract quality from manifest.\n", err)
-			recordDownloadFailure("%s: failed to read quality from manifest: %v", track.Name, err)
-			counter.Inc(&counter.Error)
+			recordDownloadFailure(ctx, "%s: failed to read quality from manifest: %v", track.Name, err)
+			ctr.Inc(&ctr.Error)
 			return
 		}
 		if variantURL != "" {
@@ -809,13 +812,13 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 	lrcFilename := fmt.Sprintf("%s.%s", forbiddenNames.ReplaceAllString(songName, "_"), Config.LrcFormat)
 
 	var convertedPath string
-	conversionEnabled := Config.ConvertAfterDownload &&
-		Config.ConvertFormat != "" &&
-		strings.ToLower(Config.ConvertFormat) != "copy"
+	conversionEnabled := cfg.ConvertAfterDownload &&
+		cfg.ConvertFormat != "" &&
+		strings.ToLower(cfg.ConvertFormat) != "copy"
 	considerConverted := false
 	if conversionEnabled {
-		convertedPath = strings.TrimSuffix(trackPath, filepath.Ext(trackPath)) + "." + strings.ToLower(Config.ConvertFormat)
-		if !Config.ConvertKeepOriginal {
+		convertedPath = strings.TrimSuffix(trackPath, filepath.Ext(trackPath)) + "." + strings.ToLower(cfg.ConvertFormat)
+		if !cfg.ConvertKeepOriginal {
 			considerConverted = true
 		}
 	}
@@ -842,7 +845,7 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 		fmt.Println("Failed to check if track exists.")
 	}
 	// --no-cache: drop any cached copy so the checks below fall through to a fresh rip.
-	if dl_noCache {
+	if rs.noCache() {
 		if existsOriginal {
 			fmt.Println("--no-cache: removing existing track to re-rip fresh.")
 		}
@@ -863,17 +866,15 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 					track.SavePath = convertedPath
 					track.SaveName = filepath.Base(convertedPath)
 				} else {
-					convertIfNeeded(track, lrc, trackProgress)
+					convertIfNeeded(&cfg, track, lrc, trackProgress)
 				}
 			} else {
-				convertIfNeeded(track, lrc, trackProgress)
+				convertIfNeeded(&cfg, track, lrc, trackProgress)
 			}
 		}
-		recordDownloadedTrack(track)
-		counter.Inc(&counter.Success)
-		okDictMu.Lock()
-		okDict[track.PreID] = append(okDict[track.PreID], track.TaskNum)
-		okDictMu.Unlock()
+		recordDownloadedTrack(ctx, track)
+		ctr.Inc(&ctr.Success)
+		rs.markDone(track.PreID, track.TaskNum)
 		return
 	}
 	if considerConverted {
@@ -882,11 +883,9 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 			fmt.Println("Converted track already exists locally.")
 			track.SavePath = convertedPath
 			track.SaveName = filepath.Base(convertedPath)
-			recordDownloadedTrack(track)
-			counter.Inc(&counter.Success)
-			okDictMu.Lock()
-			okDict[track.PreID] = append(okDict[track.PreID], track.TaskNum)
-			okDictMu.Unlock()
+			recordDownloadedTrack(ctx, track)
+			ctr.Inc(&ctr.Success)
+			rs.markDone(track.PreID, track.TaskNum)
 			return
 		}
 	}
@@ -912,12 +911,12 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 	}
 	if err != nil {
 		fmt.Println("Failed to download/decrypt:", err)
-		recordDownloadFailure("%s: download/decrypt failed: %v", track.Name, err)
+		recordDownloadFailure(ctx, "%s: download/decrypt failed: %v", track.Name, err)
 		if strings.Contains(err.Error(), "Unavailable") {
-			counter.Inc(&counter.Unavailable)
+			ctr.Inc(&ctr.Unavailable)
 			return
 		}
-		counter.Inc(&counter.Error)
+		ctr.Inc(&ctr.Error)
 		return
 	}
 
@@ -933,14 +932,14 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 		)
 		if out, err := remuxCmd.CombinedOutput(); err != nil {
 			fmt.Printf("Failed to remux fMP4: %v. Output: %s\n", err, string(out))
-			recordDownloadFailure("%s: ffmpeg remux failed: %v, output: %s", track.Name, err, string(out))
-			counter.Inc(&counter.Error)
+			recordDownloadFailure(ctx, "%s: ffmpeg remux failed: %v, output: %s", track.Name, err, string(out))
+			ctr.Inc(&ctr.Error)
 			return
 		}
 		if err := os.Rename(remuxPath, trackPath); err != nil {
 			fmt.Println("Failed to replace with remuxed file:", err)
-			recordDownloadFailure("%s: rename failed: %v", track.Name, err)
-			counter.Inc(&counter.Error)
+			recordDownloadFailure(ctx, "%s: rename failed: %v", track.Name, err)
+			ctr.Inc(&ctr.Error)
 			return
 		}
 	}
@@ -959,8 +958,8 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 	err = writeMP4Tags(track, lrc)
 	if err != nil {
 		fmt.Println("\u26A0 Failed to write tags in media:", err)
-		recordDownloadFailure("%s: failed to write MP4 tags: %v", track.Name, err)
-		counter.Inc(&counter.Unavailable)
+		recordDownloadFailure(ctx, "%s: failed to write MP4 tags: %v", track.Name, err)
+		ctr.Inc(&ctr.Unavailable)
 		return
 	}
 
@@ -969,19 +968,19 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 		_ = os.Remove(track.CoverPath)
 	}
 
-	convertIfNeeded(track, lrc, trackProgress)
+	convertIfNeeded(&cfg, track, lrc, trackProgress)
 
-	recordDownloadedTrack(track)
-	counter.Inc(&counter.Success)
-	okDictMu.Lock()
-	okDict[track.PreID] = append(okDict[track.PreID], track.TaskNum)
-	okDictMu.Unlock()
+	recordDownloadedTrack(ctx, track)
+	ctr.Inc(&ctr.Success)
+	rs.markDone(track.PreID, track.TaskNum)
 }
 
 func ripStation(albumId string, token string, storefront string, ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	rs := ripStateFrom(ctx)
+	ctr := rs.ctr()
 	station := task.NewStation(storefront, albumId)
 	err := station.GetResp(Config.MediaUserToken, token, Config.Language)
 	if err != nil {
@@ -998,9 +997,9 @@ func ripStation(albumId string, token string, storefront string, ctx context.Con
 	}
 
 	var Codec string
-	if dl_atmos {
+	if rs.atmos() {
 		Codec = "ATMOS"
-	} else if dl_aac {
+	} else if rs.aac() {
 		Codec = "AAC"
 	} else {
 		Codec = "ALAC"
@@ -1020,10 +1019,10 @@ func ripStation(albumId string, token string, storefront string, ctx context.Con
 		fmt.Println(singerFoldername)
 	}
 	singerFolder := filepath.Join(Config.AlacSaveFolder, forbiddenNames.ReplaceAllString(singerFoldername, "_"))
-	if dl_atmos {
+	if rs.atmos() {
 		singerFolder = filepath.Join(Config.AtmosSaveFolder, forbiddenNames.ReplaceAllString(singerFoldername, "_"))
 	}
-	if dl_aac {
+	if rs.aac() {
 		singerFolder = filepath.Join(Config.AacSaveFolder, forbiddenNames.ReplaceAllString(singerFoldername, "_"))
 	}
 	os.MkdirAll(singerFolder, os.ModePerm)
@@ -1084,9 +1083,9 @@ func ripStation(albumId string, token string, storefront string, ctx context.Con
 		}
 	}
 	if station.Type == "stream" {
-		counter.Total++
-		if isInArray(okDict[station.ID], 1) {
-			counter.Success++
+		ctr.Total++
+		if rs.isDone(station.ID, 1) {
+			ctr.Success++
 			return nil
 		}
 		songName := strings.NewReplacer(
@@ -1104,8 +1103,8 @@ func ripStation(albumId string, token string, storefront string, ctx context.Con
 		trackPath := filepath.Join(playlistFolderPath, fmt.Sprintf("%s.m4a", forbiddenNames.ReplaceAllString(songName, "_")))
 		exists, _ := fileExists(trackPath)
 		if exists {
-			counter.Success++
-			okDict[station.ID] = append(okDict[station.ID], 1)
+			ctr.Success++
+			rs.markDone(station.ID, 1)
 
 			fmt.Println("Radio already exists locally.")
 			return nil
@@ -1113,7 +1112,7 @@ func ripStation(albumId string, token string, storefront string, ctx context.Con
 		assetsUrl, _, err := ampapi.GetStationAssetsUrlAndServerUrl(station.ID, Config.MediaUserToken, token)
 		if err != nil {
 			fmt.Println("Failed to get station assets url.", err)
-			counter.Error++
+			ctr.Error++
 			return err
 		}
 		trackM3U8 := strings.ReplaceAll(assetsUrl, "index.m3u8", "256/prog_index.m3u8")
@@ -1122,7 +1121,7 @@ func ripStation(albumId string, token string, storefront string, ctx context.Con
 		wmPool.Release(wm)
 		if err != nil {
 			fmt.Println("Failed to download station stream.", err)
-			counter.Error++
+			ctr.Error++
 			return err
 		}
 		tags := []string{
@@ -1144,8 +1143,8 @@ func ripStation(albumId string, token string, storefront string, ctx context.Con
 		if err := cmd.Run(); err != nil {
 			fmt.Printf("Embed failed: %v\n", err)
 		}
-		counter.Success++
-		okDict[station.ID] = append(okDict[station.ID], 1)
+		ctr.Success++
+		rs.markDone(station.ID, 1)
 		return nil
 	}
 
@@ -1166,10 +1165,7 @@ func ripStation(albumId string, token string, storefront string, ctx context.Con
 		selected = arr
 	}
 
-	concurrency := len(Config.WrapperManagerAddrs)
-	if concurrency < 1 {
-		concurrency = 1
-	}
+	concurrency := rs.wrapperBudget()
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 	for i := range station.Tracks {
@@ -1179,9 +1175,11 @@ func ripStation(albumId string, token string, storefront string, ctx context.Con
 		}
 		trackIdx := i - 1
 		wg.Add(1)
+		rs.planTrack()
 		sem <- struct{}{}
 		go func(idx int) {
 			defer wg.Done()
+			defer rs.trackDone()
 			defer func() { <-sem }()
 			ripTrack(&station.Tracks[idx], token, ctx)
 		}(trackIdx)
@@ -1283,7 +1281,7 @@ func ripArtwork(link string, token string, storefront string, ctx context.Contex
 	if err != nil {
 		return fmt.Errorf("failed to download cover: %w", err)
 	}
-	lastDownloadedPaths = append(lastDownloadedPaths, coverPath)
+	ripStateFrom(ctx).addPath(coverPath)
 
 	// Motion artwork is best-effort; its absence (or a muxing failure) is not fatal.
 	if motionURL != "" {
@@ -1295,7 +1293,7 @@ func ripArtwork(link string, token string, storefront string, ctx context.Contex
 			if err := cmd.Run(); err != nil {
 				fmt.Printf("animated artwork download failed: %v\n", err)
 			} else {
-				lastDownloadedPaths = append(lastDownloadedPaths, motionPath)
+				ripStateFrom(ctx).addPath(motionPath)
 			}
 		}
 	}
@@ -1306,6 +1304,8 @@ func ripAlbum(albumId string, token string, storefront string, urlArg_i string, 
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	rs := ripStateFrom(ctx)
+	ctr := rs.ctr()
 	album := task.NewAlbum(storefront, albumId)
 	err := album.GetResp(token, Config.Language)
 	if err != nil {
@@ -1333,7 +1333,7 @@ func ripAlbum(albumId string, token string, storefront string, urlArg_i string, 
 				m3u8Url = manifest.Data[0].Attributes.ExtendedAssetUrls.EnhancedHls
 			}
 
-			_, _, err = extractMedia(m3u8Url, true)
+			_, _, err = extractMedia(ctx, m3u8Url, true)
 			if err != nil {
 				fmt.Printf("Failed to extract quality info for track %d: %v\n", trackNum, err)
 				continue
@@ -1342,9 +1342,9 @@ func ripAlbum(albumId string, token string, storefront string, urlArg_i string, 
 		return nil
 	}
 	var Codec string
-	if dl_atmos {
+	if rs.atmos() {
 		Codec = "ATMOS"
-	} else if dl_aac || forceAAC {
+	} else if rs.aac() || forceAAC {
 		Codec = "AAC"
 	} else {
 		Codec = "ALAC"
@@ -1372,18 +1372,18 @@ func ripAlbum(albumId string, token string, storefront string, urlArg_i string, 
 		fmt.Println(singerFoldername)
 	}
 	singerFolder := filepath.Join(Config.AlacSaveFolder, forbiddenNames.ReplaceAllString(singerFoldername, "_"))
-	if dl_atmos {
+	if rs.atmos() {
 		singerFolder = filepath.Join(Config.AtmosSaveFolder, forbiddenNames.ReplaceAllString(singerFoldername, "_"))
-	} else if dl_aac || forceAAC {
+	} else if rs.aac() || forceAAC {
 		singerFolder = filepath.Join(Config.AacSaveFolder, forbiddenNames.ReplaceAllString(singerFoldername, "_"))
 	}
 	os.MkdirAll(singerFolder, os.ModePerm)
 	album.SaveDir = singerFolder
 	var Quality string
 	if strings.Contains(Config.AlbumFolderFormat, "Quality") {
-		if dl_atmos {
+		if rs.atmos() {
 			Quality = fmt.Sprintf("%dKbps", Config.AtmosMax-2000)
-		} else if (dl_aac || forceAAC) && (Config.AacType == "aac-lc" || forceAAC) {
+		} else if (rs.aac() || forceAAC) && (Config.AacType == "aac-lc" || forceAAC) {
 			Quality = "256Kbps"
 		} else {
 			manifest1, err := ampapi.GetSongResp(storefront, meta.Data[0].Relationships.Tracks.Data[0].ID, album.Language, token)
@@ -1394,7 +1394,7 @@ func ripAlbum(albumId string, token string, storefront string, urlArg_i string, 
 					Codec = "AAC"
 					Quality = "256Kbps"
 				} else {
-					_, Quality, err = extractMedia(manifest1.Data[0].Attributes.ExtendedAssetUrls.EnhancedHls, true)
+					_, Quality, err = extractMedia(ctx, manifest1.Data[0].Attributes.ExtendedAssetUrls.EnhancedHls, true)
 					if err != nil {
 						fmt.Println("Failed to extract quality from manifest.\n", err)
 					}
@@ -1517,7 +1517,7 @@ func ripAlbum(albumId string, token string, storefront string, urlArg_i string, 
 		arr[i] = i + 1
 	}
 
-	if dl_song {
+	if rs.song() {
 		if urlArg_i == "" {
 		} else {
 			for i := range album.Tracks {
@@ -1531,29 +1531,24 @@ func ripAlbum(albumId string, token string, storefront string, urlArg_i string, 
 		return nil
 	}
 	var selected []int
-	if !dl_select {
+	if !rs.selectMode() {
 		selected = arr
 	} else {
 		selected = album.ShowSelect()
 	}
 
-	// Run track downloads in parallel, one goroutine per pool slot.
-	// The semaphore (sem) limits concurrency to the number of wrapper-manager
-	// instances so we never have more goroutines contending than we have clients.
-	concurrency := len(Config.WrapperManagerAddrs)
-	if concurrency < 1 {
-		concurrency = 1
-	}
+	// Run track downloads in parallel, one goroutine per pool slot. The semaphore
+	// (sem) limits concurrency to this rip's wrapper budget — the full pool for the
+	// head (and for CLI / flag-off), a smaller k for a borrower — so we never hold
+	// more wrapper clients than granted.
+	concurrency := rs.wrapperBudget()
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 	for i := range album.Tracks {
 		i++
-		okDictMu.Lock()
-		alreadyDone := isInArray(okDict[albumId], i)
-		okDictMu.Unlock()
-		if alreadyDone {
-			counter.Inc(&counter.Total)
-			counter.Inc(&counter.Success)
+		if rs.isDone(albumId, i) {
+			ctr.Inc(&ctr.Total)
+			ctr.Inc(&ctr.Success)
 			continue
 		}
 		if !isInArray(selected, i) {
@@ -1561,9 +1556,11 @@ func ripAlbum(albumId string, token string, storefront string, urlArg_i string, 
 		}
 		trackIdx := i - 1
 		wg.Add(1)
+		rs.planTrack()
 		sem <- struct{}{}
 		go func(idx int) {
 			defer wg.Done()
+			defer rs.trackDone()
 			defer func() { <-sem }()
 			ripTrack(&album.Tracks[idx], token, ctx)
 		}(trackIdx)
@@ -1576,6 +1573,8 @@ func ripPlaylist(playlistId string, token string, storefront string, forceAAC bo
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	rs := ripStateFrom(ctx)
+	ctr := rs.ctr()
 	playlist := task.NewPlaylist(storefront, playlistId)
 	err := playlist.GetResp(token, Config.Language)
 	if err != nil {
@@ -1603,7 +1602,7 @@ func ripPlaylist(playlistId string, token string, storefront string, forceAAC bo
 				m3u8Url = manifest.Data[0].Attributes.ExtendedAssetUrls.EnhancedHls
 			}
 
-			_, _, err = extractMedia(m3u8Url, true)
+			_, _, err = extractMedia(ctx, m3u8Url, true)
 			if err != nil {
 				fmt.Printf("Failed to extract quality info for track %d: %v\n", trackNum, err)
 				continue
@@ -1612,9 +1611,9 @@ func ripPlaylist(playlistId string, token string, storefront string, forceAAC bo
 		return nil
 	}
 	var Codec string
-	if dl_atmos {
+	if rs.atmos() {
 		Codec = "ATMOS"
-	} else if dl_aac || forceAAC {
+	} else if rs.aac() || forceAAC {
 		Codec = "AAC"
 	} else {
 		Codec = "ALAC"
@@ -1634,9 +1633,9 @@ func ripPlaylist(playlistId string, token string, storefront string, forceAAC bo
 		fmt.Println(singerFoldername)
 	}
 	singerFolder := filepath.Join(Config.AlacSaveFolder, forbiddenNames.ReplaceAllString(singerFoldername, "_"))
-	if dl_atmos {
+	if rs.atmos() {
 		singerFolder = filepath.Join(Config.AtmosSaveFolder, forbiddenNames.ReplaceAllString(singerFoldername, "_"))
-	} else if dl_aac || forceAAC {
+	} else if rs.aac() || forceAAC {
 		singerFolder = filepath.Join(Config.AacSaveFolder, forbiddenNames.ReplaceAllString(singerFoldername, "_"))
 	}
 	os.MkdirAll(singerFolder, os.ModePerm)
@@ -1644,9 +1643,9 @@ func ripPlaylist(playlistId string, token string, storefront string, forceAAC bo
 
 	var Quality string
 	if strings.Contains(Config.AlbumFolderFormat, "Quality") {
-		if dl_atmos {
+		if rs.atmos() {
 			Quality = fmt.Sprintf("%dKbps", Config.AtmosMax-2000)
-		} else if (dl_aac || forceAAC) && (Config.AacType == "aac-lc" || forceAAC) {
+		} else if (rs.aac() || forceAAC) && (Config.AacType == "aac-lc" || forceAAC) {
 			Quality = "256Kbps"
 		} else {
 			manifest1, err := ampapi.GetSongResp(storefront, meta.Data[0].Relationships.Tracks.Data[0].ID, playlist.Language, token)
@@ -1657,7 +1656,7 @@ func ripPlaylist(playlistId string, token string, storefront string, forceAAC bo
 					Codec = "AAC"
 					Quality = "256Kbps"
 				} else {
-					_, Quality, err = extractMedia(manifest1.Data[0].Attributes.ExtendedAssetUrls.EnhancedHls, true)
+					_, Quality, err = extractMedia(ctx, manifest1.Data[0].Attributes.ExtendedAssetUrls.EnhancedHls, true)
 					if err != nil {
 						fmt.Println("Failed to extract quality from manifest.\n", err)
 					}
@@ -1768,26 +1767,20 @@ func ripPlaylist(playlistId string, token string, storefront string, forceAAC bo
 	}
 	var selected []int
 
-	if !dl_select {
+	if !rs.selectMode() {
 		selected = arr
 	} else {
 		selected = playlist.ShowSelect()
 	}
 
-	concurrency := len(Config.WrapperManagerAddrs)
-	if concurrency < 1 {
-		concurrency = 1
-	}
+	concurrency := rs.wrapperBudget()
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 	for i := range playlist.Tracks {
 		i++
-		okDictMu.Lock()
-		alreadyDone := isInArray(okDict[playlistId], i)
-		okDictMu.Unlock()
-		if alreadyDone {
-			counter.Inc(&counter.Total)
-			counter.Inc(&counter.Success)
+		if rs.isDone(playlistId, i) {
+			ctr.Inc(&ctr.Total)
+			ctr.Inc(&ctr.Success)
 			continue
 		}
 		if !isInArray(selected, i) {
@@ -1795,9 +1788,11 @@ func ripPlaylist(playlistId string, token string, storefront string, forceAAC bo
 		}
 		trackIdx := i - 1
 		wg.Add(1)
+		rs.planTrack()
 		sem <- struct{}{}
 		go func(idx int) {
 			defer wg.Done()
+			defer rs.trackDone()
 			defer func() { <-sem }()
 			ripTrack(&playlist.Tracks[idx], token, ctx)
 		}(trackIdx)
@@ -2119,7 +2114,7 @@ func mvDownloader(ctx context.Context, adamID string, saveDir string, token stri
 	fmt.Println(MVInfo.Data[0].Attributes.Name)
 
 	exists, _ := fileExists(mvOutPath)
-	if dl_noCache && exists {
+	if ripStateFrom(ctx).noCache() && exists {
 		fmt.Println("--no-cache: removing existing MV to re-rip fresh.")
 		_ = os.Remove(mvOutPath)
 		exists = false
@@ -2236,7 +2231,8 @@ func mvDownloader(ctx context.Context, adamID string, saveDir string, token stri
 
 	// Register the muxed MV so the Telegram delivery layer can find it the same way
 	// it finds audio tracks (recordDownloadedTrack). Harmless for the CLI path.
-	lastDownloadedPaths = append(lastDownloadedPaths, mvOutPath)
+	rs := ripStateFrom(ctx)
+	rs.addPath(mvOutPath)
 	mvMeta := AudioMeta{
 		TrackID:        strings.TrimSpace(adamID),
 		Title:          strings.TrimSpace(MVInfo.Data[0].Attributes.Name),
@@ -2248,9 +2244,7 @@ func mvDownloader(ctx context.Context, adamID string, saveDir string, token stri
 		Codec:          "MV",
 	}
 	if mvMeta.Title != "" || mvMeta.Performer != "" {
-		downloadedMetaMu.Lock()
-		downloadedMeta[mvOutPath] = mvMeta
-		downloadedMetaMu.Unlock()
+		rs.putMeta(mvOutPath, mvMeta)
 	}
 	return nil
 }
@@ -2356,7 +2350,8 @@ func formatAvailability(available bool, quality string) string {
 	return quality
 }
 
-func extractMedia(b string, more_mode bool) (string, string, error) {
+func extractMedia(ctx context.Context, b string, more_mode bool) (string, string, error) {
+	rs := ripStateFrom(ctx)
 	masterUrl, err := url.Parse(b)
 	if err != nil {
 		return "", "", err
@@ -2470,7 +2465,7 @@ func extractMedia(b string, more_mode bool) (string, string, error) {
 	}
 	var Quality string
 	for _, variant := range master.Variants {
-		if dl_atmos {
+		if rs.atmos() {
 			if variant.Codecs == "ec-3" && strings.Contains(variant.Audio, "atmos") {
 				if debug_mode && !more_mode {
 					fmt.Printf("Debug: Found Dolby Atmos variant - %s (Bitrate: %d Kbps)\n",
@@ -2508,7 +2503,7 @@ func extractMedia(b string, more_mode bool) (string, string, error) {
 				Quality = fmt.Sprintf("%s Kbps", split[len(split)-1])
 				break
 			}
-		} else if dl_aac {
+		} else if rs.aac() {
 			if variant.Codecs == "mp4a.40.2" {
 				if debug_mode && !more_mode {
 					fmt.Printf("Debug: Found AAC variant - %s (Bitrate: %d)\n", variant.Audio, variant.Bandwidth)
@@ -2644,7 +2639,11 @@ func ripSong(songId string, token string, storefront string, forceAAC bool, ctx 
 	albumId := songData.Relationships.Albums.Data[0].ID
 
 	// Use album approach but only download the specific song
-	dl_song = true
+	if rs := ripStateFrom(ctx); rs != nil {
+		rs.Song = true
+	} else {
+		dl_song = true
+	}
 	err = ripAlbum(albumId, token, storefront, songId, forceAAC, ctx)
 	if err != nil {
 		fmt.Println("Failed to rip song:", err)
@@ -2746,17 +2745,17 @@ func buildAlbumTrackFromSongData(song ampapi.SongRespData, album *task.Album, al
 func ripAlbumSongFallback(album *task.Album, songID string, token string, storefront string, albumFolderPath string, coverPath string, codec string, forceAAC bool, ctx context.Context) error {
 	manifest, err := ampapi.GetSongResp(storefront, songID, album.Language, token)
 	if err != nil {
-		recordDownloadFailure("song %s: failed to fetch direct song metadata: %v", songID, err)
+		recordDownloadFailure(ctx, "song %s: failed to fetch direct song metadata: %v", songID, err)
 		return err
 	}
 	if manifest == nil || len(manifest.Data) == 0 {
 		err := fmt.Errorf("empty song response for %s", songID)
-		recordDownloadFailure("song %s: %v", songID, err)
+		recordDownloadFailure(ctx, "song %s: %v", songID, err)
 		return err
 	}
 	track, err := buildAlbumTrackFromSongData(manifest.Data[0], album, albumFolderPath, coverPath, codec)
 	if err != nil {
-		recordDownloadFailure("song %s: failed to build direct download metadata: %v", songID, err)
+		recordDownloadFailure(ctx, "song %s: failed to build direct download metadata: %v", songID, err)
 		return err
 	}
 	fmt.Println("Song was not found in album track list, downloading by song metadata.")

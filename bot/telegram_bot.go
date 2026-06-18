@@ -124,7 +124,21 @@ type TelegramBot struct {
 	inProgress    bool
 	userTaskCount map[int64]int
 	activeReq     *downloadRequest
-	activeStatus  *DownloadStatus // live status board for the running task; nil when idle
+
+	// Task-concurrency scheduler state (guarded by queueMu; only used when
+	// Config.TaskConcurrency is on). schedHeadRip/schedHeadMode describe the head
+	// that is currently in its download phase, which the scheduler reads to decide
+	// whether to lend. schedBorrowReq holds the single sticky borrower (nil when
+	// the borrow slot is free); the slot is non-preemptive — once filled it stays
+	// filled until that borrower finishes.
+	schedHeadRip   *RipState
+	schedHeadMode  string
+	schedBorrowReq *downloadRequest
+	// activeBoards is the live status board for every running task, keyed by
+	// taskID (guarded by queueMu). Under task concurrency the head and the sticky
+	// borrower each register their own board, so /status can resurface all of
+	// them; on the serial path it only ever holds one entry. Empty when idle.
+	activeBoards map[string]*DownloadStatus
 	// idleStatus* track the single board shown by /status when nothing is running,
 	// so each /status replaces the previous one instead of stacking messages.
 	idleStatusMsgID  int
@@ -201,6 +215,19 @@ type downloadRequest struct {
 	cancel          context.CancelFunc
 	statusMessageID int
 	startedAt       time.Time
+
+	// Task-concurrency scheduling (only set when Config.TaskConcurrency is on).
+	// rip is the per-rip state the scheduler builds up front so it can read this
+	// task's live remaining-track count and hand a borrower its wrapper budget;
+	// runDownload uses it instead of building its own. onDownloadComplete fires
+	// once, the moment the download phase ends (before delivery), so the scheduler
+	// can free the head slot and promote the next task while this one uploads.
+	rip                *RipState
+	onDownloadComplete func()
+	// peekedTracks caches this request's track count from the scheduler's lend
+	// check so a large, ineligible front isn't re-fetched on every tick. 0 means
+	// "not yet peeked"; -1 means "peek failed / not a track album".
+	peekedTracks int
 }
 
 func generateTaskID() string {
@@ -505,6 +532,7 @@ func newTelegramBot(token, appleToken string) *TelegramBot {
 		pendingTransfers: make(map[int64]*PendingTransfer),
 		downloadQueue:    make(chan *downloadRequest, defaultQueueSize),
 		userTaskCount:    make(map[int64]int),
+		activeBoards:     make(map[string]*DownloadStatus),
 		cacheFile:        Config.TelegramCacheFile,
 		cache:            make(map[string]CachedAudio),
 		docCache:         make(map[string]CachedDocument),
@@ -625,6 +653,12 @@ func (b *TelegramBot) loop() {
 }
 
 func (b *TelegramBot) startDownloadWorker() {
+	if Config.TaskConcurrency {
+		go b.scheduleDownloads()
+		return
+	}
+	// Strictly serial worker — one rip at a time, download then upload inline.
+	// This is the historical behavior, kept byte-identical for the flag-off path.
 	go func() {
 		for req := range b.downloadQueue {
 			b.queueMu.Lock()
@@ -648,6 +682,206 @@ func (b *TelegramBot) startDownloadWorker() {
 			b.queueMu.Unlock()
 		}
 	}()
+}
+
+// scheduleDownloads is the task-concurrency worker (Config.TaskConcurrency on).
+// A single scheduler goroutine promotes one head at a time from the queue and,
+// while that head is downloading, may lend part of the wrapper pool to one
+// sticky borrower pulled from the front of the queue. The head runs with the
+// full pool; its delivery (upload) runs detached so the next head is promoted
+// the moment the head's *download* finishes. Telegram uploads are serialized by
+// the upload gate (Phase 1); Gofile uploads stay concurrent.
+func (b *TelegramBot) scheduleDownloads() {
+	for req := range b.downloadQueue {
+		headDone := b.startTask(req, false, 0)
+
+		// While the head downloads, periodically try to launch one borrower.
+		ticker := time.NewTicker(2 * time.Second)
+	wait:
+		for {
+			select {
+			case <-headDone:
+				break wait
+			case <-ticker.C:
+				b.tryLendToBorrower()
+			}
+		}
+		ticker.Stop()
+		// Head download finished. Loop to promote the next head; the head's
+		// delivery and any borrower keep running in their own goroutines.
+	}
+}
+
+// startTask builds the per-rip state, registers the task as head or borrower,
+// and launches its rip goroutine. It returns a channel closed once the task's
+// download phase completes (used by the scheduler to gate head promotion). For a
+// borrower, budget is the granted wrapper count k; for a head, budget 0 means
+// the full pool.
+func (b *TelegramBot) startTask(req *downloadRequest, borrower bool, budget int) <-chan struct{} {
+	rip := newRipState()
+	rip.NoCache = req.noCache
+	rip.Song = req.single
+	rip.WrapperBudget = budget
+	req.rip = rip
+
+	done := make(chan struct{})
+	var once sync.Once
+	req.onDownloadComplete = func() { once.Do(func() { close(done) }) }
+
+	b.queueMu.Lock()
+	req.startedAt = time.Now()
+	b.removeQueuedReqLocked(req.taskID)
+	if borrower {
+		b.schedBorrowReq = req
+	} else {
+		b.inProgress = true
+		b.activeReq = req
+		b.schedHeadRip = rip
+		b.schedHeadMode = req.transferMode
+	}
+	b.queueMu.Unlock()
+
+	go func() {
+		b.runDownload(req)
+		if req.after != nil {
+			req.after()
+		}
+		// Guarantee the head channel is closed even if the rip returned before the
+		// download phase reported completion (e.g. an early error path).
+		req.onDownloadComplete()
+
+		b.queueMu.Lock()
+		if borrower {
+			if b.schedBorrowReq == req {
+				b.schedBorrowReq = nil
+			}
+		} else {
+			// Only clear head state if a newer head hasn't already taken over (the
+			// next head is promoted at download-done, while this one still uploads).
+			if b.activeReq == req {
+				b.activeReq = nil
+				b.inProgress = false
+			}
+			if b.schedHeadRip == rip {
+				b.schedHeadRip = nil
+				b.schedHeadMode = ""
+			}
+		}
+		if req.userID != 0 && b.userTaskCount[req.userID] > 0 {
+			b.userTaskCount[req.userID]--
+		}
+		b.queueMu.Unlock()
+	}()
+
+	return done
+}
+
+// tryLendToBorrower checks the lend rules and, if met, promotes the front queued
+// task to the single sticky borrower slot. Rules (all required):
+//   - the borrow slot is free (non-preemptive: a held slot is never reassigned),
+//   - the head is a Telegram delivery whose remaining tracks exceed the threshold,
+//   - the front queued task is a Gofile rip whose total tracks are under the max.
+//
+// The lend amount k scales with the borrower's size (small → 1, larger → 2).
+func (b *TelegramBot) tryLendToBorrower() {
+	b.queueMu.Lock()
+	if b.schedBorrowReq != nil { // slot occupied — non-preemptive
+		b.queueMu.Unlock()
+		return
+	}
+	headRip := b.schedHeadRip
+	headMode := b.schedHeadMode
+	// Peek the front of the queue via the display mirror, which tracks the channel
+	// order in lockstep. We only consume it from the channel once it qualifies.
+	var cand *downloadRequest
+	if len(b.queuedReqs) > 0 {
+		cand = b.queuedReqs[0]
+	}
+	b.queueMu.Unlock()
+
+	if headRip == nil || cand == nil {
+		return
+	}
+	if !isTelegramDeliveryMode(headMode) || headRip.remainingTracks() <= Config.LendHeadRemainingThreshold {
+		return
+	}
+	if cand.transferMode != transferModeGofileZip {
+		return // borrower must be a Gofile rip; don't skip ahead of it for head order
+	}
+	// Track count, cached on the request so an ineligible front isn't re-fetched
+	// every tick.
+	count := cand.peekedTracks
+	if count == 0 {
+		if c, ok := b.peekTrackCount(cand); ok {
+			count = c
+		} else {
+			count = -1
+		}
+		cand.peekedTracks = count
+	}
+	if count <= 0 || count >= Config.BorrowerMaxTracks {
+		return
+	}
+	k := 1
+	if count > Config.BorrowerMaxTracks/2 {
+		k = 2
+	}
+
+	// Qualified — consume the candidate from the channel under the lock (so we
+	// don't race /stop's queue drain), re-validating that the slot is still free
+	// and cand is still the front, then launch it as the borrower.
+	b.queueMu.Lock()
+	if b.schedBorrowReq != nil || len(b.queuedReqs) == 0 || b.queuedReqs[0].taskID != cand.taskID {
+		b.queueMu.Unlock()
+		return
+	}
+	var got *downloadRequest
+	select {
+	case got = <-b.downloadQueue:
+	default:
+		b.queueMu.Unlock()
+		return
+	}
+	if got.taskID != cand.taskID {
+		// Ordering drifted (should not happen with a single consumer); put it back
+		// and bail rather than borrow the wrong task.
+		b.downloadQueue <- got
+		b.queueMu.Unlock()
+		return
+	}
+	b.queueMu.Unlock()
+	b.startTask(got, true, k)
+}
+
+// isTelegramDeliveryMode reports whether mode delivers tracks as Telegram audio
+// (individual or zip) — the only head modes eligible to lend pool to a borrower.
+func isTelegramDeliveryMode(mode string) bool {
+	return mode == transferModeTelegramIndividual || mode == transferModeTelegramZip
+}
+
+// peekTrackCount returns the number of tracks a queued album/playlist rip will
+// download, fetching its metadata. The album/playlist responses follow Apple's
+// pagination, so the returned slice holds every track. Returns ok=false for
+// station/MV/artwork requests (not track-album borrowers) or on fetch failure.
+func (b *TelegramBot) peekTrackCount(req *downloadRequest) (int, bool) {
+	id := req.albumID
+	lang := b.searchLanguage()
+	switch {
+	case strings.HasPrefix(id, "pl."):
+		resp, err := ampapi.GetPlaylistResp(Config.Storefront, id, lang, b.appleToken)
+		if err != nil || resp == nil || len(resp.Data) == 0 {
+			return 0, false
+		}
+		return len(resp.Data[0].Relationships.Tracks.Data), true
+	case id != "":
+		resp, err := ampapi.GetAlbumResp(Config.Storefront, id, lang, b.appleToken)
+		if err != nil || resp == nil || len(resp.Data) == 0 {
+			return 0, false
+		}
+		return len(resp.Data[0].Relationships.Tracks.Data), true
+	default:
+		return 0, false
+	}
 }
 
 func normalizeTelegramFormat(format string) string {
@@ -1193,18 +1427,32 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args
 	case "start", "help":
 		_, _ = b.sendRichMessage(chatID, botHelpRich(), botHelpText(), nil, replyToID)
 	case "status", "queue":
-		b.queueMu.Lock()
-		active := b.activeStatus
-		inProgress := b.inProgress
-		b.queueMu.Unlock()
+		// Split active boards into this chat's and others'. Boards in this chat are
+		// resurfaced (each dropped + re-sent at the bottom); active tasks living in
+		// other chats get a plain snapshot here without disturbing their live board.
+		var mine, others []*DownloadStatus
+		for _, s := range b.activeBoardsSnapshot() {
+			if s.chatID == chatID {
+				mine = append(mine, s)
+			} else {
+				others = append(others, s)
+			}
+		}
 		switch {
-		case inProgress && active != nil && active.chatID == chatID:
-			// Single board: drop the old message and resurface it at the bottom.
-			active.Relocate(replyToID)
-		case inProgress && active != nil:
-			// Active task lives in another chat — give this chat a plain snapshot
-			// without disturbing the live board.
-			_ = b.sendMessageWithReply(chatID, active.RenderSnapshot(), nil, replyToID)
+		case len(mine) > 0:
+			for _, s := range mine {
+				s.Relocate(replyToID)
+			}
+		case len(others) > 0:
+			var sb strings.Builder
+			for i, s := range others {
+				if i > 0 {
+					sb.WriteString("\n\n")
+				}
+				sb.WriteString(s.RenderSnapshotBare())
+			}
+			sb.WriteString(b.queueBoardSuffix())
+			_ = b.sendMessageWithReply(chatID, sb.String(), nil, replyToID)
 		default:
 			// Idle: keep exactly one board, replacing any previous /status message.
 			b.replaceIdleStatusBoard(chatID, replyToID, "📊 Karen Status Board\n\nNo active tasks."+b.queueBoardSuffix())
@@ -1807,7 +2055,11 @@ func (b *TelegramBot) enqueueAlbumDownload(chatID int64, albumID string, replyTo
 	format := b.resolveFormat(chatID, forceFlac)
 	b.enqueueDownload(chatID, userID, username, replyToID, statusMessageID, false, format, transferMode, albumID, noCache, func(ctx context.Context) error {
 		if forceAtmos {
-			dl_atmos = true
+			if rs := ripStateFrom(ctx); rs != nil {
+				rs.Atmos = true
+			} else {
+				dl_atmos = true
+			}
 		}
 		return ripAlbum(albumID, b.appleToken, Config.Storefront, "", forceAAC, ctx)
 	})
@@ -1821,15 +2073,20 @@ func (b *TelegramBot) enqueuePlaylistDownload(chatID int64, playlistID string, r
 	format := b.resolveFormat(chatID, forceFlac)
 	b.enqueueDownload(chatID, userID, username, replyToID, statusMessageID, false, format, transferMode, playlistID, noCache, func(ctx context.Context) error {
 		if forceAtmos {
-			dl_atmos = true
+			if rs := ripStateFrom(ctx); rs != nil {
+				rs.Atmos = true
+			} else {
+				dl_atmos = true
+			}
 		}
 		return ripPlaylist(playlistID, b.appleToken, Config.Storefront, forceAAC, ctx)
 	})
 }
 
 // enqueueStationDownload queues an Apple Music radio/station rip. ripStation reads
-// the codec from the dl_atmos/dl_aac globals (it takes no forceAAC param), so we set
-// them inside the closure — runDownload resets both before fn runs.
+// the codec from the rip's atmos/aac flags (it takes no forceAAC param), so we set
+// them inside the closure on the per-rip state carried by ctx (falling back to the
+// globals in CLI mode where ctx carries no RipState).
 func (b *TelegramBot) enqueueStationDownload(chatID int64, stationID string, replyToID int, statusMessageID int, transferMode string, forceAAC bool, forceAtmos bool, forceFlac bool, noCache bool, userID int64, username string) {
 	if stationID == "" {
 		_ = b.sendMessage(chatID, "Station ID is empty.", nil)
@@ -1837,11 +2094,20 @@ func (b *TelegramBot) enqueueStationDownload(chatID int64, stationID string, rep
 	}
 	format := b.resolveFormat(chatID, forceFlac)
 	b.enqueueDownload(chatID, userID, username, replyToID, statusMessageID, false, format, transferMode, "", noCache, func(ctx context.Context) error {
-		if forceAtmos {
-			dl_atmos = true
-		}
-		if forceAAC {
-			dl_aac = true
+		if rs := ripStateFrom(ctx); rs != nil {
+			if forceAtmos {
+				rs.Atmos = true
+			}
+			if forceAAC {
+				rs.AAC = true
+			}
+		} else {
+			if forceAtmos {
+				dl_atmos = true
+			}
+			if forceAAC {
+				dl_aac = true
+			}
 		}
 		return ripStation(stationID, b.appleToken, Config.Storefront, ctx)
 	})
@@ -1914,14 +2180,23 @@ func (b *TelegramBot) enqueueDownloadWithAfter(chatID int64, userID int64, usern
 	if userID != 0 {
 		b.userTaskCount[userID]++
 	}
-	active := b.activeStatus
+	// Snapshot this chat's live boards under the lock (activeBoardsSnapshot would
+	// re-take queueMu).
+	var mine []*DownloadStatus
+	for _, s := range b.activeBoards {
+		if s.chatID == chatID {
+			mine = append(mine, s)
+		}
+	}
 	b.queueMu.Unlock()
 
-	// A new task was added. Instead of a separate "Queued" message, refresh the
-	// single live board (its queue section now lists this task) and resurface it.
-	// If nothing is running, the worker will create the board momentarily.
-	if active != nil && active.chatID == chatID {
-		active.Relocate(replyToID)
+	// A new task was added. Instead of a separate "Queued" message, refresh this
+	// chat's live board(s) — their queue section now lists this task — and resurface
+	// them. If nothing is running here, the worker will create the board momentarily.
+	if len(mine) > 0 {
+		for _, s := range mine {
+			s.Relocate(replyToID)
+		}
 	} else if inProgress || queueLen > 0 {
 		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Queued (ID: %s). Position: %d\nStop: /stop_%s", taskID, position, taskID), nil, replyToID)
 	}
@@ -1984,43 +2259,68 @@ func (b *TelegramBot) runDownload(req *downloadRequest) {
 		return
 	}
 
-	lastDownloadedPaths = nil
-	downloadedMetaMu.Lock()
-	downloadedMeta = make(map[string]AudioMeta)
-	downloadedMetaMu.Unlock()
-	resetDownloadFailures()
-	counter = structs.Counter{}
-	okDict = make(map[string][]int)
-
-	dl_atmos = false
-	dl_aac = false
-	dl_select = false
-	// Per-request --no-cache: applied here (serial worker) so each queued rip honors
-	// its own flag regardless of what the next/previous request set.
-	dl_noCache = req.noCache
-	if single {
-		dl_song = true
-	} else {
-		dl_song = false
-	}
-
 	format = normalizeTelegramFormat(format)
 	if format == "" {
 		format = defaultTelegramFormat
 	}
 	defer b.cleanupDownloadsIfNeeded()
-	Config.ConvertAfterDownload = format == telegramFormatFlac
+
+	// Per-rip state. When task-concurrency is enabled each rip carries its own
+	// RipState through ctx so concurrent rips never share the download-mode flags,
+	// counter, path list, meta map, or conversion overrides. When disabled we fall
+	// back to the historical package globals and the strictly serial worker, so the
+	// behavior is byte-identical to before.
+	var rs *RipState
+	rctx := req.ctx
+	if Config.TaskConcurrency {
+		// The scheduler builds the rip state up front (so it can read live counts
+		// and set a borrower's budget) and attaches it to the request. Fall back to
+		// a fresh one for any concurrent path that didn't go through the scheduler.
+		rs = req.rip
+		if rs == nil {
+			rs = newRipState()
+			rs.NoCache = req.noCache
+			rs.Song = single
+		}
+		rctx = withRipState(req.ctx, rs)
+	} else {
+		lastDownloadedPaths = nil
+		downloadedMetaMu.Lock()
+		downloadedMeta = make(map[string]AudioMeta)
+		downloadedMetaMu.Unlock()
+		resetDownloadFailures()
+		counter = structs.Counter{}
+		okDict = make(map[string][]int)
+		dl_atmos = false
+		dl_aac = false
+		dl_select = false
+		dl_noCache = req.noCache
+		dl_song = single
+	}
+
+	// Conversion overrides: written to the per-rip state when concurrent, else to the
+	// global Config as before.
+	convertAfter := format == telegramFormatFlac
+	convertFormat := ""
 	if format == telegramFormatFlac {
-		Config.ConvertFormat = telegramFormatFlac
-		Config.ConvertKeepOriginal = false
-		Config.ConvertSkipLossyToLossless = false
+		convertFormat = telegramFormatFlac
 		if _, err := exec.LookPath(Config.FFmpegPath); err != nil {
 			_ = b.sendMessageWithReply(chatID, fmt.Sprintf("ffmpeg not found at '%s'.", Config.FFmpegPath), nil, replyToID)
-			dl_song = false
 			return
 		}
+	}
+	if rs != nil {
+		rs.ConvertAfterDownload = convertAfter
+		rs.ConvertFormat = convertFormat
+		rs.ConvertKeepOriginal = false
+		rs.ConvertSkipLossyToLossless = false
 	} else {
-		Config.ConvertFormat = ""
+		Config.ConvertAfterDownload = convertAfter
+		Config.ConvertFormat = convertFormat
+		if convertAfter {
+			Config.ConvertKeepOriginal = false
+			Config.ConvertSkipLossyToLossless = false
+		}
 	}
 
 	status, err := newDownloadStatus(b, chatID, replyToID, req.statusMessageID, req)
@@ -2031,10 +2331,13 @@ func (b *TelegramBot) runDownload(req *downloadRequest) {
 	}
 	defer status.Stop()
 
-	// Expose the live status board so /status can render the same rich view, and
-	// retire any idle board left by a previous /status so only one board remains.
+	// Register this task's live board so /status can render the same rich view,
+	// and retire any idle board left by a previous /status so it doesn't linger.
+	// Keying by taskID means the head and the sticky borrower each keep their own
+	// board with no contention — and the next head can register while a finished
+	// head's delivery is still running, since they have distinct keys.
 	b.queueMu.Lock()
-	b.activeStatus = status
+	b.activeBoards[req.taskID] = status
 	idleID := b.idleStatusMsgID
 	idleChat := b.idleStatusChatID
 	b.idleStatusMsgID = 0
@@ -2044,11 +2347,11 @@ func (b *TelegramBot) runDownload(req *downloadRequest) {
 	}
 	defer func() {
 		b.queueMu.Lock()
-		b.activeStatus = nil
+		delete(b.activeBoards, req.taskID)
 		b.queueMu.Unlock()
 	}()
 
-	activeProgressFactory = func(track *task.Track) apputils.ProgressFunc {
+	progressFactory := func(track *task.Track) apputils.ProgressFunc {
 		totalTracks := track.TaskTotal
 		if single {
 			totalTracks = 1
@@ -2067,27 +2370,33 @@ func (b *TelegramBot) runDownload(req *downloadRequest) {
 			status.UpdateTrack(track.ID, track.Resp.Attributes.Name, releaseTitle, track.WorkerID, track.TaskNum, totalTracks, phase, done, total)
 		}
 	}
-	defer func() { activeProgressFactory = nil }()
+	rs.setProgressFactory(progressFactory)
+	defer rs.setProgressFactory(nil)
 
 	status.Update("Downloading", 0, 0)
-	err = fn(req.ctx)
+	err = fn(rctx)
+	// Download phase done (success or not): free the head slot so the scheduler can
+	// promote the next head while this rip proceeds to deliver/upload. No-op on the
+	// serial path, where onDownloadComplete is never set.
+	if req.onDownloadComplete != nil {
+		req.onDownloadComplete()
+	}
 	if err != nil {
 		status.UpdateSync(fmt.Sprintf("Failed: %v", err), 0, 0)
-		dl_song = false
 		return
 	}
-	dl_song = false
 
-	activeProgressFactory = nil
+	rs.setProgressFactory(nil)
 
-	paths := append([]string{}, lastDownloadedPaths...)
+	paths := rs.snapshotPaths()
+	ctr := rs.ctr()
 	if len(paths) == 0 {
-		if summary := downloadFailureSummary(); summary != "" {
+		if summary := rs.failureSummary(); summary != "" {
 			status.UpdateSync("No files were downloaded: "+summary, 0, 0)
 			return
 		}
-		if counter.Error > 0 || counter.Unavailable > 0 {
-			status.UpdateSync(fmt.Sprintf("No files were downloaded. Errors: %d, unavailable: %d.", counter.Error, counter.Unavailable), 0, 0)
+		if ctr.Error > 0 || ctr.Unavailable > 0 {
+			status.UpdateSync(fmt.Sprintf("No files were downloaded. Errors: %d, unavailable: %d.", ctr.Error, ctr.Unavailable), 0, 0)
 			return
 		}
 		status.UpdateSync("No files were downloaded.", 0, 0)
@@ -2100,28 +2409,28 @@ func (b *TelegramBot) runDownload(req *downloadRequest) {
 	if strings.HasPrefix(req.albumID, "pl.") && len(paths) > largePlaylistThreshold &&
 		transferMode != transferModeGofileZip && transferMode != transferModeMv && transferMode != transferModeMvGofile && transferMode != transferModeArt {
 		status.UpdateSync(fmt.Sprintf("Large playlist (%d tracks) — routing to Gofile.", len(paths)), 0, 0)
-		b.deliverGofileZip(chatID, paths, replyToID, single, status, req.ctx)
+		b.deliverGofileZip(chatID, paths, replyToID, single, status, rctx)
 		return
 	}
 
 	switch transferMode {
 	case transferModeMv:
-		b.deliverMusicVideo(chatID, paths[0], replyToID, status, req.ctx)
+		b.deliverMusicVideo(chatID, paths[0], replyToID, status, rctx)
 	case transferModeMvGofile:
-		b.deliverMvGofile(chatID, paths[0], replyToID, status, req.ctx)
+		b.deliverMvGofile(chatID, paths[0], replyToID, status, rctx)
 	case transferModeArt:
-		b.deliverArtwork(chatID, paths, replyToID, status, req.ctx)
+		b.deliverArtwork(chatID, paths, replyToID, status, rctx)
 	case transferModeTelegramIndividual:
-		b.deliverTelegramIndividual(chatID, paths, replyToID, format, status, req.ctx)
+		b.deliverTelegramIndividual(chatID, paths, replyToID, format, status, rctx)
 	case transferModeTelegramZip:
-		b.deliverTelegramZip(chatID, paths, replyToID, albumID, format, status, req.ctx)
+		b.deliverTelegramZip(chatID, paths, replyToID, albumID, format, status, rctx)
 	case transferModeGofileZip:
-		b.deliverGofileZip(chatID, paths, replyToID, single, status, req.ctx)
+		b.deliverGofileZip(chatID, paths, replyToID, single, status, rctx)
 	default:
 		if transferMode == transferModeZip {
-			b.deliverGofileZip(chatID, paths, replyToID, single, status, req.ctx)
+			b.deliverGofileZip(chatID, paths, replyToID, single, status, rctx)
 		} else {
-			b.deliverTelegramIndividual(chatID, paths, replyToID, format, status, req.ctx)
+			b.deliverTelegramIndividual(chatID, paths, replyToID, format, status, rctx)
 		}
 	}
 }
@@ -2142,7 +2451,7 @@ func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, re
 	// Send cover art as standalone photo with album info
 	if len(paths) > 0 {
 		if coverPath := findCoverFile(filepath.Dir(paths[0])); coverPath != "" {
-			coverCaption := buildCoverCaption(paths)
+			coverCaption := buildCoverCaption(ctx, paths)
 			_ = b.sendPhotoWithReply(chatID, coverPath, coverCaption, replyToID)
 		}
 	}
@@ -2194,7 +2503,7 @@ func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, re
 		// Prepare AudioGroupItem slice
 		var groupItems []AudioGroupItem
 		for _, path := range chunk {
-			meta, hasMeta := getDownloadedMeta(path)
+			meta, hasMeta := getDownloadedMeta(ctx, path)
 			title := filepath.Base(path)
 			performer := ""
 			durationSecs := 0
@@ -2304,7 +2613,7 @@ func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, re
 	if sentAny {
 		status.Stop()
 		_ = b.deleteMessage(chatID, status.MessageID())
-		b.sendDeliverySummary(chatID, paths, format, replyToID)
+		b.sendDeliverySummary(ctx, chatID, paths, format, replyToID)
 	}
 }
 
@@ -2315,7 +2624,7 @@ func (b *TelegramBot) deliverTelegramIndividualFallback(chatID int64, paths []st
 	// Send cover art as standalone photo with album info
 	if len(paths) > 0 {
 		if coverPath := findCoverFile(filepath.Dir(paths[0])); coverPath != "" {
-			coverCaption := buildCoverCaption(paths)
+			coverCaption := buildCoverCaption(ctx, paths)
 			_ = b.sendPhotoWithReply(chatID, coverPath, coverCaption, replyToID)
 		}
 	}
@@ -2331,7 +2640,7 @@ func (b *TelegramBot) deliverTelegramIndividualFallback(chatID int64, paths []st
 		}
 		if info.Size() <= b.maxFileBytes {
 			// Small enough for Bot API
-			err = b.sendAudioFile(chatID, path, 0, status, format)
+			err = b.sendAudioFile(ctx, chatID, path, 0, status, format)
 			if err == nil {
 				sentAny = true
 				continue
@@ -2358,7 +2667,7 @@ func (b *TelegramBot) deliverTelegramIndividualFallback(chatID int64, paths []st
 	if sentAny {
 		status.Stop()
 		_ = b.deleteMessage(chatID, status.MessageID())
-		b.sendDeliverySummary(chatID, paths, format, replyToID)
+		b.sendDeliverySummary(ctx, chatID, paths, format, replyToID)
 		return
 	}
 	b.reportDeliveryFailure(chatID, replyToID, status, lastErr)
@@ -2410,7 +2719,7 @@ func (b *TelegramBot) deliverTelegramZip(chatID int64, paths []string, replyToID
 		} else {
 			status.Stop()
 			_ = b.deleteMessage(chatID, status.MessageID())
-			b.sendDeliverySummary(chatID, paths, format, replyToID)
+			b.sendDeliverySummary(ctx, chatID, paths, format, replyToID)
 		}
 	} else {
 		// No MTProto — fallback to Gofile
@@ -2433,7 +2742,7 @@ func (b *TelegramBot) deliverGofileZip(chatID int64, paths []string, replyToID i
 		// Send cover art as standalone photo with album info
 		if len(paths) > 0 {
 			if coverPath := findCoverFile(filepath.Dir(paths[0])); coverPath != "" {
-				coverCaption := buildCoverCaption(paths)
+				coverCaption := buildCoverCaption(ctx, paths)
 				_ = b.sendPhotoWithReply(chatID, coverPath, coverCaption, replyToID)
 			}
 		}
@@ -2556,7 +2865,7 @@ func (b *TelegramBot) sendVideoFileMTProto(chatID int64, path string, replyToID 
 	// Caption from metadata when available.
 	caption := filepath.Base(path)
 	durationSecs := 0
-	if meta, ok := getDownloadedMeta(path); ok {
+	if meta, ok := getDownloadedMeta(ctx, path); ok {
 		if meta.Title != "" {
 			caption = meta.Title
 			if meta.Performer != "" {
@@ -2957,7 +3266,7 @@ func isParentDir(parent, child string) bool {
 	return !strings.HasPrefix(rel, "..")
 }
 
-func (b *TelegramBot) sendAudioFile(chatID int64, filePath string, replyToID int, status *DownloadStatus, format string) error {
+func (b *TelegramBot) sendAudioFile(ctx context.Context, chatID int64, filePath string, replyToID int, status *DownloadStatus, format string) error {
 	format = normalizeTelegramFormat(format)
 	if format == "" {
 		format = defaultTelegramFormat
@@ -2977,7 +3286,7 @@ func (b *TelegramBot) sendAudioFile(chatID int64, filePath string, replyToID int
 	displayName := filepath.Base(filePath)
 	thumbPath := ""
 	compressed := false
-	meta, hasMeta := getDownloadedMeta(filePath)
+	meta, hasMeta := getDownloadedMeta(ctx, filePath)
 	cleanup := func() {
 		if thumbPath != "" {
 			_ = os.Remove(thumbPath)
@@ -3285,6 +3594,21 @@ func (b *TelegramBot) sendDocumentByFileID(chatID int64, entry CachedDocument, r
 // It reads the display-only queuedReqs mirror so it never touches the live channel
 // (no draining/blocking) even when called every few seconds from the update loop.
 // Renders with outline-style symbols to match the active-task board.
+// activeBoardsSnapshot returns the live status boards for all running tasks. The
+// returned slice is a copy, so callers can iterate without holding queueMu.
+func (b *TelegramBot) activeBoardsSnapshot() []*DownloadStatus {
+	b.queueMu.Lock()
+	defer b.queueMu.Unlock()
+	if len(b.activeBoards) == 0 {
+		return nil
+	}
+	boards := make([]*DownloadStatus, 0, len(b.activeBoards))
+	for _, s := range b.activeBoards {
+		boards = append(boards, s)
+	}
+	return boards
+}
+
 func (b *TelegramBot) queueBoardSuffix() string {
 	b.queueMu.Lock()
 	reqs := make([]*downloadRequest, len(b.queuedReqs))
@@ -3603,6 +3927,15 @@ func (s *DownloadStatus) RenderSnapshot() string {
 	if s == nil {
 		return ""
 	}
+	return s.RenderSnapshotBare() + s.bot.queueBoardSuffix()
+}
+
+// RenderSnapshotBare is RenderSnapshot without the trailing queue section, so a
+// caller rendering several boards at once can append the queue list just once.
+func (s *DownloadStatus) RenderSnapshotBare() string {
+	if s == nil {
+		return ""
+	}
 	s.mu.Lock()
 	phase := s.latestPhase
 	done := s.latestDone
@@ -3621,7 +3954,7 @@ func (s *DownloadStatus) RenderSnapshot() string {
 			percent = 100
 		}
 	}
-	return s.formatProgressText(phase, done, total, percent) + s.bot.queueBoardSuffix()
+	return s.formatProgressText(phase, done, total, percent)
 }
 
 // Relocate deletes the current board message and re-sends it at the bottom of the
@@ -5494,7 +5827,7 @@ func buildInlineKeyboard(count int, hasPrev bool, hasNext bool) InlineKeyboardMa
 // deliveries skip it (the file itself is the summary). It is best-effort — a
 // failure is swallowed so it never blocks the delivery flow — and degrades to a
 // plain-text list when the API can't serve rich content.
-func (b *TelegramBot) sendDeliverySummary(chatID int64, paths []string, format string, replyToID int) {
+func (b *TelegramBot) sendDeliverySummary(ctx context.Context, chatID int64, paths []string, format string, replyToID int) {
 	if len(paths) < 2 {
 		return
 	}
@@ -5509,10 +5842,9 @@ func (b *TelegramBot) sendDeliverySummary(chatID int64, paths []string, format s
 	var totalBytes int64
 	albumName, albumArtist, quality, codec, playlistName, playlistArtist := "", "", "", "", "", ""
 
-	downloadedMetaMu.Lock()
 	for i, p := range paths {
 		r := row{num: i + 1, title: filepath.Base(p)}
-		if meta, ok := downloadedMeta[p]; ok {
+		if meta, ok := getDownloadedMeta(ctx, p); ok {
 			if meta.Title != "" {
 				r.title = meta.Title
 			}
@@ -5536,7 +5868,6 @@ func (b *TelegramBot) sendDeliverySummary(chatID int64, paths []string, format s
 		}
 		rows = append(rows, r)
 	}
-	downloadedMetaMu.Unlock()
 
 	if playlistName != "" {
 		albumName = playlistName
@@ -5591,7 +5922,7 @@ func (b *TelegramBot) sendDeliverySummary(chatID int64, paths []string, format s
 	_, _ = b.sendRichMessage(chatID, rb.String(), strings.TrimRight(pb.String(), "\n"), nil, replyToID)
 }
 
-func buildCoverCaption(paths []string) string {
+func buildCoverCaption(ctx context.Context, paths []string) string {
 	if len(paths) == 0 {
 		return ""
 	}
@@ -5604,9 +5935,8 @@ func buildCoverCaption(paths []string) string {
 	playlistName := ""
 	playlistArtist := ""
 
-	downloadedMetaMu.Lock()
 	for _, p := range paths {
-		if meta, ok := downloadedMeta[p]; ok {
+		if meta, ok := getDownloadedMeta(ctx, p); ok {
 			if artist == "" && meta.Performer != "" {
 				artist = meta.Performer
 			}
@@ -5631,7 +5961,6 @@ func buildCoverCaption(paths []string) string {
 			}
 		}
 	}
-	downloadedMetaMu.Unlock()
 
 	// For a playlist, the per-track album/artist describe individual songs, so the
 	// aggregate caption would otherwise masquerade as the first track's album.
@@ -5770,6 +6099,21 @@ func (b *TelegramBot) cancelTask(chatID int64, issuerID int64, taskID string, re
 		}
 		if b.activeReq.cancel != nil {
 			b.activeReq.cancel()
+		}
+		b.queueMu.Unlock()
+		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("⛔ Task %s stopped.", taskID), nil, replyToID)
+		return
+	}
+	// Check the sticky borrower (task-concurrency mode): it runs concurrently with
+	// the head and is neither activeReq nor still in the queue.
+	if b.schedBorrowReq != nil && b.schedBorrowReq.taskID == taskID {
+		if b.schedBorrowReq.userID != 0 && issuerID != b.schedBorrowReq.userID && !b.isAdmin(issuerID) {
+			b.queueMu.Unlock()
+			_ = b.sendMessageWithReply(chatID, notYours, nil, replyToID)
+			return
+		}
+		if b.schedBorrowReq.cancel != nil {
+			b.schedBorrowReq.cancel()
 		}
 		b.queueMu.Unlock()
 		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("⛔ Task %s stopped.", taskID), nil, replyToID)
