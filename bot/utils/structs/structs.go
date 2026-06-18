@@ -60,6 +60,19 @@ type ConfigSet struct {
 	GofileToken                   string  `yaml:"gofile-token"`
 	MediaUserToken                string  `yaml:"media-user-token"`
 	WrapperManagerAddrs           []string `yaml:"wrapper-manager-addrs"`
+
+	// TaskConcurrency enables running more than one queued rip at a time: a head
+	// task downloads with the full wrapper pool while an eligible queued gofile
+	// task borrows a few wrappers, and a finished rip's upload runs detached so the
+	// next download starts immediately. Off (default) preserves the strictly serial
+	// one-task-at-a-time worker.
+	TaskConcurrency bool `yaml:"task-concurrency"`
+	// LendHeadRemainingThreshold: a borrower may take wrappers only while the head
+	// task still has more than this many tracks left to download. Default 50.
+	LendHeadRemainingThreshold int `yaml:"lend-head-remaining-threshold"`
+	// BorrowerMaxTracks: only a queued gofile task with fewer than this many total
+	// tracks is eligible to borrow. Default 30.
+	BorrowerMaxTracks int `yaml:"borrower-max-tracks"`
 }
 
 type Counter struct {

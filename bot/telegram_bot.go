@@ -1807,7 +1807,11 @@ func (b *TelegramBot) enqueueAlbumDownload(chatID int64, albumID string, replyTo
 	format := b.resolveFormat(chatID, forceFlac)
 	b.enqueueDownload(chatID, userID, username, replyToID, statusMessageID, false, format, transferMode, albumID, noCache, func(ctx context.Context) error {
 		if forceAtmos {
-			dl_atmos = true
+			if rs := ripStateFrom(ctx); rs != nil {
+				rs.Atmos = true
+			} else {
+				dl_atmos = true
+			}
 		}
 		return ripAlbum(albumID, b.appleToken, Config.Storefront, "", forceAAC, ctx)
 	})
@@ -1821,15 +1825,20 @@ func (b *TelegramBot) enqueuePlaylistDownload(chatID int64, playlistID string, r
 	format := b.resolveFormat(chatID, forceFlac)
 	b.enqueueDownload(chatID, userID, username, replyToID, statusMessageID, false, format, transferMode, playlistID, noCache, func(ctx context.Context) error {
 		if forceAtmos {
-			dl_atmos = true
+			if rs := ripStateFrom(ctx); rs != nil {
+				rs.Atmos = true
+			} else {
+				dl_atmos = true
+			}
 		}
 		return ripPlaylist(playlistID, b.appleToken, Config.Storefront, forceAAC, ctx)
 	})
 }
 
 // enqueueStationDownload queues an Apple Music radio/station rip. ripStation reads
-// the codec from the dl_atmos/dl_aac globals (it takes no forceAAC param), so we set
-// them inside the closure — runDownload resets both before fn runs.
+// the codec from the rip's atmos/aac flags (it takes no forceAAC param), so we set
+// them inside the closure on the per-rip state carried by ctx (falling back to the
+// globals in CLI mode where ctx carries no RipState).
 func (b *TelegramBot) enqueueStationDownload(chatID int64, stationID string, replyToID int, statusMessageID int, transferMode string, forceAAC bool, forceAtmos bool, forceFlac bool, noCache bool, userID int64, username string) {
 	if stationID == "" {
 		_ = b.sendMessage(chatID, "Station ID is empty.", nil)
@@ -1837,11 +1846,20 @@ func (b *TelegramBot) enqueueStationDownload(chatID int64, stationID string, rep
 	}
 	format := b.resolveFormat(chatID, forceFlac)
 	b.enqueueDownload(chatID, userID, username, replyToID, statusMessageID, false, format, transferMode, "", noCache, func(ctx context.Context) error {
-		if forceAtmos {
-			dl_atmos = true
-		}
-		if forceAAC {
-			dl_aac = true
+		if rs := ripStateFrom(ctx); rs != nil {
+			if forceAtmos {
+				rs.Atmos = true
+			}
+			if forceAAC {
+				rs.AAC = true
+			}
+		} else {
+			if forceAtmos {
+				dl_atmos = true
+			}
+			if forceAAC {
+				dl_aac = true
+			}
 		}
 		return ripStation(stationID, b.appleToken, Config.Storefront, ctx)
 	})
@@ -1984,43 +2002,62 @@ func (b *TelegramBot) runDownload(req *downloadRequest) {
 		return
 	}
 
-	lastDownloadedPaths = nil
-	downloadedMetaMu.Lock()
-	downloadedMeta = make(map[string]AudioMeta)
-	downloadedMetaMu.Unlock()
-	resetDownloadFailures()
-	counter = structs.Counter{}
-	okDict = make(map[string][]int)
-
-	dl_atmos = false
-	dl_aac = false
-	dl_select = false
-	// Per-request --no-cache: applied here (serial worker) so each queued rip honors
-	// its own flag regardless of what the next/previous request set.
-	dl_noCache = req.noCache
-	if single {
-		dl_song = true
-	} else {
-		dl_song = false
-	}
-
 	format = normalizeTelegramFormat(format)
 	if format == "" {
 		format = defaultTelegramFormat
 	}
 	defer b.cleanupDownloadsIfNeeded()
-	Config.ConvertAfterDownload = format == telegramFormatFlac
+
+	// Per-rip state. When task-concurrency is enabled each rip carries its own
+	// RipState through ctx so concurrent rips never share the download-mode flags,
+	// counter, path list, meta map, or conversion overrides. When disabled we fall
+	// back to the historical package globals and the strictly serial worker, so the
+	// behavior is byte-identical to before.
+	var rs *RipState
+	rctx := req.ctx
+	if Config.TaskConcurrency {
+		rs = newRipState()
+		rs.NoCache = req.noCache
+		rs.Song = single
+		rctx = withRipState(req.ctx, rs)
+	} else {
+		lastDownloadedPaths = nil
+		downloadedMetaMu.Lock()
+		downloadedMeta = make(map[string]AudioMeta)
+		downloadedMetaMu.Unlock()
+		resetDownloadFailures()
+		counter = structs.Counter{}
+		okDict = make(map[string][]int)
+		dl_atmos = false
+		dl_aac = false
+		dl_select = false
+		dl_noCache = req.noCache
+		dl_song = single
+	}
+
+	// Conversion overrides: written to the per-rip state when concurrent, else to the
+	// global Config as before.
+	convertAfter := format == telegramFormatFlac
+	convertFormat := ""
 	if format == telegramFormatFlac {
-		Config.ConvertFormat = telegramFormatFlac
-		Config.ConvertKeepOriginal = false
-		Config.ConvertSkipLossyToLossless = false
+		convertFormat = telegramFormatFlac
 		if _, err := exec.LookPath(Config.FFmpegPath); err != nil {
 			_ = b.sendMessageWithReply(chatID, fmt.Sprintf("ffmpeg not found at '%s'.", Config.FFmpegPath), nil, replyToID)
-			dl_song = false
 			return
 		}
+	}
+	if rs != nil {
+		rs.ConvertAfterDownload = convertAfter
+		rs.ConvertFormat = convertFormat
+		rs.ConvertKeepOriginal = false
+		rs.ConvertSkipLossyToLossless = false
 	} else {
-		Config.ConvertFormat = ""
+		Config.ConvertAfterDownload = convertAfter
+		Config.ConvertFormat = convertFormat
+		if convertAfter {
+			Config.ConvertKeepOriginal = false
+			Config.ConvertSkipLossyToLossless = false
+		}
 	}
 
 	status, err := newDownloadStatus(b, chatID, replyToID, req.statusMessageID, req)
@@ -2048,7 +2085,7 @@ func (b *TelegramBot) runDownload(req *downloadRequest) {
 		b.queueMu.Unlock()
 	}()
 
-	activeProgressFactory = func(track *task.Track) apputils.ProgressFunc {
+	progressFactory := func(track *task.Track) apputils.ProgressFunc {
 		totalTracks := track.TaskTotal
 		if single {
 			totalTracks = 1
@@ -2067,27 +2104,27 @@ func (b *TelegramBot) runDownload(req *downloadRequest) {
 			status.UpdateTrack(track.ID, track.Resp.Attributes.Name, releaseTitle, track.WorkerID, track.TaskNum, totalTracks, phase, done, total)
 		}
 	}
-	defer func() { activeProgressFactory = nil }()
+	rs.setProgressFactory(progressFactory)
+	defer rs.setProgressFactory(nil)
 
 	status.Update("Downloading", 0, 0)
-	err = fn(req.ctx)
+	err = fn(rctx)
 	if err != nil {
 		status.UpdateSync(fmt.Sprintf("Failed: %v", err), 0, 0)
-		dl_song = false
 		return
 	}
-	dl_song = false
 
-	activeProgressFactory = nil
+	rs.setProgressFactory(nil)
 
-	paths := append([]string{}, lastDownloadedPaths...)
+	paths := rs.snapshotPaths()
+	ctr := rs.ctr()
 	if len(paths) == 0 {
-		if summary := downloadFailureSummary(); summary != "" {
+		if summary := rs.failureSummary(); summary != "" {
 			status.UpdateSync("No files were downloaded: "+summary, 0, 0)
 			return
 		}
-		if counter.Error > 0 || counter.Unavailable > 0 {
-			status.UpdateSync(fmt.Sprintf("No files were downloaded. Errors: %d, unavailable: %d.", counter.Error, counter.Unavailable), 0, 0)
+		if ctr.Error > 0 || ctr.Unavailable > 0 {
+			status.UpdateSync(fmt.Sprintf("No files were downloaded. Errors: %d, unavailable: %d.", ctr.Error, ctr.Unavailable), 0, 0)
 			return
 		}
 		status.UpdateSync("No files were downloaded.", 0, 0)
@@ -2100,28 +2137,28 @@ func (b *TelegramBot) runDownload(req *downloadRequest) {
 	if strings.HasPrefix(req.albumID, "pl.") && len(paths) > largePlaylistThreshold &&
 		transferMode != transferModeGofileZip && transferMode != transferModeMv && transferMode != transferModeMvGofile && transferMode != transferModeArt {
 		status.UpdateSync(fmt.Sprintf("Large playlist (%d tracks) — routing to Gofile.", len(paths)), 0, 0)
-		b.deliverGofileZip(chatID, paths, replyToID, single, status, req.ctx)
+		b.deliverGofileZip(chatID, paths, replyToID, single, status, rctx)
 		return
 	}
 
 	switch transferMode {
 	case transferModeMv:
-		b.deliverMusicVideo(chatID, paths[0], replyToID, status, req.ctx)
+		b.deliverMusicVideo(chatID, paths[0], replyToID, status, rctx)
 	case transferModeMvGofile:
-		b.deliverMvGofile(chatID, paths[0], replyToID, status, req.ctx)
+		b.deliverMvGofile(chatID, paths[0], replyToID, status, rctx)
 	case transferModeArt:
-		b.deliverArtwork(chatID, paths, replyToID, status, req.ctx)
+		b.deliverArtwork(chatID, paths, replyToID, status, rctx)
 	case transferModeTelegramIndividual:
-		b.deliverTelegramIndividual(chatID, paths, replyToID, format, status, req.ctx)
+		b.deliverTelegramIndividual(chatID, paths, replyToID, format, status, rctx)
 	case transferModeTelegramZip:
-		b.deliverTelegramZip(chatID, paths, replyToID, albumID, format, status, req.ctx)
+		b.deliverTelegramZip(chatID, paths, replyToID, albumID, format, status, rctx)
 	case transferModeGofileZip:
-		b.deliverGofileZip(chatID, paths, replyToID, single, status, req.ctx)
+		b.deliverGofileZip(chatID, paths, replyToID, single, status, rctx)
 	default:
 		if transferMode == transferModeZip {
-			b.deliverGofileZip(chatID, paths, replyToID, single, status, req.ctx)
+			b.deliverGofileZip(chatID, paths, replyToID, single, status, rctx)
 		} else {
-			b.deliverTelegramIndividual(chatID, paths, replyToID, format, status, req.ctx)
+			b.deliverTelegramIndividual(chatID, paths, replyToID, format, status, rctx)
 		}
 	}
 }
@@ -2142,7 +2179,7 @@ func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, re
 	// Send cover art as standalone photo with album info
 	if len(paths) > 0 {
 		if coverPath := findCoverFile(filepath.Dir(paths[0])); coverPath != "" {
-			coverCaption := buildCoverCaption(paths)
+			coverCaption := buildCoverCaption(ctx, paths)
 			_ = b.sendPhotoWithReply(chatID, coverPath, coverCaption, replyToID)
 		}
 	}
@@ -2194,7 +2231,7 @@ func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, re
 		// Prepare AudioGroupItem slice
 		var groupItems []AudioGroupItem
 		for _, path := range chunk {
-			meta, hasMeta := getDownloadedMeta(path)
+			meta, hasMeta := getDownloadedMeta(ctx, path)
 			title := filepath.Base(path)
 			performer := ""
 			durationSecs := 0
@@ -2304,7 +2341,7 @@ func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, re
 	if sentAny {
 		status.Stop()
 		_ = b.deleteMessage(chatID, status.MessageID())
-		b.sendDeliverySummary(chatID, paths, format, replyToID)
+		b.sendDeliverySummary(ctx, chatID, paths, format, replyToID)
 	}
 }
 
@@ -2315,7 +2352,7 @@ func (b *TelegramBot) deliverTelegramIndividualFallback(chatID int64, paths []st
 	// Send cover art as standalone photo with album info
 	if len(paths) > 0 {
 		if coverPath := findCoverFile(filepath.Dir(paths[0])); coverPath != "" {
-			coverCaption := buildCoverCaption(paths)
+			coverCaption := buildCoverCaption(ctx, paths)
 			_ = b.sendPhotoWithReply(chatID, coverPath, coverCaption, replyToID)
 		}
 	}
@@ -2331,7 +2368,7 @@ func (b *TelegramBot) deliverTelegramIndividualFallback(chatID int64, paths []st
 		}
 		if info.Size() <= b.maxFileBytes {
 			// Small enough for Bot API
-			err = b.sendAudioFile(chatID, path, 0, status, format)
+			err = b.sendAudioFile(ctx, chatID, path, 0, status, format)
 			if err == nil {
 				sentAny = true
 				continue
@@ -2358,7 +2395,7 @@ func (b *TelegramBot) deliverTelegramIndividualFallback(chatID int64, paths []st
 	if sentAny {
 		status.Stop()
 		_ = b.deleteMessage(chatID, status.MessageID())
-		b.sendDeliverySummary(chatID, paths, format, replyToID)
+		b.sendDeliverySummary(ctx, chatID, paths, format, replyToID)
 		return
 	}
 	b.reportDeliveryFailure(chatID, replyToID, status, lastErr)
@@ -2410,7 +2447,7 @@ func (b *TelegramBot) deliverTelegramZip(chatID int64, paths []string, replyToID
 		} else {
 			status.Stop()
 			_ = b.deleteMessage(chatID, status.MessageID())
-			b.sendDeliverySummary(chatID, paths, format, replyToID)
+			b.sendDeliverySummary(ctx, chatID, paths, format, replyToID)
 		}
 	} else {
 		// No MTProto — fallback to Gofile
@@ -2433,7 +2470,7 @@ func (b *TelegramBot) deliverGofileZip(chatID int64, paths []string, replyToID i
 		// Send cover art as standalone photo with album info
 		if len(paths) > 0 {
 			if coverPath := findCoverFile(filepath.Dir(paths[0])); coverPath != "" {
-				coverCaption := buildCoverCaption(paths)
+				coverCaption := buildCoverCaption(ctx, paths)
 				_ = b.sendPhotoWithReply(chatID, coverPath, coverCaption, replyToID)
 			}
 		}
@@ -2556,7 +2593,7 @@ func (b *TelegramBot) sendVideoFileMTProto(chatID int64, path string, replyToID 
 	// Caption from metadata when available.
 	caption := filepath.Base(path)
 	durationSecs := 0
-	if meta, ok := getDownloadedMeta(path); ok {
+	if meta, ok := getDownloadedMeta(ctx, path); ok {
 		if meta.Title != "" {
 			caption = meta.Title
 			if meta.Performer != "" {
@@ -2957,7 +2994,7 @@ func isParentDir(parent, child string) bool {
 	return !strings.HasPrefix(rel, "..")
 }
 
-func (b *TelegramBot) sendAudioFile(chatID int64, filePath string, replyToID int, status *DownloadStatus, format string) error {
+func (b *TelegramBot) sendAudioFile(ctx context.Context, chatID int64, filePath string, replyToID int, status *DownloadStatus, format string) error {
 	format = normalizeTelegramFormat(format)
 	if format == "" {
 		format = defaultTelegramFormat
@@ -2977,7 +3014,7 @@ func (b *TelegramBot) sendAudioFile(chatID int64, filePath string, replyToID int
 	displayName := filepath.Base(filePath)
 	thumbPath := ""
 	compressed := false
-	meta, hasMeta := getDownloadedMeta(filePath)
+	meta, hasMeta := getDownloadedMeta(ctx, filePath)
 	cleanup := func() {
 		if thumbPath != "" {
 			_ = os.Remove(thumbPath)
@@ -5494,7 +5531,7 @@ func buildInlineKeyboard(count int, hasPrev bool, hasNext bool) InlineKeyboardMa
 // deliveries skip it (the file itself is the summary). It is best-effort — a
 // failure is swallowed so it never blocks the delivery flow — and degrades to a
 // plain-text list when the API can't serve rich content.
-func (b *TelegramBot) sendDeliverySummary(chatID int64, paths []string, format string, replyToID int) {
+func (b *TelegramBot) sendDeliverySummary(ctx context.Context, chatID int64, paths []string, format string, replyToID int) {
 	if len(paths) < 2 {
 		return
 	}
@@ -5509,10 +5546,9 @@ func (b *TelegramBot) sendDeliverySummary(chatID int64, paths []string, format s
 	var totalBytes int64
 	albumName, albumArtist, quality, codec, playlistName, playlistArtist := "", "", "", "", "", ""
 
-	downloadedMetaMu.Lock()
 	for i, p := range paths {
 		r := row{num: i + 1, title: filepath.Base(p)}
-		if meta, ok := downloadedMeta[p]; ok {
+		if meta, ok := getDownloadedMeta(ctx, p); ok {
 			if meta.Title != "" {
 				r.title = meta.Title
 			}
@@ -5536,7 +5572,6 @@ func (b *TelegramBot) sendDeliverySummary(chatID int64, paths []string, format s
 		}
 		rows = append(rows, r)
 	}
-	downloadedMetaMu.Unlock()
 
 	if playlistName != "" {
 		albumName = playlistName
@@ -5591,7 +5626,7 @@ func (b *TelegramBot) sendDeliverySummary(chatID int64, paths []string, format s
 	_, _ = b.sendRichMessage(chatID, rb.String(), strings.TrimRight(pb.String(), "\n"), nil, replyToID)
 }
 
-func buildCoverCaption(paths []string) string {
+func buildCoverCaption(ctx context.Context, paths []string) string {
 	if len(paths) == 0 {
 		return ""
 	}
@@ -5604,9 +5639,8 @@ func buildCoverCaption(paths []string) string {
 	playlistName := ""
 	playlistArtist := ""
 
-	downloadedMetaMu.Lock()
 	for _, p := range paths {
-		if meta, ok := downloadedMeta[p]; ok {
+		if meta, ok := getDownloadedMeta(ctx, p); ok {
 			if artist == "" && meta.Performer != "" {
 				artist = meta.Performer
 			}
@@ -5631,7 +5665,6 @@ func buildCoverCaption(paths []string) string {
 			}
 		}
 	}
-	downloadedMetaMu.Unlock()
 
 	// For a playlist, the per-track album/artist describe individual songs, so the
 	// aggregate caption would otherwise masquerade as the first track's album.
