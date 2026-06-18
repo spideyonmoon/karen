@@ -107,6 +107,16 @@ func loadConfig() error {
 	if Config.MVAudioType == "" {
 		Config.MVAudioType = "aac"
 	}
+	// Task-concurrency lend thresholds. These are read directly (no fallback) by
+	// the scheduler, so default them here: an unset BorrowerMaxTracks (0) would make
+	// `count >= max` always true and silently disable all borrowing. Inert when
+	// task-concurrency is off.
+	if Config.LendHeadRemainingThreshold <= 0 {
+		Config.LendHeadRemainingThreshold = 50
+	}
+	if Config.BorrowerMaxTracks <= 0 {
+		Config.BorrowerMaxTracks = 30
+	}
 	return nil
 }
 

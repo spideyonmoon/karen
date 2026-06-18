@@ -56,7 +56,12 @@ Branch: `feat/task-concurrency-gofile-lending` (pushed, Build Check green).
   Enqueue refresh (~2183) relocates all of this chat's boards. Helpers added:
   `activeBoardsSnapshot()` and `DownloadStatus.RenderSnapshotBare()` (RenderSnapshot
   = bare + queue suffix). Flag-off serial path is unchanged behavior (one entry).
-- **Phase 4** — add the 3 config keys to `bot/config.yaml.example` + update docs.
+- **Phase 4** — DONE (committed). Added `task-concurrency`,
+  `lend-head-remaining-threshold`, `borrower-max-tracks` to
+  `bot/config.yaml.example` with explanatory comments. Also enforced the 50/30
+  defaults in `loadConfig` (main.go) — they were previously read with no fallback,
+  so enabling task-concurrency without setting `borrower-max-tracks` left it 0 and
+  `count >= 0` silently disabled ALL borrowing. Now inert-but-correct when unset.
 
 ## Verify
 No local Go toolchain (never build locally). Push branch → `.github/workflows/build-check.yml`

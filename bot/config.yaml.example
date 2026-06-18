@@ -76,3 +76,14 @@ media-user-token: "your_media_user_token" # Apple Music API token (required for 
 wrapper-manager-addrs:
   - "karen-wm-1:8081"
   - "karen-wm-2:8082"
+# Task concurrency: run two queued rips at once. A "head" task downloads with the
+# full wrapper pool; while it runs, ONE eligible queued Gofile task may "borrow" a
+# few wrappers. A finished rip's upload runs detached so the next download starts
+# right away. Off = strictly serial, one task at a time (unchanged default behavior).
+task-concurrency: false
+# A borrower may take wrappers only while the head still has more than this many
+# tracks left to download (so lending stops as the head winds down). Default 50.
+lend-head-remaining-threshold: 50
+# Only a queued Gofile task with fewer than this many total tracks may borrow
+# (small tasks lend 1 wrapper, larger ones up to 2). Default 30.
+borrower-max-tracks: 30
