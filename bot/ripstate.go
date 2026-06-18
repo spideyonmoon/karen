@@ -57,10 +57,13 @@ type RipState struct {
 	WrapperBudget int
 
 	// Live track accounting the scheduler reads to make its lend decision (head
-	// remaining-tracks threshold). planTrack increments totalTracks as each track
-	// download is launched; trackDone increments doneTracks as each finishes.
-	// remainingTracks() = total - done. Read from the scheduler goroutine while the
-	// rip writes, so both are atomic.
+	// remaining-tracks threshold). planTracks sets totalTracks to the rip's full
+	// planned track count ONCE, up front; trackDone increments doneTracks as each
+	// finishes. remainingTracks() = total - done = album tracks not yet finished.
+	// (totalTracks must be the whole plan, not the in-flight count — the launch
+	// loop is gated by the wrapper semaphore, so incrementing per-launch would cap
+	// the total at ~pool size and the head's remaining would never exceed it.)
+	// Read from the scheduler goroutine while the rip writes, so both are atomic.
 	totalTracks atomic.Int64
 	doneTracks  atomic.Int64
 
@@ -187,14 +190,15 @@ func (rs *RipState) wrapperBudget() int {
 	return rs.WrapperBudget
 }
 
-// planTrack records that one more track download has been launched. trackDone
-// records one finishing (success or failure). Both are no-ops on a nil receiver
-// (CLI / flag-off), where the scheduler never reads the counts.
-func (rs *RipState) planTrack() {
-	if rs == nil {
+// planTracks records the rip's full planned track count (call once, before the
+// download loop). trackDone records one track finishing (success or failure).
+// Both are no-ops on a nil receiver (CLI / flag-off), where the scheduler never
+// reads the counts.
+func (rs *RipState) planTracks(n int) {
+	if rs == nil || n <= 0 {
 		return
 	}
-	rs.totalTracks.Add(1)
+	rs.totalTracks.Add(int64(n))
 }
 
 func (rs *RipState) trackDone() {
@@ -204,8 +208,9 @@ func (rs *RipState) trackDone() {
 	rs.doneTracks.Add(1)
 }
 
-// remainingTracks reports launched-but-not-yet-finished tracks. The scheduler
-// uses it for the head's lend-eligibility threshold. Zero on a nil receiver.
+// remainingTracks reports planned-but-not-yet-finished tracks (album tracks left
+// to download). The scheduler uses it for the head's lend-eligibility threshold.
+// Zero on a nil receiver.
 func (rs *RipState) remainingTracks() int {
 	if rs == nil {
 		return 0

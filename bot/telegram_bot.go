@@ -850,6 +850,8 @@ func (b *TelegramBot) tryLendToBorrower() {
 		return
 	}
 	b.queueMu.Unlock()
+	fmt.Printf("task-concurrency: lending %d wrapper(s) to borrower %s (%d tracks); head %s has %d tracks remaining\n",
+		k, got.taskID, count, headMode, headRip.remainingTracks())
 	b.startTask(got, true, k)
 }
 
