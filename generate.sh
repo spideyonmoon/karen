@@ -134,6 +134,9 @@ telegram-request-timeout-seconds: 3600
 telegram-api-id: ${TELEGRAM_API_ID:-0}
 telegram-api-hash: "${TELEGRAM_API_HASH:-}"
 gofile-token: "${GOFILE_TOKEN:-}"
+task-concurrency: true
+lend-head-remaining-threshold: 50
+borrower-max-tracks: 30
 wrapper-manager-addrs:
 YAML
 for ((i = 1; i <= N; i++)); do
