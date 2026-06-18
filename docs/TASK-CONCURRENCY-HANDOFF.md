@@ -44,10 +44,18 @@ Branch: `feat/task-concurrency-gofile-lending` (pushed, Build Check green).
     `queueMu` only once eligible. `/stop` cancels the borrower too.
   - Head/borrower lifecycle clears `activeReq`/`schedHeadRip`/`schedBorrowReq` only if not
     already superseded (next head is promoted while the old one still uploads).
-- **Phase 3** — per-task status boards: `activeStatus` (single) → registry keyed by
-  taskID; `/status` lists active + queued. NOTE: a borrower currently does NOT seize
-  `activeStatus` (head owns the shared board) but still posts/updates its own status
-  message — Phase 3 should give each active task its own board.
+- **Phase 3** — DONE (committed). Per-task status boards: `activeStatus` (single
+  `*DownloadStatus`) replaced by `activeBoards map[string]*DownloadStatus` keyed by
+  taskID (guarded by queueMu, init in the constructor). `runDownload` now registers
+  EVERY task's board (head + sticky borrower) under its taskID and `defer`s the
+  delete — the old `!req.isBorrower` guard and the "only clear if still ours"
+  supersede dance are gone (distinct keys = no contention; the dead `isBorrower`
+  field was removed). `/status` (telegram_bot.go ~1429) splits boards into this
+  chat's (Relocate each) vs other chats' (one combined snapshot via new
+  `RenderSnapshotBare()` + a single `queueBoardSuffix()`); idle → idle board.
+  Enqueue refresh (~2183) relocates all of this chat's boards. Helpers added:
+  `activeBoardsSnapshot()` and `DownloadStatus.RenderSnapshotBare()` (RenderSnapshot
+  = bare + queue suffix). Flag-off serial path is unchanged behavior (one entry).
 - **Phase 4** — add the 3 config keys to `bot/config.yaml.example` + update docs.
 
 ## Verify

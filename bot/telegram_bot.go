@@ -134,7 +134,11 @@ type TelegramBot struct {
 	schedHeadRip   *RipState
 	schedHeadMode  string
 	schedBorrowReq *downloadRequest
-	activeStatus  *DownloadStatus // live status board for the running task; nil when idle
+	// activeBoards is the live status board for every running task, keyed by
+	// taskID (guarded by queueMu). Under task concurrency the head and the sticky
+	// borrower each register their own board, so /status can resurface all of
+	// them; on the serial path it only ever holds one entry. Empty when idle.
+	activeBoards map[string]*DownloadStatus
 	// idleStatus* track the single board shown by /status when nothing is running,
 	// so each /status replaces the previous one instead of stacking messages.
 	idleStatusMsgID  int
@@ -218,11 +222,8 @@ type downloadRequest struct {
 	// runDownload uses it instead of building its own. onDownloadComplete fires
 	// once, the moment the download phase ends (before delivery), so the scheduler
 	// can free the head slot and promote the next task while this one uploads.
-	// isBorrower marks the single sticky borrower so it doesn't seize the shared
-	// /status board from the head.
 	rip                *RipState
 	onDownloadComplete func()
-	isBorrower         bool
 	// peekedTracks caches this request's track count from the scheduler's lend
 	// check so a large, ineligible front isn't re-fetched on every tick. 0 means
 	// "not yet peeked"; -1 means "peek failed / not a track album".
@@ -531,6 +532,7 @@ func newTelegramBot(token, appleToken string) *TelegramBot {
 		pendingTransfers: make(map[int64]*PendingTransfer),
 		downloadQueue:    make(chan *downloadRequest, defaultQueueSize),
 		userTaskCount:    make(map[int64]int),
+		activeBoards:     make(map[string]*DownloadStatus),
 		cacheFile:        Config.TelegramCacheFile,
 		cache:            make(map[string]CachedAudio),
 		docCache:         make(map[string]CachedDocument),
@@ -721,7 +723,6 @@ func (b *TelegramBot) startTask(req *downloadRequest, borrower bool, budget int)
 	rip.Song = req.single
 	rip.WrapperBudget = budget
 	req.rip = rip
-	req.isBorrower = borrower
 
 	done := make(chan struct{})
 	var once sync.Once
@@ -1426,18 +1427,32 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args
 	case "start", "help":
 		_, _ = b.sendRichMessage(chatID, botHelpRich(), botHelpText(), nil, replyToID)
 	case "status", "queue":
-		b.queueMu.Lock()
-		active := b.activeStatus
-		inProgress := b.inProgress
-		b.queueMu.Unlock()
+		// Split active boards into this chat's and others'. Boards in this chat are
+		// resurfaced (each dropped + re-sent at the bottom); active tasks living in
+		// other chats get a plain snapshot here without disturbing their live board.
+		var mine, others []*DownloadStatus
+		for _, s := range b.activeBoardsSnapshot() {
+			if s.chatID == chatID {
+				mine = append(mine, s)
+			} else {
+				others = append(others, s)
+			}
+		}
 		switch {
-		case inProgress && active != nil && active.chatID == chatID:
-			// Single board: drop the old message and resurface it at the bottom.
-			active.Relocate(replyToID)
-		case inProgress && active != nil:
-			// Active task lives in another chat — give this chat a plain snapshot
-			// without disturbing the live board.
-			_ = b.sendMessageWithReply(chatID, active.RenderSnapshot(), nil, replyToID)
+		case len(mine) > 0:
+			for _, s := range mine {
+				s.Relocate(replyToID)
+			}
+		case len(others) > 0:
+			var sb strings.Builder
+			for i, s := range others {
+				if i > 0 {
+					sb.WriteString("\n\n")
+				}
+				sb.WriteString(s.RenderSnapshotBare())
+			}
+			sb.WriteString(b.queueBoardSuffix())
+			_ = b.sendMessageWithReply(chatID, sb.String(), nil, replyToID)
 		default:
 			// Idle: keep exactly one board, replacing any previous /status message.
 			b.replaceIdleStatusBoard(chatID, replyToID, "📊 Karen Status Board\n\nNo active tasks."+b.queueBoardSuffix())
@@ -2165,14 +2180,23 @@ func (b *TelegramBot) enqueueDownloadWithAfter(chatID int64, userID int64, usern
 	if userID != 0 {
 		b.userTaskCount[userID]++
 	}
-	active := b.activeStatus
+	// Snapshot this chat's live boards under the lock (activeBoardsSnapshot would
+	// re-take queueMu).
+	var mine []*DownloadStatus
+	for _, s := range b.activeBoards {
+		if s.chatID == chatID {
+			mine = append(mine, s)
+		}
+	}
 	b.queueMu.Unlock()
 
-	// A new task was added. Instead of a separate "Queued" message, refresh the
-	// single live board (its queue section now lists this task) and resurface it.
-	// If nothing is running, the worker will create the board momentarily.
-	if active != nil && active.chatID == chatID {
-		active.Relocate(replyToID)
+	// A new task was added. Instead of a separate "Queued" message, refresh this
+	// chat's live board(s) — their queue section now lists this task — and resurface
+	// them. If nothing is running here, the worker will create the board momentarily.
+	if len(mine) > 0 {
+		for _, s := range mine {
+			s.Relocate(replyToID)
+		}
 	} else if inProgress || queueLen > 0 {
 		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Queued (ID: %s). Position: %d\nStop: /stop_%s", taskID, position, taskID), nil, replyToID)
 	}
@@ -2307,31 +2331,25 @@ func (b *TelegramBot) runDownload(req *downloadRequest) {
 	}
 	defer status.Stop()
 
-	// Expose the live status board so /status can render the same rich view, and
-	// retire any idle board left by a previous /status so only one board remains.
-	// A borrower never seizes the shared board — the head's rip owns /status — so
-	// the two concurrent rips don't fight over a single activeStatus pointer.
-	if !req.isBorrower {
-		b.queueMu.Lock()
-		b.activeStatus = status
-		idleID := b.idleStatusMsgID
-		idleChat := b.idleStatusChatID
-		b.idleStatusMsgID = 0
-		b.queueMu.Unlock()
-		if idleID != 0 {
-			_ = b.deleteMessage(idleChat, idleID)
-		}
-		defer func() {
-			b.queueMu.Lock()
-			// Only retire the board if it is still ours: under task concurrency the
-			// next head is promoted (and seizes activeStatus) while this head's
-			// delivery is still running, so a blind clear would wipe the new board.
-			if b.activeStatus == status {
-				b.activeStatus = nil
-			}
-			b.queueMu.Unlock()
-		}()
+	// Register this task's live board so /status can render the same rich view,
+	// and retire any idle board left by a previous /status so it doesn't linger.
+	// Keying by taskID means the head and the sticky borrower each keep their own
+	// board with no contention — and the next head can register while a finished
+	// head's delivery is still running, since they have distinct keys.
+	b.queueMu.Lock()
+	b.activeBoards[req.taskID] = status
+	idleID := b.idleStatusMsgID
+	idleChat := b.idleStatusChatID
+	b.idleStatusMsgID = 0
+	b.queueMu.Unlock()
+	if idleID != 0 {
+		_ = b.deleteMessage(idleChat, idleID)
 	}
+	defer func() {
+		b.queueMu.Lock()
+		delete(b.activeBoards, req.taskID)
+		b.queueMu.Unlock()
+	}()
 
 	progressFactory := func(track *task.Track) apputils.ProgressFunc {
 		totalTracks := track.TaskTotal
@@ -3576,6 +3594,21 @@ func (b *TelegramBot) sendDocumentByFileID(chatID int64, entry CachedDocument, r
 // It reads the display-only queuedReqs mirror so it never touches the live channel
 // (no draining/blocking) even when called every few seconds from the update loop.
 // Renders with outline-style symbols to match the active-task board.
+// activeBoardsSnapshot returns the live status boards for all running tasks. The
+// returned slice is a copy, so callers can iterate without holding queueMu.
+func (b *TelegramBot) activeBoardsSnapshot() []*DownloadStatus {
+	b.queueMu.Lock()
+	defer b.queueMu.Unlock()
+	if len(b.activeBoards) == 0 {
+		return nil
+	}
+	boards := make([]*DownloadStatus, 0, len(b.activeBoards))
+	for _, s := range b.activeBoards {
+		boards = append(boards, s)
+	}
+	return boards
+}
+
 func (b *TelegramBot) queueBoardSuffix() string {
 	b.queueMu.Lock()
 	reqs := make([]*downloadRequest, len(b.queuedReqs))
@@ -3894,6 +3927,15 @@ func (s *DownloadStatus) RenderSnapshot() string {
 	if s == nil {
 		return ""
 	}
+	return s.RenderSnapshotBare() + s.bot.queueBoardSuffix()
+}
+
+// RenderSnapshotBare is RenderSnapshot without the trailing queue section, so a
+// caller rendering several boards at once can append the queue list just once.
+func (s *DownloadStatus) RenderSnapshotBare() string {
+	if s == nil {
+		return ""
+	}
 	s.mu.Lock()
 	phase := s.latestPhase
 	done := s.latestDone
@@ -3912,7 +3954,7 @@ func (s *DownloadStatus) RenderSnapshot() string {
 			percent = 100
 		}
 	}
-	return s.formatProgressText(phase, done, total, percent) + s.bot.queueBoardSuffix()
+	return s.formatProgressText(phase, done, total, percent)
 }
 
 // Relocate deletes the current board message and re-sends it at the bottom of the
