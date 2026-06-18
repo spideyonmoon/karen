@@ -26,12 +26,28 @@ Branch: `feat/task-concurrency-gofile-lending` (pushed, Build Check green).
 - Uploads: TG one-at-a-time (done, Phase 1); gofile concurrent.
 
 ## TODO
-- **Phase 2** — replace the serial worker in `startDownloadWorker` (telegram_bot.go ~627)
-  with a flag-gated scheduler implementing the rules above. Per-task wrapper budget
-  layered on existing `wmgrpc.Pool` (borrower self-limits to k concurrent Acquire; head
-  takes rest). Flag off = keep current `for req := range downloadQueue` serial loop.
+- **Phase 2** — DONE (committed, Build Check green). `startDownloadWorker` now branches
+  on `Config.TaskConcurrency`: flag off keeps the verbatim serial loop; flag on runs
+  `scheduleDownloads` (telegram_bot.go). Mechanism:
+  - Per-rip wrapper budget = the `sem` size in the three fan-out loops (main.go album /
+    playlist / station), sourced from `rs.wrapperBudget()`. Head budget 0 → full pool;
+    borrower → k. Borrower self-limits to k concurrent track goroutines (≤ k Acquire).
+  - `RipState` gained `WrapperBudget` + atomic `totalTracks`/`doneTracks`
+    (`planTrack`/`trackDone`/`remainingTracks`) so the scheduler reads the head's live
+    remaining count.
+  - Head download done → `req.onDownloadComplete()` (fired in runDownload right after
+    `fn`) closes the head's done-chan → scheduler promotes next head; finished head's
+    delivery runs on in its own goroutine (TG gate serializes uploads).
+  - Borrow slot = `b.schedBorrowReq` (single, non-preemptive). `tryLendToBorrower`
+    (2s tick) peeks the front via the `queuedReqs` mirror, fetches its track count
+    (`peekTrackCount`, cached on `req.peekedTracks`), and consumes from the channel under
+    `queueMu` only once eligible. `/stop` cancels the borrower too.
+  - Head/borrower lifecycle clears `activeReq`/`schedHeadRip`/`schedBorrowReq` only if not
+    already superseded (next head is promoted while the old one still uploads).
 - **Phase 3** — per-task status boards: `activeStatus` (single) → registry keyed by
-  taskID; `/status` lists active + queued.
+  taskID; `/status` lists active + queued. NOTE: a borrower currently does NOT seize
+  `activeStatus` (head owns the shared board) but still posts/updates its own status
+  message — Phase 3 should give each active task its own board.
 - **Phase 4** — add the 3 config keys to `bot/config.yaml.example` + update docs.
 
 ## Verify
