@@ -3757,6 +3757,14 @@ type trackProgressState struct {
 	phase        string
 	done         int64
 	size         int64
+	// maxBytes is the high-water mark of every byte count ever seen for this track
+	// (max of `done` and `total` across all phases). `size` mirrors only the reported
+	// `total`, which stays 0 for the HLS-segment download path and gets clobbered to
+	// 0/1 by the post-download Decrypting/Converting sentinels — so it can't be trusted
+	// as the final size. maxBytes survives those, giving finishedSizes a real number
+	// (and keeping the upload bar's aggregate total honest) while `size` is left alone
+	// so the live per-track % stays indeterminate for unknown-total downloads.
+	maxBytes     int64
 	startedAt    time.Time
 	updatedAt    time.Time
 	workerID     string
@@ -4176,8 +4184,12 @@ func (s *DownloadStatus) UpdateTrack(id, title, releaseTitle, workerID string, n
 	if phase == "Finished" {
 		if prev, ok := s.tracks[id]; ok {
 			// Retain the size so the aggregate progress bar keeps a stable total.
-			// Prefer the final reported size; fall back to the last seen done.
-			size := prev.size
+			// maxBytes is the trustworthy high-water size (see field doc); fall back to
+			// the reported total, then the last seen done, for older/edge cases.
+			size := prev.maxBytes
+			if size <= 0 {
+				size = prev.size
+			}
 			if size <= 0 {
 				size = prev.done
 			}
@@ -4205,6 +4217,18 @@ func (s *DownloadStatus) UpdateTrack(id, title, releaseTitle, workerID string, n
 		state.phase = phase
 		state.done = done
 		state.size = total
+		// Maintain maxBytes as the true-size high-water mark (see field doc). The
+		// direct-stream path reports total=resp.ContentLength; the HLS-segment path
+		// reports total=0 and exposes size only via accumulated `done`. Post-download
+		// phases report 0/1 sentinels and Decrypting rewinds `done` to 0 — none of
+		// which can lower maxBytes, so finishedSizes captures the real track size and
+		// the upload bar no longer collapses to "7.00MB / 7.00MB".
+		if total > state.maxBytes {
+			state.maxBytes = total
+		}
+		if done > state.maxBytes {
+			state.maxBytes = done
+		}
 		state.updatedAt = now
 		if workerID != "" {
 			state.workerID = workerID
