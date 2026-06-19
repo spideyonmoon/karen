@@ -2148,6 +2148,27 @@ func mvDownloader(ctx context.Context, adamID string, saveDir string, token stri
 
 	fmt.Println(MVInfo.Data[0].Attributes.Name)
 
+	// Register the muxed MV with the rip state so the Telegram delivery layer can find
+	// it the same way it finds audio tracks. Used by both the cached and freshly-ripped
+	// paths so a cached file is still delivered/uploaded. Harmless for the CLI path.
+	registerMV := func() {
+		rs := ripStateFrom(ctx)
+		rs.addPath(mvOutPath)
+		mvMeta := AudioMeta{
+			TrackID:        strings.TrimSpace(adamID),
+			Title:          strings.TrimSpace(MVInfo.Data[0].Attributes.Name),
+			Performer:      strings.TrimSpace(MVInfo.Data[0].Attributes.ArtistName),
+			DurationMillis: int64(MVInfo.Data[0].Attributes.DurationInMillis),
+			AlbumName:      strings.TrimSpace(MVInfo.Data[0].Attributes.AlbumName),
+			ReleaseDate:    strings.TrimSpace(MVInfo.Data[0].Attributes.ReleaseDate),
+			ContentRating:  strings.TrimSpace(MVInfo.Data[0].Attributes.ContentRating),
+			Codec:          "MV",
+		}
+		if mvMeta.Title != "" || mvMeta.Performer != "" {
+			rs.putMeta(mvOutPath, mvMeta)
+		}
+	}
+
 	exists, _ := fileExists(mvOutPath)
 	if ripStateFrom(ctx).noCache() && exists {
 		fmt.Println("--no-cache: removing existing MV to re-rip fresh.")
@@ -2155,7 +2176,11 @@ func mvDownloader(ctx context.Context, adamID string, saveDir string, token stri
 		exists = false
 	}
 	if exists {
-		fmt.Println("MV already exists locally.")
+		fmt.Println("MV already cached locally — skipping download, will upload.")
+		if progress != nil {
+			progress("Cached, preparing upload", 0, 0)
+		}
+		registerMV()
 		return nil
 	}
 
@@ -2264,23 +2289,9 @@ func mvDownloader(ctx context.Context, adamID string, saveDir string, token stri
 	}
 	fmt.Printf("\rMV Remuxed.   \n")
 
-	// Register the muxed MV so the Telegram delivery layer can find it the same way
-	// it finds audio tracks (recordDownloadedTrack). Harmless for the CLI path.
-	rs := ripStateFrom(ctx)
-	rs.addPath(mvOutPath)
-	mvMeta := AudioMeta{
-		TrackID:        strings.TrimSpace(adamID),
-		Title:          strings.TrimSpace(MVInfo.Data[0].Attributes.Name),
-		Performer:      strings.TrimSpace(MVInfo.Data[0].Attributes.ArtistName),
-		DurationMillis: int64(MVInfo.Data[0].Attributes.DurationInMillis),
-		AlbumName:      strings.TrimSpace(MVInfo.Data[0].Attributes.AlbumName),
-		ReleaseDate:    strings.TrimSpace(MVInfo.Data[0].Attributes.ReleaseDate),
-		ContentRating:  strings.TrimSpace(MVInfo.Data[0].Attributes.ContentRating),
-		Codec:          "MV",
-	}
-	if mvMeta.Title != "" || mvMeta.Performer != "" {
-		rs.putMeta(mvOutPath, mvMeta)
-	}
+	// Register the muxed MV so the Telegram delivery layer can find it (same as the
+	// cached path above).
+	registerMV()
 	return nil
 }
 
