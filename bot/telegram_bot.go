@@ -2927,6 +2927,23 @@ func (b *TelegramBot) sendVideoFileMTProto(chatID int64, path string, replyToID 
 		defer os.Remove(thumbPath)
 	}
 
+	// Append a video-quality + file-size line to the caption (best-effort; only
+	// the parts we actually have are shown).
+	var details []string
+	if quality := videoQualityLabel(height); quality != "" {
+		if width > 0 && height > 0 {
+			details = append(details, fmt.Sprintf("%s (%d×%d)", quality, width, height))
+		} else {
+			details = append(details, quality)
+		}
+	}
+	if sizeBytes > 0 {
+		details = append(details, formatBytes(sizeBytes))
+	}
+	if len(details) > 0 {
+		caption = fmt.Sprintf("%s\n%s", caption, strings.Join(details, " · "))
+	}
+
 	// Try native video first.
 	err := b.mtproto.UploadAndSendVideo(chatID, path, caption, durationSecs, width, height, thumbPath, replyToID, status, ctx)
 	if err == nil {
@@ -4951,6 +4968,29 @@ func formatBytes(value int64) string {
 		precision = 2
 	}
 	return fmt.Sprintf("%.*f%s", precision, size, units[unitIndex])
+}
+
+// videoQualityLabel maps a video's pixel height to a familiar quality tag
+// (e.g. 1080 -> "1080p", 2160 -> "4K"). Returns "" when the height is unknown.
+func videoQualityLabel(height int) string {
+	switch {
+	case height <= 0:
+		return ""
+	case height >= 2160:
+		return "4K"
+	case height >= 1440:
+		return "1440p"
+	case height >= 1080:
+		return "1080p"
+	case height >= 720:
+		return "720p"
+	case height >= 480:
+		return "480p"
+	case height >= 360:
+		return "360p"
+	default:
+		return fmt.Sprintf("%dp", height)
+	}
 }
 
 func calcBitrateKbps(sizeBytes int64, durationMillis int64) float64 {
