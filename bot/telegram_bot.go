@@ -134,11 +134,18 @@ type TelegramBot struct {
 	schedHeadRip   *RipState
 	schedHeadMode  string
 	schedBorrowReq *downloadRequest
-	// activeBoards is the live status board for every running task, keyed by
-	// taskID (guarded by queueMu). Under task concurrency the head and the sticky
-	// borrower each register their own board, so /status can resurface all of
-	// them; on the serial path it only ever holds one entry. Empty when idle.
+	// activeBoards is the per-task render/data source for every running task, keyed
+	// by taskID (guarded by queueMu). Under task concurrency the head and the sticky
+	// borrower each register their own entry, so /status can resurface all of them;
+	// on the serial path it only ever holds one entry. Empty when idle. Each entry
+	// is a member of exactly one chatBoard (the message owner for its chat).
 	activeBoards map[string]*DownloadStatus
+	// chatBoards owns the single live Telegram message per chat (guarded by queueMu).
+	// All of a chat's active tasks render into that one message via a single edit
+	// loop, so two concurrent tasks (head + borrower) never produce two messages or
+	// two edit streams. Created on the first task in a chat, removed when the last
+	// one retires.
+	chatBoards map[int64]*chatBoard
 	// idleStatus* track the single board shown by /status when nothing is running,
 	// so each /status replaces the previous one instead of stacking messages.
 	idleStatusMsgID  int
@@ -533,6 +540,7 @@ func newTelegramBot(token, appleToken string) *TelegramBot {
 		downloadQueue:    make(chan *downloadRequest, defaultQueueSize),
 		userTaskCount:    make(map[int64]int),
 		activeBoards:     make(map[string]*DownloadStatus),
+		chatBoards:       make(map[int64]*chatBoard),
 		cacheFile:        Config.TelegramCacheFile,
 		cache:            make(map[string]CachedAudio),
 		docCache:         make(map[string]CachedDocument),
@@ -1442,9 +1450,11 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args
 		}
 		switch {
 		case len(mine) > 0:
-			for _, s := range mine {
-				s.Relocate(replyToID)
-			}
+			// All of this chat's tasks share one combined board; resurface it once.
+			b.queueMu.Lock()
+			grp := b.chatBoards[chatID]
+			b.queueMu.Unlock()
+			grp.relocate(replyToID)
 		case len(others) > 0:
 			var sb strings.Builder
 			for i, s := range others {
@@ -2182,23 +2192,15 @@ func (b *TelegramBot) enqueueDownloadWithAfter(chatID int64, userID int64, usern
 	if userID != 0 {
 		b.userTaskCount[userID]++
 	}
-	// Snapshot this chat's live boards under the lock (activeBoardsSnapshot would
-	// re-take queueMu).
-	var mine []*DownloadStatus
-	for _, s := range b.activeBoards {
-		if s.chatID == chatID {
-			mine = append(mine, s)
-		}
-	}
+	// Grab this chat's combined board (if any) under the lock.
+	grp := b.chatBoards[chatID]
 	b.queueMu.Unlock()
 
 	// A new task was added. Instead of a separate "Queued" message, refresh this
-	// chat's live board(s) — their queue section now lists this task — and resurface
-	// them. If nothing is running here, the worker will create the board momentarily.
-	if len(mine) > 0 {
-		for _, s := range mine {
-			s.Relocate(replyToID)
-		}
+	// chat's combined board — its queue section now lists this task — and resurface
+	// it. If nothing is running here, the worker will create the board momentarily.
+	if grp != nil {
+		grp.relocate(replyToID)
 	} else if inProgress || queueLen > 0 {
 		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Queued (ID: %s). Position: %d\nStop: /stop_%s", taskID, position, taskID), nil, replyToID)
 	}
@@ -2325,33 +2327,16 @@ func (b *TelegramBot) runDownload(req *downloadRequest) {
 		}
 	}
 
-	status, err := newDownloadStatus(b, chatID, replyToID, req.statusMessageID, req)
+	// Register this task into its chat's combined status board (head and sticky
+	// borrower stack into one message keyed by chat), retire any idle board left by
+	// a previous /status, and ensure the section is removed when this task finishes.
+	status, err := b.attachBoard(chatID, replyToID, req)
 	if err != nil {
 		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Failed to create status message: %v", err), nil, replyToID)
 		dl_song = false
 		return
 	}
-	defer status.Stop()
-
-	// Register this task's live board so /status can render the same rich view,
-	// and retire any idle board left by a previous /status so it doesn't linger.
-	// Keying by taskID means the head and the sticky borrower each keep their own
-	// board with no contention — and the next head can register while a finished
-	// head's delivery is still running, since they have distinct keys.
-	b.queueMu.Lock()
-	b.activeBoards[req.taskID] = status
-	idleID := b.idleStatusMsgID
-	idleChat := b.idleStatusChatID
-	b.idleStatusMsgID = 0
-	b.queueMu.Unlock()
-	if idleID != 0 {
-		_ = b.deleteMessage(idleChat, idleID)
-	}
-	defer func() {
-		b.queueMu.Lock()
-		delete(b.activeBoards, req.taskID)
-		b.queueMu.Unlock()
-	}()
+	defer b.retireBoard(status)
 
 	progressFactory := func(track *task.Track) apputils.ProgressFunc {
 		totalTracks := track.TaskTotal
@@ -2614,7 +2599,6 @@ func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, re
 
 	if sentAny {
 		status.Stop()
-		_ = b.deleteMessage(chatID, status.MessageID())
 		b.sendDeliverySummary(ctx, chatID, paths, format, replyToID)
 	}
 }
@@ -2668,7 +2652,6 @@ func (b *TelegramBot) deliverTelegramIndividualFallback(chatID int64, paths []st
 	}
 	if sentAny {
 		status.Stop()
-		_ = b.deleteMessage(chatID, status.MessageID())
 		b.sendDeliverySummary(ctx, chatID, paths, format, replyToID)
 		return
 	}
@@ -2720,7 +2703,6 @@ func (b *TelegramBot) deliverTelegramZip(chatID int64, paths []string, replyToID
 			b.deliverGofileZipFromPath(chatID, zipPath, displayName, replyToID, status, ctx)
 		} else {
 			status.Stop()
-			_ = b.deleteMessage(chatID, status.MessageID())
 			b.sendDeliverySummary(ctx, chatID, paths, format, replyToID)
 		}
 	} else {
@@ -2766,7 +2748,6 @@ func (b *TelegramBot) deliverGofileZip(chatID int64, paths []string, replyToID i
 		}
 		if sentAny {
 			status.Stop()
-			_ = b.deleteMessage(chatID, status.MessageID())
 			return
 		}
 		b.reportDeliveryFailure(chatID, replyToID, status, lastErr)
@@ -2805,7 +2786,6 @@ func (b *TelegramBot) deliverGofileZipFromPath(chatID int64, zipPath string, dis
 	_ = b.sendMessageWithReply(chatID, msg, nil, replyToID)
 
 	status.Stop()
-	_ = b.deleteMessage(chatID, status.MessageID())
 }
 
 // reportDeliveryFailure gives the user a clear terminal message when nothing could be
@@ -2932,7 +2912,6 @@ func (b *TelegramBot) deliverMusicVideo(chatID int64, path string, replyToID int
 		err := b.sendVideoFileMTProto(chatID, path, replyToID, status, ctx)
 		if err == nil {
 			status.Stop()
-			_ = b.deleteMessage(chatID, status.messageID)
 			return
 		}
 		if errors.Is(err, context.Canceled) || (ctx != nil && ctx.Err() != nil) {
@@ -2956,7 +2935,6 @@ func (b *TelegramBot) deliverMusicVideo(chatID int64, path string, replyToID int
 	msg := fmt.Sprintf("File: %s\nDownload Link: %s", filepath.Base(path), link)
 	_ = b.sendMessageWithReply(chatID, msg, nil, replyToID)
 	status.Stop()
-	_ = b.deleteMessage(chatID, status.messageID)
 }
 
 // deliverMvGofile uploads a single music video straight to Gofile — no Telegram attempt,
@@ -2976,7 +2954,6 @@ func (b *TelegramBot) deliverMvGofile(chatID int64, path string, replyToID int, 
 	msg := fmt.Sprintf("File: %s\nDownload Link: %s", filepath.Base(path), link)
 	_ = b.sendMessageWithReply(chatID, msg, nil, replyToID)
 	status.Stop()
-	_ = b.deleteMessage(chatID, status.messageID)
 }
 
 // deliverArtwork sends extracted artwork to Telegram: image files as photos and the
@@ -3025,7 +3002,6 @@ func (b *TelegramBot) deliverArtwork(chatID int64, paths []string, replyToID int
 		return
 	}
 	status.Stop()
-	_ = b.deleteMessage(chatID, status.messageID)
 }
 
 // probeVideo returns the video's width, height, and duration (seconds) via ffprobe.
@@ -3725,25 +3701,19 @@ type trackProgressState struct {
 const speedWindow = 6 * time.Second
 
 type DownloadStatus struct {
-	bot            *TelegramBot
+	bot   *TelegramBot
+	group *chatBoard // chat's combined-message owner (message + edit loop)
 	chatID         int64
-	messageID      int
 	taskID         string
 	mode           string
 	startedAt      time.Time
 	phaseStartedAt time.Time
-	lastPhase      string
-	lastPercent    int
-	lastText       string
-	lastUpdate     time.Time
 	mu             sync.Mutex
 	latestPhase    string
 	latestDone     int64
 	latestTotal    int64
 	dirty          bool
-	updateCh       chan struct{}
-	stopCh         chan struct{}
-	stopOnce       sync.Once
+	retired        bool // set once retired (idempotent); guarded by queueMu
 	userID         int64
 	username       string
 	speedSamples   []progressSample
@@ -3782,19 +3752,19 @@ func isUploadPhase(phase string) bool {
 	return strings.HasPrefix(strings.TrimSpace(phase), "Uploading")
 }
 
-func newDownloadStatus(bot *TelegramBot, chatID int64, replyToID int, existingMsgID int, req *downloadRequest) (*DownloadStatus, error) {
+// newDownloadStatus builds the per-task render/data source. It performs no I/O —
+// the owning chatBoard sends and edits the actual Telegram message. attachBoard
+// wires the returned status into its chat's group.
+func newDownloadStatus(bot *TelegramBot, chatID int64, req *downloadRequest) *DownloadStatus {
 	status := &DownloadStatus{
 		bot:            bot,
 		chatID:         chatID,
-		messageID:      existingMsgID,
 		taskID:         req.taskID,
 		mode:           req.transferMode,
 		startedAt:      req.startedAt,
 		phaseStartedAt: req.startedAt,
 		userID:         req.userID,
 		username:       req.username,
-		updateCh:       make(chan struct{}, 1),
-		stopCh:         make(chan struct{}),
 		tracks:         make(map[string]trackProgressState),
 		finishedSizes:  nil,
 		workerLimit:    len(Config.WrapperManagerAddrs),
@@ -3803,24 +3773,301 @@ func newDownloadStatus(bot *TelegramBot, chatID int64, replyToID int, existingMs
 	if status.workerLimit < 1 {
 		status.workerLimit = 1
 	}
-	if existingMsgID <= 0 {
-		msgID, err := bot.sendMessageWithReplyReturn(chatID, "Starting download...", nil, replyToID)
-		if err != nil {
-			return nil, err
-		}
-		status.messageID = msgID
+	return status
+}
+
+// chatBoard owns the single live status message for one chat. Every active task in
+// the chat is a member; the board renders them stacked (head first, then borrower)
+// into one message and edits it from a single 3s loop, so N concurrent tasks never
+// produce N messages or N edit streams (the source of the double-edit floodwait risk
+// once task-concurrency could run two rips at once). Guarded by mu; the bot's
+// chatBoards map is guarded by queueMu.
+type chatBoard struct {
+	bot        *TelegramBot
+	chatID     int64
+	mu         sync.Mutex
+	messageID  int
+	members    []*DownloadStatus
+	lastText   string
+	lastUpdate time.Time
+	updateCh   chan struct{}
+	stopCh     chan struct{}
+	stopOnce   sync.Once
+}
+
+// signal nudges the loop to re-render soon (non-blocking; the loop coalesces).
+func (g *chatBoard) signal() {
+	if g == nil {
+		return
 	}
-	go status.loop()
+	select {
+	case g.updateCh <- struct{}{}:
+	default:
+	}
+}
+
+func (g *chatBoard) stop() {
+	if g == nil {
+		return
+	}
+	g.stopOnce.Do(func() { close(g.stopCh) })
+}
+
+func (g *chatBoard) loop() {
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-g.updateCh:
+			g.flush(false)
+		case <-ticker.C:
+			g.flush(false)
+		case <-g.stopCh:
+			return
+		}
+	}
+}
+
+// membersSnapshot copies the live members slice under lock.
+func (g *chatBoard) membersSnapshot() []*DownloadStatus {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	out := make([]*DownloadStatus, len(g.members))
+	copy(out, g.members)
+	return out
+}
+
+// renderCombined builds the plain + rich text for the whole chat: each live member's
+// section stacked in registration order, joined by a divider, with the queue listing
+// appended exactly once.
+func (g *chatBoard) renderCombined() (plain, rich string) {
+	members := g.membersSnapshot()
+	var pb, rb strings.Builder
+	for i, m := range members {
+		if i > 0 {
+			pb.WriteString("\n\n──────────\n\n")
+			rb.WriteString("\n\n---\n\n")
+		}
+		pb.WriteString(m.RenderSnapshotBare())
+		rb.WriteString(m.renderSnapshotBareRich())
+	}
+	pb.WriteString(g.bot.queueBoardSuffix())
+	rb.WriteString(g.bot.queueBoardSuffixRich())
+	return pb.String(), rb.String()
+}
+
+// flush re-renders the combined board and edits the chat's single message, with the
+// same 3s dedup/throttle the old per-board loop used. On throttle it simply returns;
+// the 3s ticker guarantees a follow-up edit, so there's no busy-loop.
+func (g *chatBoard) flush(force bool) {
+	if g == nil || g.bot == nil {
+		return
+	}
+	g.mu.Lock()
+	msgID := g.messageID
+	lastText := g.lastText
+	lastUpdate := g.lastUpdate
+	g.mu.Unlock()
+	if msgID == 0 {
+		return
+	}
+	plain, rich := g.renderCombined()
+	now := time.Now()
+	if !force {
+		if plain == lastText {
+			return
+		}
+		if now.Sub(lastUpdate) < 3*time.Second {
+			return
+		}
+	}
+	if _, err := g.bot.editMessageRich(g.chatID, msgID, rich, plain, nil); err != nil {
+		return
+	}
+	g.mu.Lock()
+	g.lastText = plain
+	g.lastUpdate = now
+	g.mu.Unlock()
+}
+
+// relocate deletes the current message and re-sends the combined board at the bottom
+// of the chat, so /status and new enqueues resurface a single up-to-date board (no
+// stale duplicates). The loop continues on the new message; the next flush upgrades
+// the plain re-send to the rich render.
+func (g *chatBoard) relocate(replyToID int) {
+	if g == nil || g.bot == nil {
+		return
+	}
+	plain, _ := g.renderCombined()
+	newID, err := g.bot.sendMessageWithReplyReturn(g.chatID, plain, nil, replyToID)
+	if err != nil {
+		return
+	}
+	g.mu.Lock()
+	oldID := g.messageID
+	g.messageID = newID
+	g.lastText = plain
+	g.lastUpdate = time.Now()
+	g.mu.Unlock()
+	if oldID != 0 && oldID != newID {
+		_ = g.bot.deleteMessage(g.chatID, oldID)
+	}
+}
+
+// attachBoard registers a task's render source into its chat's combined board,
+// creating the board (message + loop) on the first task in the chat and joining the
+// existing one otherwise. Returns the per-task DownloadStatus the runner updates.
+func (b *TelegramBot) attachBoard(chatID int64, replyToID int, req *downloadRequest) (*DownloadStatus, error) {
+	status := newDownloadStatus(b, chatID, req)
+
+	b.queueMu.Lock()
+	grp := b.chatBoards[chatID]
+	newGroup := grp == nil
+	if newGroup {
+		grp = &chatBoard{
+			bot:      b,
+			chatID:   chatID,
+			updateCh: make(chan struct{}, 1),
+			stopCh:   make(chan struct{}),
+		}
+		b.chatBoards[chatID] = grp
+	}
+	status.group = grp
+	grp.mu.Lock()
+	grp.members = append(grp.members, status)
+	grp.mu.Unlock()
+	b.activeBoards[req.taskID] = status
+	idleID := b.idleStatusMsgID
+	idleChat := b.idleStatusChatID
+	b.idleStatusMsgID = 0
+	b.queueMu.Unlock()
+
+	if idleID != 0 {
+		_ = b.deleteMessage(idleChat, idleID)
+	}
+
+	if newGroup {
+		// First task in this chat: adopt the request's pre-sent placeholder if it has
+		// one, else send the initial message. Set the message ID before starting the
+		// loop so flush never runs against a zero ID.
+		msgID := req.statusMessageID
+		if msgID <= 0 {
+			id, err := b.sendMessageWithReplyReturn(chatID, "Starting download...", nil, replyToID)
+			if err != nil {
+				// Roll back this registration. Only drop the group if no other task
+				// raced in and joined it meanwhile, so we never orphan a sibling.
+				b.queueMu.Lock()
+				delete(b.activeBoards, req.taskID)
+				grp.mu.Lock()
+				for i, m := range grp.members {
+					if m == status {
+						grp.members = append(grp.members[:i], grp.members[i+1:]...)
+						break
+					}
+				}
+				empty := len(grp.members) == 0
+				grp.mu.Unlock()
+				if empty {
+					delete(b.chatBoards, chatID)
+				}
+				b.queueMu.Unlock()
+				return nil, err
+			}
+			msgID = id
+		}
+		grp.mu.Lock()
+		grp.messageID = msgID
+		grp.mu.Unlock()
+		go grp.loop()
+	} else {
+		// Joining an existing board: drop any placeholder this request pre-sent so it
+		// doesn't dangle, then refresh the combined message to include the new task.
+		if req.statusMessageID > 0 {
+			_ = b.deleteMessage(chatID, req.statusMessageID)
+		}
+		grp.signal()
+	}
 	return status, nil
 }
 
+// retireBoard removes a finished task's section from its chat's combined board. It is
+// idempotent. When other tasks remain in the chat, the section simply disappears
+// (success or failure alike). When this was the last task, the message is deleted on
+// success, or kept showing the final state on a terminal failure/cancel — so a lone
+// error stays visible, matching the pre-combined single-board behavior.
+func (b *TelegramBot) retireBoard(s *DownloadStatus) {
+	if s == nil {
+		return
+	}
+	b.queueMu.Lock()
+	if s.retired {
+		b.queueMu.Unlock()
+		return
+	}
+	s.retired = true
+	delete(b.activeBoards, s.taskID)
+	grp := s.group
+	empty := false
+	if grp != nil {
+		grp.mu.Lock()
+		for i, m := range grp.members {
+			if m == s {
+				grp.members = append(grp.members[:i], grp.members[i+1:]...)
+				break
+			}
+		}
+		empty = len(grp.members) == 0
+		grp.mu.Unlock()
+		if empty {
+			delete(b.chatBoards, s.chatID)
+		}
+	}
+	b.queueMu.Unlock()
+
+	if grp == nil {
+		return
+	}
+	if !empty {
+		grp.signal() // re-render without this section
+		return
+	}
+	// Last task in this chat: stop the loop, then finalize the single message.
+	grp.stop()
+	grp.mu.Lock()
+	msgID := grp.messageID
+	grp.mu.Unlock()
+	if msgID == 0 {
+		return
+	}
+	if s.finishedAsFailure() {
+		plain := s.RenderSnapshotBare() + b.queueBoardSuffix()
+		rich := s.renderSnapshotBareRich() + b.queueBoardSuffixRich()
+		_, _ = b.editMessageRich(s.chatID, msgID, rich, plain, nil)
+		return
+	}
+	_ = b.deleteMessage(s.chatID, msgID)
+}
+
+// finishedAsFailure reports whether the task's final phase denotes a terminal failure
+// or cancellation (vs a clean finish), so retireBoard can keep a lone error visible
+// instead of deleting the message.
+func (s *DownloadStatus) finishedAsFailure() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	p := strings.ToLower(strings.TrimSpace(s.latestPhase))
+	s.mu.Unlock()
+	return strings.Contains(p, "fail") || strings.Contains(p, "cancel") || strings.HasPrefix(p, "no files")
+}
+
+// Stop retires this task's board (idempotent). It's a thin alias to retireBoard so
+// the delivery call sites can mark completion without reaching into chatBoard.
 func (s *DownloadStatus) Stop() {
 	if s == nil || s.bot == nil {
 		return
 	}
-	s.stopOnce.Do(func() {
-		close(s.stopCh)
-	})
+	s.bot.retireBoard(s)
 }
 
 func (s *DownloadStatus) Update(phase string, done, total int64) {
@@ -3830,10 +4077,7 @@ func (s *DownloadStatus) Update(phase string, done, total int64) {
 	s.mu.Lock()
 	s.setLatestLocked(phase, done, total)
 	s.mu.Unlock()
-	select {
-	case s.updateCh <- struct{}{}:
-	default:
-	}
+	s.group.signal()
 }
 
 func (s *DownloadStatus) UpdateSync(phase string, done, total int64) {
@@ -3843,7 +4087,7 @@ func (s *DownloadStatus) UpdateSync(phase string, done, total int64) {
 	s.mu.Lock()
 	s.setLatestLocked(phase, done, total)
 	s.mu.Unlock()
-	s.flush(true)
+	s.group.flush(true)
 }
 
 func (s *DownloadStatus) UpdateTrack(id, title, releaseTitle, workerID string, number, trackTotal int, phase string, done, total int64) {
@@ -3903,23 +4147,7 @@ func (s *DownloadStatus) UpdateTrack(id, title, releaseTitle, workerID string, n
 	}
 	s.dirty = true
 	s.mu.Unlock()
-	if s.updateCh != nil {
-		select {
-		case s.updateCh <- struct{}{}:
-		default:
-		}
-	}
-}
-
-// MessageID returns the board's current Telegram message ID under lock, so callers
-// (delivery cleanup, etc.) stay correct even if Relocate moved the board concurrently.
-func (s *DownloadStatus) MessageID() int {
-	if s == nil {
-		return 0
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.messageID
+	s.group.signal()
 }
 
 // RenderSnapshot returns the current status board text using the same renderer
@@ -3959,27 +4187,32 @@ func (s *DownloadStatus) RenderSnapshotBare() string {
 	return s.formatProgressText(phase, done, total, percent)
 }
 
-// Relocate deletes the current board message and re-sends it at the bottom of the
-// chat, keeping a single up-to-date board (no stale duplicates) when /status is run
-// or a new task is enqueued. The live update loop continues on the new message.
-func (s *DownloadStatus) Relocate(replyToID int) {
-	if s == nil || s.bot == nil {
-		return
-	}
-	text := s.RenderSnapshot()
-	newID, err := s.bot.sendMessageWithReplyReturn(s.chatID, text, nil, replyToID)
-	if err != nil {
-		return
+// renderSnapshotBareRich is the Rich-Markdown counterpart of RenderSnapshotBare: the
+// task's section without the queue suffix, so chatBoard.renderCombined can stack
+// several sections and append the queue listing exactly once.
+func (s *DownloadStatus) renderSnapshotBareRich() string {
+	if s == nil {
+		return ""
 	}
 	s.mu.Lock()
-	oldID := s.messageID
-	s.messageID = newID
-	s.lastText = text
-	s.lastUpdate = time.Now()
+	phase := s.latestPhase
+	done := s.latestDone
+	total := s.latestTotal
 	s.mu.Unlock()
-	if oldID != 0 && oldID != newID {
-		_ = s.bot.deleteMessage(s.chatID, oldID)
+	if strings.TrimSpace(phase) == "" {
+		phase = "Working"
 	}
+	percent := -1
+	if total > 0 {
+		percent = int(float64(done) / float64(total) * 100)
+		if percent < 0 {
+			percent = 0
+		}
+		if percent > 100 {
+			percent = 100
+		}
+	}
+	return s.formatProgressRich(phase, done, total, percent)
 }
 
 func (s *DownloadStatus) setLatestLocked(phase string, done, total int64) {
@@ -4068,83 +4301,6 @@ func (s *DownloadStatus) rollingSpeedBytesPerSec() float64 {
 		return 0
 	}
 	return float64(db) / dt
-}
-
-func (s *DownloadStatus) loop() {
-	ticker := time.NewTicker(3 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-s.updateCh:
-			s.flush(false)
-		case <-ticker.C:
-			s.flush(false)
-		case <-s.stopCh:
-			return
-		}
-	}
-}
-
-func (s *DownloadStatus) flush(force bool) {
-	if s == nil || s.bot == nil {
-		return
-	}
-	s.mu.Lock()
-	if !s.dirty && !force {
-		s.mu.Unlock()
-		return
-	}
-	phase := s.latestPhase
-	done := s.latestDone
-	total := s.latestTotal
-	s.dirty = false
-	lastText := s.lastText
-	lastUpdate := s.lastUpdate
-	msgID := s.messageID
-	s.mu.Unlock()
-
-	percent := -1
-	if total > 0 {
-		percent = int(float64(done) / float64(total) * 100)
-		if percent < 0 {
-			percent = 0
-		}
-		if percent > 100 {
-			percent = 100
-		}
-	}
-
-	suffix := s.bot.queueBoardSuffix()
-	text := s.formatProgressText(phase, done, total, percent) + suffix
-	now := time.Now()
-	if !force {
-		if text == lastText {
-			return
-		}
-		if now.Sub(lastUpdate) < 3*time.Second {
-			s.mu.Lock()
-			s.dirty = true
-			s.mu.Unlock()
-			return
-		}
-	}
-
-	// Prefer a Rich Message edit (Bot API 10.1); editMessageRich transparently
-	// falls back to a plain-text edit if the API can't serve rich content. We
-	// dedup on the plain `text` (cheap and stable) regardless of which path ran.
-	richText := s.formatProgressRich(phase, done, total, percent) + s.bot.queueBoardSuffixRich()
-	if _, err := s.bot.editMessageRich(s.chatID, msgID, richText, text, nil); err != nil {
-		s.mu.Lock()
-		s.dirty = true
-		s.mu.Unlock()
-		return
-	}
-	s.mu.Lock()
-	s.lastPhase = phase
-	s.lastPercent = percent
-	s.lastText = text
-	s.lastUpdate = now
-	s.mu.Unlock()
 }
 
 func formatUploadMode(mode string) string {
@@ -4550,12 +4706,13 @@ func (s *DownloadStatus) formatProgressRich(phase string, done, total int64, per
 	// Per-track table — only for multi-track releases with live data. The track
 	// number folds into the Track cell ("01 · Title") so there's no wide right-
 	// aligned "#" column shoving the rest of the table to the right. The table is
-	// wrapped in a collapsible <details> block (Bot API 10.1 Rich Markdown renders
-	// supported HTML directly) so the board can be collapsed; it stays open here so
-	// live progress is visible by default. Blank lines around the table keep GFM
-	// parsing it as a table inside the details block.
+	// wrapped in a collapsed <details> block (Bot API 10.1 Rich Markdown renders
+	// supported HTML directly) so the board stays compact — important now that two
+	// tasks can share one combined message; the user taps "Tracks · N active" to
+	// expand. Blank lines around the table keep GFM parsing it as a table inside the
+	// details block.
 	if !snap.single && len(snap.active) > 0 {
-		fmt.Fprintf(&b, "\n<details open>\n<summary>Tracks · %d active</summary>\n\n", len(snap.active))
+		fmt.Fprintf(&b, "\n<details>\n<summary>Tracks · %d active</summary>\n\n", len(snap.active))
 		b.WriteString("| Track | Progress | Speed |\n|:------|:--------:|------:|\n")
 		shown := 0
 		for _, st := range snap.active {
@@ -4603,15 +4760,17 @@ func (s *DownloadStatus) formatProgressRich(phase string, done, total int64, per
 		}
 	}
 
-	// Footer blockquote: one fact per line so it reads as a tidy stack rather than
-	// a dense run-on — speed, elapsed, who/mode, then cancel.
-	// /stop_<id> stays bare (no code span) so Telegram auto-links it as a tappable
-	// command; task IDs are hex, safe from GFM emphasis.
-	fmt.Fprintf(&b, "\n> %s %s/s\n> %s %s\n> by %s · %s\n> %s cancel /stop_%s\n",
+	// Footer blockquote: three lines — speed+elapsed, who·mode, then the cancel
+	// command. Each non-final line ends in TWO spaces (a GFM hard break): without it
+	// Telegram's rich blockquote soft-wraps the lines into one run-on (the old
+	// four-line footer rendered as a single line). The stray "✕" is gone. /stop_<id>
+	// stays bare so Telegram auto-links it as a tappable command; task IDs are hex,
+	// safe from GFM emphasis.
+	fmt.Fprintf(&b, "\n> %s %s/s  %s %s  \n> by %s · %s  \n> cancel /stop_%s\n",
 		symSpeed, formatBytes(int64(totalSpeed)),
 		symElapsed, elapsedStr,
 		escapeRichMD(user), escapeRichMD(shortMode(s.mode)),
-		symCancel, s.taskID,
+		s.taskID,
 	)
 	return b.String()
 }
