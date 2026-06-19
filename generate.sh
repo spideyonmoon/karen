@@ -174,9 +174,11 @@ done
 } > docker-compose.override.yml
 echo "Wrote docker-compose.override.yml"
 
-# Ensure the persistent bot-state file exists as a FILE before `docker compose
-# up`. A bind mount to a non-existent path makes Docker create a directory,
-# which would silently break state persistence (admin lock + scheduled rips).
-# Gitignored; an empty file is treated as "defaults" by the bot on first load.
-touch bot/telegram-state.json
-echo "Ensured bot/telegram-state.json exists"
+# Ensure the persistent state DIRECTORY exists before `docker compose up`. The
+# bot keeps all mutable JSON here (telegram-cache.json, telegram-state.json,
+# telegram-schedule.json) and docker-compose.yml bind-mounts the whole dir, so
+# atomic tmp+rename saves actually reach the host (a single-file mount would
+# break them — see the comment in docker-compose.yml). Gitignored; empty/missing
+# files are treated as "defaults" by the bot on first load.
+mkdir -p bot/state
+echo "Ensured bot/state/ exists"

@@ -9,11 +9,16 @@ services:
     volumes:
       - ./bot/config.yaml:/app/config.yaml
       - ./bot/downloads:/downloads
-      - ./bot/telegram-cache.json:/app/telegram-cache.json
-      # Admin lock + scheduled sleeptime rips. Without this mount the file lives
-      # only in the container layer and is wiped on every --build deploy.
-      # generate.sh touches the host file first so Docker mounts a file, not a dir.
-      - ./bot/telegram-state.json:/app/telegram-state.json
+      # All mutable JSON state (audio cache, admin lock + user profiles, and the
+      # scheduled-rip queue) lives in this ONE directory mount — NOT as per-file
+      # mounts. A single-file bind mount breaks atomic saves: the code writes a
+      # ".tmp" sibling then os.Rename()s it over the target, but tmp sits on the
+      # container overlay fs while a single-file mount is a separate device, so the
+      # rename returns EXDEV and the host file silently never updates (cache lost,
+      # scheduled jobs lost across restarts). Mounting the directory puts tmp and
+      # target on the same fs, so rename is atomic and actually persists.
+      # generate.sh creates ./bot/state first so Docker mounts a dir, not a file.
+      - ./bot/state:/app/state
     command: ["--bot"]
     restart: unless-stopped
     # MTProto uploads to DC5 (Singapore, ~176ms RTT) drop/resume because

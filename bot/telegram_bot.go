@@ -164,9 +164,16 @@ type TelegramBot struct {
 	// It is a LEAF lock: never acquire queueMu while holding it, and never hold
 	// it across an enqueue*/cancel/purge call (those take queueMu).
 	stateMu       sync.Mutex
-	stateFile     string
-	adminLock     bool            // true => only admins may use the bot (persisted)
-	scheduledJobs []*scheduledJob // pending sleeptime rips (persisted)
+	stateFile     string               // admin lock + user profiles (DM-backed-up daily)
+	scheduleFile  string               // pending sleeptime rips (persisted, NOT backed up)
+	adminLock     bool                 // true => only admins may use the bot (persisted)
+	scheduledJobs []*scheduledJob      // pending sleeptime rips (persisted)
+	userPrefs     map[int64]*UserPrefs // saved per-user rip profiles (persisted, keyed by user ID)
+
+	// profileOwners tracks who opened each live /profile panel ("chatID:messageID"
+	// → userID) so only that user may operate its buttons. Guarded by profileMu.
+	profileMu     sync.Mutex
+	profileOwners map[string]int64
 }
 
 type PendingSelection struct {
@@ -509,16 +516,21 @@ func newTelegramBot(token, appleToken string) *TelegramBot {
 	if maxFileBytes <= 0 {
 		maxFileBytes = 50 * 1024 * 1024
 	}
+	// All mutable JSON state lives together in the bind-mounted state/ directory
+	// (see docker-compose.yml) so atomic tmp+rename saves actually persist. The
+	// cache file defaults into that dir; the state + schedule files are derived
+	// from its directory so an explicit telegram-cache-file override keeps them
+	// colocated.
 	cacheFile := strings.TrimSpace(Config.TelegramCacheFile)
 	if cacheFile == "" {
-		cacheFile = "telegram-cache.json"
+		cacheFile = "state/telegram-cache.json"
 	}
-	// State file lives beside the cache file so a single download-folder volume
-	// covers both; defaults to telegram-state.json in the working dir (/app),
-	// which is bind-mounted in docker-compose.yml.
+	stateDir := filepath.Dir(cacheFile)
 	stateFile := "telegram-state.json"
-	if dir := filepath.Dir(cacheFile); dir != "." && dir != "" {
-		stateFile = filepath.Join(dir, "telegram-state.json")
+	scheduleFile := "telegram-schedule.json"
+	if stateDir != "." && stateDir != "" {
+		stateFile = filepath.Join(stateDir, "telegram-state.json")
+		scheduleFile = filepath.Join(stateDir, "telegram-schedule.json")
 	}
 	queueSize := defaultQueueSize
 	if queueSize <= 0 {
@@ -541,17 +553,20 @@ func newTelegramBot(token, appleToken string) *TelegramBot {
 		userTaskCount:    make(map[int64]int),
 		activeBoards:     make(map[string]*DownloadStatus),
 		chatBoards:       make(map[int64]*chatBoard),
-		cacheFile:        Config.TelegramCacheFile,
+		cacheFile:        cacheFile,
 		cache:            make(map[string]CachedAudio),
 		docCache:         make(map[string]CachedDocument),
 		admins:           admins,
 		stateFile:        stateFile,
+		scheduleFile:     scheduleFile,
 	}
 	bot.loadCache()
 	bot.loadState()
+	bot.loadSchedule()
 	bot.startDownloadWorker()
 	bot.startPurgeRoutine()
 	bot.startScheduler()
+	bot.startBackupRoutine()
 	return bot
 }
 
@@ -730,6 +745,10 @@ func (b *TelegramBot) startTask(req *downloadRequest, borrower bool, budget int)
 	rip.NoCache = req.noCache
 	rip.Song = req.single
 	rip.WrapperBudget = budget
+	if req.userID != 0 && b.hasPrefs(req.userID) {
+		p := b.getPrefs(req.userID)
+		rip.Prefs = &p
+	}
 	req.rip = rip
 
 	done := make(chan struct{})
@@ -1330,6 +1349,8 @@ func (b *TelegramBot) handleCallback(cb *CallbackQuery) {
 		if delta, err := strconv.Atoi(deltaStr); err == nil {
 			alert = b.handlePage(cb.Message.Chat.ID, cb.Message.MessageID, delta, clickerID)
 		}
+	} else if strings.HasPrefix(data, "pf:") {
+		alert = b.handleProfileCallback(cb, data, clickerID)
 	}
 	if alert != "" {
 		_ = b.answerCallbackAlert(cb.ID, alert)
@@ -1436,6 +1457,8 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args
 	switch cmd {
 	case "start", "help":
 		_, _ = b.sendRichMessage(chatID, botHelpRich(), botHelpText(), nil, replyToID)
+	case "profile":
+		b.handleProfileCommand(chatID, userID, replyToID)
 	case "status", "queue":
 		// Split active boards into this chat's and others'. Boards in this chat are
 		// resurfaced (each dropped + re-sent at the bottom); active tasks living in
@@ -1509,6 +1532,37 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args
 				headlessMode = transferModeGofileZip
 			default:
 				link = arg
+			}
+		}
+
+		// Seed unset choices from the user's saved profile so /dl runs zero-prompt.
+		// Explicit command flags ALWAYS win — this only fills what the user left
+		// blank, and never mutates the stored profile (one-off override). Codec maps
+		// to the force-flags; a concrete delivery target fills headlessMode, which
+		// already bypasses the transfer-mode prompt for every link type below.
+		if userID != 0 && b.hasPrefs(userID) {
+			prefs := b.getPrefs(userID)
+			if !forceAAC && !forceAtmos && !forceFlac {
+				switch prefs.Codec {
+				case "aac":
+					forceAAC = true
+				case "atmos":
+					forceAtmos = true
+				case "flac":
+					forceFlac = true
+				// "alac" / "" → default codec, no force flag needed.
+				}
+			}
+			if headlessMode == "" {
+				switch prefs.DeliveryTarget {
+				case "telegram":
+					headlessMode = transferModeTelegramIndividual
+				case "telegram_zip":
+					headlessMode = transferModeTelegramZip
+				case "gofile":
+					headlessMode = transferModeGofileZip
+				// "ask" / "" → keep the interactive transfer prompt.
+				}
 			}
 		}
 
@@ -2285,6 +2339,10 @@ func (b *TelegramBot) runDownload(req *downloadRequest) {
 			rs = newRipState()
 			rs.NoCache = req.noCache
 			rs.Song = single
+			if req.userID != 0 && b.hasPrefs(req.userID) {
+				p := b.getPrefs(req.userID)
+				rs.Prefs = &p
+			}
 		}
 		rctx = withRipState(req.ctx, rs)
 	} else {
@@ -2966,6 +3024,13 @@ func (b *TelegramBot) deliverArtwork(chatID int64, paths []string, replyToID int
 	}
 	status.UpdateSync("Uploading artwork...", 0, 0)
 
+	// Cover-delivery profile pref: "document" sends still images as a plain file
+	// (full quality, no Telegram re-compression) instead of an inline photo.
+	preferDoc := false
+	if rs := ripStateFrom(ctx); rs != nil && rs.Prefs != nil && rs.Prefs.CoverDelivery == "document" {
+		preferDoc = true
+	}
+
 	sentAny := false
 	var lastErr error
 	for _, p := range paths {
@@ -2978,6 +3043,12 @@ func (b *TelegramBot) deliverArtwork(chatID int64, paths []string, replyToID int
 		switch strings.ToLower(filepath.Ext(p)) {
 		case ".mp4", ".mov", ".m4v":
 			err = b.sendVideoWithReply(chatID, p, caption, replyToID)
+		case ".jpg", ".jpeg", ".png", ".webp":
+			if preferDoc {
+				err = b.sendDocumentFile(chatID, p, filepath.Base(p), replyToID, nil, "")
+			} else {
+				err = b.sendPhotoWithReply(chatID, p, caption, replyToID)
+			}
 		default:
 			err = b.sendPhotoWithReply(chatID, p, caption, replyToID)
 		}
@@ -6328,6 +6399,7 @@ Commands:
 /count <apple-music-link>        count the streamable tracks behind a link
 /status or /queue                show active task and queue count
 /stop_<task_id>                  cancel a running or queued download
+/profile                         set your saved rip preferences (buttons)
 /help                            show this message
 
 Heavy rips (full artist discographies, and playlists over 100 tracks) are
@@ -6363,6 +6435,7 @@ Rips lossless ALAC, Dolby Atmos, and AAC from Apple Music straight to your chat.
 | ` + "`/count <link>`" + ` | Count the streamable tracks behind a link |
 | ` + "`/status`" + ` or ` + "`/queue`" + ` | Show the active task and queue |
 | ` + "`/stop_<task_id>`" + ` | Cancel a running or queued download |
+| ` + "`/profile`" + ` | Set your saved rip preferences (all buttons) |
 | ` + "`/help`" + ` | Show this message |
 
 > Heavy rips (full artist discographies, playlists over 100 tracks) deliver as a Gofile ZIP and, outside 2:30–6:00 AM Dhaka time, are scheduled for that window.
