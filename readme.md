@@ -122,6 +122,14 @@ The account count drives everything — `generate.sh` rewrites `config.yaml` (th
 
 ---
 
+## Data & backups
+
+All persistent state lives in `bot/state/` (a directory bind mount, gitignored): the Telegram `file_id` cache, per-user `/profile` preferences, and the sleeptime job schedule. Saves are atomic.
+
+Because a VPS can vanish, the bot DMs every admin (`ADMIN_IDS`) a copy of the profile data (`karen-state-YYYY-MM-DD.json`) once a day at **04:00 Dhaka time**. Worst-case loss on a total VPS wipe is one day of profile changes — restore by dropping the file back into `bot/state/`. The job schedule is intentionally not backed up.
+
+---
+
 ## Usage
 
 ### Commands
@@ -129,6 +137,7 @@ The account count drives everything — `generate.sh` rewrites `config.yaml` (th
 | Command | Description |
 |---|---|
 | `/dl <url> [flags]` | Download a song, album, or playlist |
+| `/profile` | Set saved rip preferences (codec, quality, lyrics, cover, delivery target…) so `/dl` runs with zero flags and zero prompts. Fully button-driven UI; prefs persist per user. |
 | `/status` or `/queue` | Show active task and queue count |
 | `/stop_<task_id>` | Cancel a running or queued download |
 | `/help` | Show help message |
@@ -234,6 +243,9 @@ karen/
 ├── bot/                        # Go binary
 │   ├── main.go                 # Core: ripTrack, extractMedia, album/playlist flows
 │   ├── telegram_bot.go         # Telegram bot handler, download queue, delivery
+│   ├── profile.go              # /profile saved-prefs rich UI + pf:* callbacks
+│   ├── admin_tasks.go          # State persistence, sleeptime scheduler, daily backup
+│   ├── ripstate.go             # Per-rip Config overlay (ripConfig) from user prefs
 │   ├── mtproto.go              # MTProto client for large uploads
 │   ├── config.yaml.example     # Config template
 │   ├── utils/
@@ -249,6 +261,7 @@ karen/
 ├── wrapper-manager/
 │   ├── Dockerfile              # Builds upstream wrapper-manager + patches
 │   └── webplay.go              # Nil-safety patch for WebPlayback handler
+├── bot/state/                  # Persisted JSON: cache, user profiles, schedule (dir mount, gitignored)
 ├── .env.example                # Single source of truth — copy to .env, fill in
 ├── setup.sh                    # One-time bootstrap: generate + login + start
 ├── generate.sh                 # Writes config.yaml + docker-compose.override.yml from .env
