@@ -131,17 +131,19 @@ const (
 // net.ipv4.tcp_wmem max to 16 MB (verified live in the container), so the in-flight
 // window can grow while leaving room for the keepalive ping.
 //
-// At 16 the sawtooth was cured (clean log over a full 168 MB upload) but throughput
-// stayed moderate (~6-7 MB/s) — gotd serializes RPC writes over the one connection, so
-// raising threads has diminishing returns. Trialing 20 (10 MB in flight = 62% of the
-// 16 MB buffer, ~6 MB keepalive headroom) as the decisive test of whether more threads
-// buy throughput on a single connection. If speed climbs AND the log stays clean, 24 is
-// the next notch (12 MB = 75% of buffer — getting tight). If it flatlines at ~6-7, the
-// single connection is protocol-saturated and only a multi-connection path (Pyrofork
-// sidecar) lifts it. Watch the zap log for "pong missed"; if it returns, drop back to 16.
+// At 16 the sawtooth was cured (clean log over a full 168 MB upload). Trialing 20 (10 MB
+// in flight = 62% of the 16 MB buffer) RE-INTRODUCED the teardown: dc_id=5 "engine
+// forcibly closed: context canceled" mid-upload (e.g. part 197), the same drop/resume
+// sawtooth. So 20 over-fills the send buffer and re-starves the keepalive write even at
+// 16 MB — the safe ceiling on this single connection is 16. Throughput at 16 stays
+// moderate (the displayed ~6-7 MB/s is itself suspect — known progress-board display
+// bug), but it is STABLE. gotd serializes RPC writes over the one connection, so the
+// single connection is protocol-saturated; only a multi-connection path (Pyrofork
+// sidecar or a Go client pool) lifts it further. DO NOT raise above 16 without a buffer
+// increase. Watch the zap log for "pong missed" / "engine forcibly closed".
 const (
 	uploadPartSize = 512 * 1024
-	uploadThreads  = 20
+	uploadThreads  = 16
 )
 
 // awaitReady blocks until the supervisor has a live, authenticated client again and
