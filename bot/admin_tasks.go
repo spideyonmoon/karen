@@ -45,10 +45,40 @@ type scheduledJob struct {
 
 func (j *scheduledJob) releaseTime() time.Time { return time.Unix(j.ReleaseAtUnix, 0) }
 
+// UserPrefs is a single user's saved rip profile. Every field is "unset" at its
+// zero value (empty string, nil pointer, or 0), and an unset field means "inherit
+// the global config default" — so a user who has never touched /profile sees the
+// exact same behavior as before this feature existed. Pointers are used for the
+// tri-state booleans (nil = inherit, &true / &false = explicit) so a saved "off"
+// is distinguishable from "never set". Keyed by Telegram user ID so a profile
+// follows the person across chats.
+type UserPrefs struct {
+	// Core
+	Codec          string `json:"codec"`           // "" | alac | flac | aac | atmos
+	Quality        string `json:"quality"`         // "" | redbook | hires  (AlacMax/AtmosMax)
+	LyricMode      string `json:"lyric_mode"`      // "" | off | static | synced | word
+	EmbedLrc       *bool  `json:"embed_lrc"`       // nil = inherit config default
+	CoverDelivery  string `json:"cover_delivery"`  // "" | photo | document
+	AnimatedArt    *bool  `json:"animated_art"`    // include motion artwork
+	EmbedCover     *bool  `json:"embed_cover"`     // embed cover in the audio file
+	DeliveryTarget string `json:"delivery_target"` // "" | ask | telegram | telegram_zip | gofile
+	// Selected extras
+	AacType        string `json:"aac_type"`        // "" | aac-lc | aac | he-aac | binaural | downmix
+	ExplicitChoice string `json:"explicit_choice"` // "" | explicit | clean
+	AppleMaster    *bool  `json:"apple_master"`    // prefer Apple Digital Master
+	CoverFormat    string `json:"cover_format"`    // "" | jpg | png | original
+	CoverSize      string `json:"cover_size"`      // "" | e.g. 1000x1000 | 3000x3000
+	Language       string `json:"language"`        // "" | metadata/lyric locale (e.g. ja, en)
+	MVMax          int    `json:"mv_max"`          // 0=inherit | 360|480|720|1080|2160 (max cap)
+	SilentDelivery *bool  `json:"silent_delivery"` // disable_notification on sends
+	UpdatedAtUnix  int64  `json:"updated_at_unix"`
+}
+
 type telegramStateFile struct {
-	Version       int             `json:"version"`
-	AdminLock     bool            `json:"admin_lock"`
-	ScheduledJobs []*scheduledJob `json:"scheduled_jobs"`
+	Version       int                  `json:"version"`
+	AdminLock     bool                 `json:"admin_lock"`
+	ScheduledJobs []*scheduledJob      `json:"scheduled_jobs"`
+	UserPrefs     map[int64]*UserPrefs `json:"user_prefs"`
 }
 
 // loadState reads telegram-state.json into adminLock + scheduledJobs. A missing
@@ -58,6 +88,7 @@ func (b *TelegramBot) loadState() {
 	defer b.stateMu.Unlock()
 	b.adminLock = false
 	b.scheduledJobs = nil
+	b.userPrefs = make(map[int64]*UserPrefs)
 	if b.stateFile == "" {
 		return
 	}
@@ -73,6 +104,9 @@ func (b *TelegramBot) loadState() {
 	}
 	b.adminLock = payload.AdminLock
 	b.scheduledJobs = payload.ScheduledJobs
+	if payload.UserPrefs != nil {
+		b.userPrefs = payload.UserPrefs
+	}
 }
 
 // saveStateLocked persists current state. Caller must hold stateMu. Mirrors
@@ -89,6 +123,7 @@ func (b *TelegramBot) saveStateLocked() {
 		Version:       1,
 		AdminLock:     b.adminLock,
 		ScheduledJobs: b.scheduledJobs,
+		UserPrefs:     b.userPrefs,
 	}
 	data, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
@@ -99,6 +134,62 @@ func (b *TelegramBot) saveStateLocked() {
 		return
 	}
 	_ = os.Rename(tmp, b.stateFile)
+}
+
+// getPrefs returns a copy of userID's saved profile, or a zero-value UserPrefs
+// (every field "unset" → inherit global config) when the user has none. A copy is
+// returned so callers can read it without holding stateMu; the tri-state *bool
+// pointers are shared, but callers only ever read through them.
+func (b *TelegramBot) getPrefs(userID int64) UserPrefs {
+	b.stateMu.Lock()
+	defer b.stateMu.Unlock()
+	if p, ok := b.userPrefs[userID]; ok && p != nil {
+		return *p
+	}
+	return UserPrefs{}
+}
+
+// hasPrefs reports whether userID has any saved profile row at all (used to skip
+// work for the common no-profile case).
+func (b *TelegramBot) hasPrefs(userID int64) bool {
+	b.stateMu.Lock()
+	defer b.stateMu.Unlock()
+	_, ok := b.userPrefs[userID]
+	return ok
+}
+
+// setPrefs mutates userID's profile under stateMu via the supplied callback,
+// stamps UpdatedAtUnix, and persists the whole state file. The row is created on
+// first use. A nil mutate is a no-op.
+func (b *TelegramBot) setPrefs(userID int64, mutate func(*UserPrefs)) {
+	if mutate == nil {
+		return
+	}
+	b.stateMu.Lock()
+	defer b.stateMu.Unlock()
+	if b.userPrefs == nil {
+		b.userPrefs = make(map[int64]*UserPrefs)
+	}
+	p := b.userPrefs[userID]
+	if p == nil {
+		p = &UserPrefs{}
+		b.userPrefs[userID] = p
+	}
+	mutate(p)
+	p.UpdatedAtUnix = time.Now().Unix()
+	b.saveStateLocked()
+}
+
+// resetPrefs drops userID's entire profile (every field back to inherit-global)
+// and persists. A no-op if the user had none.
+func (b *TelegramBot) resetPrefs(userID int64) {
+	b.stateMu.Lock()
+	defer b.stateMu.Unlock()
+	if _, ok := b.userPrefs[userID]; !ok {
+		return
+	}
+	delete(b.userPrefs, userID)
+	b.saveStateLocked()
 }
 
 // =============================================================================

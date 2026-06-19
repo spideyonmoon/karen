@@ -36,6 +36,13 @@ type RipState struct {
 	ConvertKeepOriginal        bool
 	ConvertSkipLossyToLossless bool
 
+	// Prefs is the issuing user's saved rip profile, or nil for the CLI / no-profile
+	// path. ripConfig() overlays its set fields onto the per-rip Config copy so a
+	// user's saved lyrics/cover/quality/etc. choices take effect without mutating the
+	// global Config or disturbing concurrent rips by other users. nil → no overlay,
+	// behavior is byte-identical to before.
+	Prefs *UserPrefs
+
 	Counter structs.Counter
 
 	okDictMu sync.Mutex
@@ -149,13 +156,14 @@ func (rs *RipState) ctr() *structs.Counter {
 	return &rs.Counter
 }
 
-// --- conversion overrides --------------------------------------------------
-// applyConvertConfig writes the rip's conversion overrides onto a copy of the
-// global Config and returns it, so concurrent rips with different output formats
-// don't clobber a shared Config. On a nil receiver it returns the global Config
-// unchanged (the CLI/flag-off path already mutates the global in place).
-
-func (rs *RipState) convertConfig() structs.ConfigSet {
+// --- per-rip config copy ---------------------------------------------------
+// ripConfig returns a per-rip copy of the global Config with this rip's
+// conversion overrides AND the issuing user's saved profile overlaid, so
+// concurrent rips with different output formats / profiles never clobber a
+// shared Config. On a nil receiver it returns the global Config unchanged (the
+// CLI/flag-off path already mutates the global in place), so behavior there is
+// byte-identical to before.
+func (rs *RipState) ripConfig() structs.ConfigSet {
 	if rs == nil {
 		return Config
 	}
@@ -164,7 +172,87 @@ func (rs *RipState) convertConfig() structs.ConfigSet {
 	cfg.ConvertFormat = rs.ConvertFormat
 	cfg.ConvertKeepOriginal = rs.ConvertKeepOriginal
 	cfg.ConvertSkipLossyToLossless = rs.ConvertSkipLossyToLossless
+	applyPrefsToConfig(&cfg, rs.Prefs)
 	return cfg
+}
+
+// lyricStripTimestamps reports whether the saved profile asks for a "static"
+// (plain, un-timed) .lrc — synced lyrics are fetched then timestamps are stripped
+// on write. Used by ripTrack; false on a nil receiver / no profile.
+func (rs *RipState) lyricStripTimestamps() bool {
+	return rs != nil && rs.Prefs != nil && rs.Prefs.LyricMode == "static"
+}
+
+// applyPrefsToConfig overlays a user's saved profile onto a per-rip Config copy.
+// Every field is "unset" at its zero value and an unset field is left at the
+// global default, so a user with no (or a partial) profile sees unchanged
+// behavior. p may be nil. Codec/delivery are NOT applied here — codec flows
+// through rs.Atmos/rs.AAC + the delivery format seeded at command entry, and the
+// delivery target is honored by promptTransferMode.
+func applyPrefsToConfig(cfg *structs.ConfigSet, p *UserPrefs) {
+	if p == nil {
+		return
+	}
+
+	// Lyrics sidecar mode → SaveLrcFile + LrcType. "static" shares the timed
+	// "lyrics" fetch with "synced"; ripTrack strips its timestamps on write.
+	switch p.LyricMode {
+	case "off":
+		cfg.SaveLrcFile = false
+	case "synced", "static":
+		cfg.SaveLrcFile = true
+		cfg.LrcType = "lyrics"
+	case "word":
+		cfg.SaveLrcFile = true
+		cfg.LrcType = "syllable-lyrics"
+	}
+	if p.EmbedLrc != nil {
+		cfg.EmbedLrc = *p.EmbedLrc
+	}
+	if p.EmbedCover != nil {
+		cfg.EmbedCover = *p.EmbedCover
+	}
+	if p.AnimatedArt != nil {
+		cfg.SaveAnimatedArtwork = *p.AnimatedArt
+	}
+
+	// Quality tier caps the lossless stream: Red Book = 16-bit/44.1kHz, Hi-Res =
+	// 24-bit up to 192kHz. AlacMax is a sample-rate cap (Hz); AtmosMax is a bitrate.
+	switch p.Quality {
+	case "redbook":
+		cfg.AlacMax = 44100
+		cfg.AtmosMax = 2448
+	case "hires":
+		cfg.AlacMax = 192000
+		cfg.AtmosMax = 2768
+	}
+
+	if p.AacType != "" {
+		cfg.AacType = p.AacType
+	}
+	if p.CoverFormat != "" {
+		cfg.CoverFormat = p.CoverFormat
+	}
+	if p.CoverSize != "" {
+		cfg.CoverSize = p.CoverSize
+	}
+	if p.Language != "" {
+		cfg.Language = p.Language
+	}
+	if p.MVMax != 0 {
+		cfg.MVMax = p.MVMax
+	}
+	// Apple Digital Master tag: a saved "off" clears the filename tag; "on" keeps
+	// whatever the global default tag is (or a sensible default if unset).
+	if p.AppleMaster != nil {
+		if *p.AppleMaster {
+			if cfg.AppleMasterChoice == "" {
+				cfg.AppleMasterChoice = "[M]"
+			}
+		} else {
+			cfg.AppleMasterChoice = ""
+		}
+	}
 }
 
 // --- wrapper budget + track accounting -------------------------------------

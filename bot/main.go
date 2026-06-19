@@ -664,6 +664,26 @@ func convertIfNeeded(cfg *structs.ConfigSet, track *task.Track, lrc string, prog
 	apputils.ConvertIfNeeded(track, lrc, cfg, coverPath, progress)
 }
 
+// lrcLineTimestampRe matches a line-level LRC timestamp tag like "[00:12.34]" or
+// "[01:02:123]"; lrcWordTimestampRe matches the word/syllable variant "<00:12.34>".
+// Metadata tags ("[ti:...]", "[ar:...]") are left intact — only digit-shaped time
+// tags are removed.
+var lrcLineTimestampRe = regexp.MustCompile(`\[\d{1,2}:\d{2}(?:[.:]\d{1,3})?\]`)
+var lrcWordTimestampRe = regexp.MustCompile(`<\d{1,2}:\d{2}(?:[.:]\d{1,3})?>`)
+
+// stripLrcTimestamps turns timed lyrics into plain text by removing the per-line
+// and per-word timestamp tags, then trimming the whitespace they leave behind.
+// Used for the profile's "static" lyric mode (best-effort).
+func stripLrcTimestamps(s string) string {
+	s = lrcLineTimestampRe.ReplaceAllString(s, "")
+	s = lrcWordTimestampRe.ReplaceAllString(s, "")
+	lines := strings.Split(s, "\n")
+	for i, ln := range lines {
+		lines[i] = strings.TrimLeft(ln, " \t")
+	}
+	return strings.Join(lines, "\n")
+}
+
 func ripTrack(track *task.Track, token string, ctx context.Context) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -674,7 +694,7 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 	var err error
 	rs := ripStateFrom(ctx)
 	ctr := rs.ctr()
-	cfg := rs.convertConfig()
+	cfg := rs.ripConfig()
 	ctr.Inc(&ctr.Total)
 	var trackProgress apputils.ProgressFunc
 	if tp := rs.progress(track); tp != nil {
@@ -700,7 +720,7 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 	}
 
 	needDlAacLc := false
-	if (rs.aac() || track.Codec == "AAC") && (Config.AacType == "aac-lc" || track.Codec == "AAC") {
+	if (rs.aac() || track.Codec == "AAC") && (cfg.AacType == "aac-lc" || track.Codec == "AAC") {
 		needDlAacLc = true
 	}
 	if track.WebM3u8 == "" && !needDlAacLc {
@@ -758,7 +778,7 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 
 	var Quality string
 	if rs.atmos() {
-		Quality = fmt.Sprintf("%dKbps", Config.AtmosMax-2000)
+		Quality = fmt.Sprintf("%dKbps", cfg.AtmosMax-2000)
 	} else if needDlAacLc {
 		Quality = "256Kbps"
 	} else {
@@ -778,18 +798,18 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 
 	stringsToJoin := []string{}
 	if track.Resp.Attributes.IsAppleDigitalMaster {
-		if Config.AppleMasterChoice != "" {
-			stringsToJoin = append(stringsToJoin, Config.AppleMasterChoice)
+		if cfg.AppleMasterChoice != "" {
+			stringsToJoin = append(stringsToJoin, cfg.AppleMasterChoice)
 		}
 	}
 	if track.Resp.Attributes.ContentRating == "explicit" {
-		if Config.ExplicitChoice != "" {
-			stringsToJoin = append(stringsToJoin, Config.ExplicitChoice)
+		if cfg.ExplicitChoice != "" {
+			stringsToJoin = append(stringsToJoin, cfg.ExplicitChoice)
 		}
 	}
 	if track.Resp.Attributes.ContentRating == "clean" {
-		if Config.CleanChoice != "" {
-			stringsToJoin = append(stringsToJoin, Config.CleanChoice)
+		if cfg.CleanChoice != "" {
+			stringsToJoin = append(stringsToJoin, cfg.CleanChoice)
 		}
 	}
 	Tag_string := strings.Join(stringsToJoin, " ")
@@ -809,7 +829,7 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 	filename := fmt.Sprintf("%s.m4a", forbiddenNames.ReplaceAllString(songName, "_"))
 	track.SaveName = filename
 	trackPath := filepath.Join(track.SaveDir, track.SaveName)
-	lrcFilename := fmt.Sprintf("%s.%s", forbiddenNames.ReplaceAllString(songName, "_"), Config.LrcFormat)
+	lrcFilename := fmt.Sprintf("%s.%s", forbiddenNames.ReplaceAllString(songName, "_"), cfg.LrcFormat)
 
 	var convertedPath string
 	conversionEnabled := cfg.ConvertAfterDownload &&
@@ -823,18 +843,23 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 		}
 	}
 	var lrc string = ""
-	if Config.EmbedLrc || Config.SaveLrcFile {
-		lrcStr, err := lyrics.Get(track.Storefront, track.ID, Config.LrcType, Config.Language, Config.LrcFormat, token, Config.MediaUserToken)
+	if cfg.EmbedLrc || cfg.SaveLrcFile {
+		lrcStr, err := lyrics.Get(track.Storefront, track.ID, cfg.LrcType, cfg.Language, cfg.LrcFormat, token, cfg.MediaUserToken)
 		if err != nil {
 			fmt.Println(err)
 		} else {
-			if Config.SaveLrcFile {
+			// "static" profile mode: fetch the timed lyrics, then strip the
+			// per-line "[mm:ss.xx]" timestamps so the saved .lrc is plain text.
+			if rs.lyricStripTimestamps() {
+				lrcStr = stripLrcTimestamps(lrcStr)
+			}
+			if cfg.SaveLrcFile {
 				err := writeLyrics(track.SaveDir, lrcFilename, lrcStr)
 				if err != nil {
 					fmt.Printf("Failed to write lyrics")
 				}
 			}
-			if Config.EmbedLrc {
+			if cfg.EmbedLrc {
 				lrc = lrcStr
 			}
 		}
@@ -945,7 +970,7 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 	}
 
 	// Download per-track cover for playlist/station entries if needed.
-	if Config.EmbedCover {
+	if cfg.EmbedCover {
 		if (strings.Contains(track.PreID, "pl.") || strings.Contains(track.PreID, "ra.")) && Config.DlAlbumcoverForPlaylist {
 			track.CoverPath, err = writeCover(track.SaveDir, track.ID, track.Resp.Attributes.Artwork.URL)
 			if err != nil {
@@ -964,7 +989,7 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 	}
 
 	// Clean up per-track cover written above (not the shared album cover).
-	if Config.EmbedCover && (strings.Contains(track.PreID, "pl.") || strings.Contains(track.PreID, "ra.")) && Config.DlAlbumcoverForPlaylist {
+	if cfg.EmbedCover && (strings.Contains(track.PreID, "pl.") || strings.Contains(track.PreID, "ra.")) && Config.DlAlbumcoverForPlaylist {
 		_ = os.Remove(track.CoverPath)
 	}
 
@@ -1051,10 +1076,10 @@ func ripStation(albumId string, token string, storefront string, ctx context.Con
 	}
 	station.CoverPath = covPath
 
-	if Config.SaveAnimatedArtwork && meta.Data[0].Attributes.EditorialVideo.MotionSquare.Video != "" {
+	if ripStateFrom(ctx).ripConfig().SaveAnimatedArtwork && meta.Data[0].Attributes.EditorialVideo.MotionSquare.Video != "" {
 		fmt.Println("Found Animation Artwork.")
 
-		motionvideoUrlSquare, err := extractVideo(meta.Data[0].Attributes.EditorialVideo.MotionSquare.Video)
+		motionvideoUrlSquare, err := extractVideo(ctx, meta.Data[0].Attributes.EditorialVideo.MotionSquare.Video)
 		if err != nil {
 			fmt.Println("no motion video square.\n", err)
 		} else {
@@ -1287,7 +1312,7 @@ func ripArtwork(link string, token string, storefront string, ctx context.Contex
 
 	// Motion artwork is best-effort; its absence (or a muxing failure) is not fatal.
 	if motionURL != "" {
-		if hlsURL, err := extractVideo(motionURL); err != nil {
+		if hlsURL, err := extractVideo(ctx, motionURL); err != nil {
 			fmt.Println("animated artwork unavailable:", err)
 		} else {
 			motionPath := filepath.Join(outDir, coverName+"_animated.mp4")
@@ -1456,10 +1481,10 @@ func ripAlbum(albumId string, token string, storefront string, urlArg_i string, 
 	if err != nil {
 		fmt.Println("Failed to write cover.")
 	}
-	if Config.SaveAnimatedArtwork && meta.Data[0].Attributes.EditorialVideo.MotionDetailSquare.Video != "" {
+	if ripStateFrom(ctx).ripConfig().SaveAnimatedArtwork && meta.Data[0].Attributes.EditorialVideo.MotionDetailSquare.Video != "" {
 		fmt.Println("Found Animation Artwork.")
 
-		motionvideoUrlSquare, err := extractVideo(meta.Data[0].Attributes.EditorialVideo.MotionDetailSquare.Video)
+		motionvideoUrlSquare, err := extractVideo(ctx, meta.Data[0].Attributes.EditorialVideo.MotionDetailSquare.Video)
 		if err != nil {
 			fmt.Println("no motion video square.\n", err)
 		} else {
@@ -1487,7 +1512,7 @@ func ripAlbum(albumId string, token string, storefront string, urlArg_i string, 
 			}
 		}
 
-		motionvideoUrlTall, err := extractVideo(meta.Data[0].Attributes.EditorialVideo.MotionDetailTall.Video)
+		motionvideoUrlTall, err := extractVideo(ctx, meta.Data[0].Attributes.EditorialVideo.MotionDetailTall.Video)
 		if err != nil {
 			fmt.Println("no motion video tall.\n", err)
 		} else {
@@ -1714,10 +1739,10 @@ func ripPlaylist(playlistId string, token string, storefront string, forceAAC bo
 		playlist.Tracks[i].Codec = Codec
 	}
 
-	if Config.SaveAnimatedArtwork && meta.Data[0].Attributes.EditorialVideo.MotionDetailSquare.Video != "" {
+	if ripStateFrom(ctx).ripConfig().SaveAnimatedArtwork && meta.Data[0].Attributes.EditorialVideo.MotionDetailSquare.Video != "" {
 		fmt.Println("Found Animation Artwork.")
 
-		motionvideoUrlSquare, err := extractVideo(meta.Data[0].Attributes.EditorialVideo.MotionDetailSquare.Video)
+		motionvideoUrlSquare, err := extractVideo(ctx, meta.Data[0].Attributes.EditorialVideo.MotionDetailSquare.Video)
 		if err != nil {
 			fmt.Println("no motion video square.\n", err)
 		} else {
@@ -1745,7 +1770,7 @@ func ripPlaylist(playlistId string, token string, storefront string, forceAAC bo
 			}
 		}
 
-		motionvideoUrlTall, err := extractVideo(meta.Data[0].Attributes.EditorialVideo.MotionDetailTall.Video)
+		motionvideoUrlTall, err := extractVideo(ctx, meta.Data[0].Attributes.EditorialVideo.MotionDetailTall.Video)
 		if err != nil {
 			fmt.Println("no motion video tall.\n", err)
 		} else {
@@ -2143,7 +2168,7 @@ func mvDownloader(ctx context.Context, adamID string, saveDir string, token stri
 	}
 
 	os.MkdirAll(saveDir, os.ModePerm)
-	videom3u8url, _ := extractVideo(mvm3u8url)
+	videom3u8url, _ := extractVideo(ctx, mvm3u8url)
 	videokeyAndUrls, err := runv3.Run(ctx, adamID, videom3u8url, token, Config.MediaUserToken, true, "", nil)
 	if err != nil {
 		return fmt.Errorf("video key retrieval failed: %w", err)
@@ -2362,6 +2387,7 @@ func formatAvailability(available bool, quality string) string {
 
 func extractMedia(ctx context.Context, b string, more_mode bool) (string, string, error) {
 	rs := ripStateFrom(ctx)
+	cfg := rs.ripConfig()
 	masterUrl, err := url.Parse(b)
 	if err != nil {
 		return "", "", err
@@ -2487,7 +2513,7 @@ func extractMedia(ctx context.Context, b string, more_mode bool) (string, string
 				if err != nil {
 					return "", "", err
 				}
-				if length_int <= Config.AtmosMax {
+				if length_int <= cfg.AtmosMax {
 					if !debug_mode && !more_mode {
 						fmt.Printf("%s\n", variant.Audio)
 					}
@@ -2520,7 +2546,7 @@ func extractMedia(ctx context.Context, b string, more_mode bool) (string, string
 				}
 				aacregex := regexp.MustCompile(`audio-stereo-\d+`)
 				replaced := aacregex.ReplaceAllString(variant.Audio, "aac")
-				if replaced == Config.AacType {
+				if replaced == cfg.AacType {
 					if !debug_mode && !more_mode {
 						fmt.Printf("%s\n", variant.Audio)
 					}
@@ -2542,7 +2568,7 @@ func extractMedia(ctx context.Context, b string, more_mode bool) (string, string
 				if err != nil {
 					return "", "", err
 				}
-				if length_int <= Config.AlacMax {
+				if length_int <= cfg.AlacMax {
 					if !debug_mode && !more_mode {
 						fmt.Printf("%s-bit / %s Hz\n", split[length-1], split[length-2])
 					}
@@ -2563,7 +2589,7 @@ func extractMedia(ctx context.Context, b string, more_mode bool) (string, string
 	}
 	return streamUrl.String(), Quality, nil
 }
-func extractVideo(c string) (string, error) {
+func extractVideo(ctx context.Context, c string) (string, error) {
 	MediaUrl, err := url.Parse(c)
 	if err != nil {
 		return "", err
@@ -2599,7 +2625,7 @@ func extractVideo(c string) (string, error) {
 		return video.Variants[i].AverageBandwidth > video.Variants[j].AverageBandwidth
 	})
 
-	maxHeight := Config.MVMax
+	maxHeight := ripStateFrom(ctx).ripConfig().MVMax
 
 	for _, variant := range video.Variants {
 		matches := re.FindStringSubmatch(variant.URI)
