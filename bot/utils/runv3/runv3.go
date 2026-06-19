@@ -24,6 +24,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/grafov/m3u8"
 	"github.com/schollz/progressbar/v3"
@@ -215,7 +216,9 @@ func extractKidBase64(b string, mvmode bool) (string, string, string, error) {
 		if mediaPlaylist.Key != nil {
 			split := strings.Split(mediaPlaylist.Key.URI, ",")
 			uriPrefix = split[0]
-			kidbase64 = split[1]
+			if len(split) > 1 {
+				kidbase64 = split[1]
+			}
 			lastSlashIndex := strings.LastIndex(b, "/")
 			// 截取最后一个斜杠之前的部分
 			urlBuilder.WriteString(b[:lastSlashIndex])
@@ -372,7 +375,7 @@ type Segment struct {
 	Data  []byte
 }
 
-func downloadSegment(ctx context.Context, url string, index int, wg *sync.WaitGroup, segmentsChan chan<- Segment, client *http.Client, limiter chan struct{}) {
+func downloadSegment(ctx context.Context, url string, index int, wg *sync.WaitGroup, segmentsChan chan<- Segment, client *http.Client, limiter chan struct{}, failed *int32) {
 	// 函数退出时，从 limiter 中接收一个值，释放一个并发槽位
 	defer func() {
 		<-limiter
@@ -382,24 +385,28 @@ func downloadSegment(ctx context.Context, url string, index int, wg *sync.WaitGr
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		fmt.Printf("错误(分段 %d): 创建请求失败: %v\n", index, err)
+		atomic.AddInt32(failed, 1)
 		return
 	}
 
 	resp, err := client.Do(req)
 	if err != nil {
 		fmt.Printf("错误(分段 %d): 下载失败: %v\n", index, err)
+		atomic.AddInt32(failed, 1)
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		fmt.Printf("错误(分段 %d): 服务器返回状态码 %d\n", index, resp.StatusCode)
+		atomic.AddInt32(failed, 1)
 		return
 	}
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		fmt.Printf("错误(分段 %d): 读取数据失败: %v\n", index, err)
+		atomic.AddInt32(failed, 1)
 		return
 	}
 
@@ -469,6 +476,7 @@ func ExtMvData(ctx context.Context, keyAndUrls string, savePath string, progress
 	defer tempFile.Close()
 
 	var downloadWg, writerWg sync.WaitGroup
+	var failed int32
 	segmentsChan := make(chan Segment, len(urls))
 	// --- 新增代码: 定义最大并发数 ---
 	const maxConcurrency = 10
@@ -503,7 +511,7 @@ func ExtMvData(ctx context.Context, keyAndUrls string, savePath string, progress
 
 		downloadWg.Add(1)
 		// 将 limiter 传递给下载函数
-		go downloadSegment(ctx, url, i, &downloadWg, segmentsChan, client, limiter)
+		go downloadSegment(ctx, url, i, &downloadWg, segmentsChan, client, limiter, &failed)
 	}
 
 	// 等待所有下载任务完成
@@ -513,6 +521,16 @@ func ExtMvData(ctx context.Context, keyAndUrls string, savePath string, progress
 
 	// 等待写入 Goroutine 完成所有写入和缓冲处理
 	writerWg.Wait()
+
+	// Report cancellation as cancellation; otherwise, if any segment failed to
+	// download, the muxed file would be silently truncated — fail loudly instead of
+	// remuxing a corrupt video and reporting success.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if n := atomic.LoadInt32(&failed); n > 0 {
+		return fmt.Errorf("music video download incomplete: %d of %d segment(s) failed", n, len(urls))
+	}
 
 	// 显式关闭文件（defer会再次调用，但重复关闭是安全的）
 	if err := tempFile.Close(); err != nil {

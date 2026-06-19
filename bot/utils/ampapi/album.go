@@ -48,6 +48,12 @@ func GetAlbumResp(storefront string, id string, language string, token string) (
 	if err != nil {
 		return nil, err
 	}
+	// Apple can return HTTP 200 with an empty data array (region-locked, pulled, or
+	// throttled content). Guard before indexing Data[0] so it returns an error the
+	// caller can surface instead of panicking the whole process.
+	if len(obj.Data) == 0 {
+		return nil, errors.New("album not found or unavailable")
+	}
 	if len(obj.Data[0].Relationships.Tracks.Next) > 0 {
 		next := obj.Data[0].Relationships.Tracks.Next
 		for {
@@ -124,6 +130,9 @@ func GetAlbumRespByHref(href string, language string, token string) (*AlbumResp,
 	err = json.NewDecoder(do.Body).Decode(&obj)
 	if err != nil {
 		return nil, err
+	}
+	if len(obj.Data) == 0 {
+		return nil, errors.New("album not found or unavailable")
 	}
 	if len(obj.Data[0].Relationships.Tracks.Next) > 0 {
 		next := obj.Data[0].Relationships.Tracks.Next

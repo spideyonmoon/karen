@@ -603,7 +603,8 @@ func (m *MTProtoClient) uploadAndSendAudioOnce(
 	_, err = api.MessagesSendMedia(ctx, req)
 	if waited, _ := tgerr.FloodWait(ctx, err); waited {
 		fmt.Println("FLOOD_WAIT for audio, retrying...")
-		req.RandomID = cryptoRandID()
+		// Reuse the original RandomID so Telegram deduplicates the resend — a fresh
+		// RandomID would post a duplicate if the first send committed server-side.
 		_, err = api.MessagesSendMedia(ctx, req)
 	}
 	if err != nil {
@@ -856,7 +857,7 @@ func (m *MTProtoClient) uploadAndSendDocumentOnce(
 	_, err = api.MessagesSendMedia(ctx, req)
 	if waited, _ := tgerr.FloodWait(ctx, err); waited {
 		fmt.Println("FLOOD_WAIT for document, retrying...")
-		req.RandomID = cryptoRandID()
+		// Reuse the original RandomID so Telegram deduplicates the resend.
 		_, err = api.MessagesSendMedia(ctx, req)
 	}
 	if err != nil {
@@ -968,7 +969,7 @@ func (m *MTProtoClient) uploadAndSendVideoOnce(
 	_, err = api.MessagesSendMedia(ctx, req)
 	if waited, _ := tgerr.FloodWait(ctx, err); waited {
 		fmt.Println("FLOOD_WAIT for video, retrying...")
-		req.RandomID = cryptoRandID()
+		// Reuse the original RandomID so Telegram deduplicates the resend.
 		_, err = api.MessagesSendMedia(ctx, req)
 	}
 	if err != nil {
