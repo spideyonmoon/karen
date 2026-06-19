@@ -2967,6 +2967,20 @@ func (b *TelegramBot) sendVideoFileMTProto(chatID int64, path string, replyToID 
 	return errDoc
 }
 
+// mvBoardTitle derives a human heading for the status board from the MV's recorded
+// metadata ("Performer — Title"), falling back to the file's base name (sans
+// extension) when no metadata is available. Mirrors the caption logic in
+// sendVideoFileMTProto.
+func mvBoardTitle(ctx context.Context, path string) string {
+	if meta, ok := getDownloadedMeta(ctx, path); ok && meta.Title != "" {
+		if meta.Performer != "" {
+			return fmt.Sprintf("%s — %s", meta.Performer, meta.Title)
+		}
+		return meta.Title
+	}
+	return strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+}
+
 // deliverMusicVideo sends a downloaded music video as a native Telegram video (inline
 // player + thumbnail), falling back to a document and then Gofile. The status board is
 // always resolved to a terminal state.
@@ -2975,6 +2989,10 @@ func (b *TelegramBot) deliverMusicVideo(chatID int64, path string, replyToID int
 		status.UpdateSync("Cancelled", 0, 0)
 		return
 	}
+
+	// Give the board a real heading; MV progress flows through status.Update, which
+	// never sets releaseTitle, so without this the board reads "Untitled".
+	status.SetReleaseTitle(mvBoardTitle(ctx, path))
 
 	var sizeBytes int64
 	if info, err := os.Stat(path); err == nil {
@@ -3020,6 +3038,7 @@ func (b *TelegramBot) deliverMvGofile(chatID int64, path string, replyToID int, 
 		status.UpdateSync("Cancelled", 0, 0)
 		return
 	}
+	status.SetReleaseTitle(mvBoardTitle(ctx, path))
 	status.UpdateSync("Uploading to Gofile...", 0, 0)
 	link, err := apputils.UploadToGofile(ctx, path, Config.GofileToken)
 	if err != nil {
@@ -4184,6 +4203,25 @@ func (s *DownloadStatus) UpdateSync(phase string, done, total int64) {
 	s.setLatestLocked(phase, done, total)
 	s.mu.Unlock()
 	s.group.flush(true)
+}
+
+// SetReleaseTitle sets the board's heading when no per-track UpdateTrack call will
+// supply one — e.g. music-video / artwork deliveries, whose progress flows through
+// status.Update (not UpdateTrack), leaving releaseTitle empty and the board showing
+// "Untitled". First non-empty value wins, mirroring UpdateTrack.
+func (s *DownloadStatus) SetReleaseTitle(title string) {
+	if s == nil {
+		return
+	}
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return
+	}
+	s.mu.Lock()
+	if s.releaseTitle == "" {
+		s.releaseTitle = title
+	}
+	s.mu.Unlock()
 }
 
 func (s *DownloadStatus) UpdateTrack(id, title, releaseTitle, workerID string, number, trackTotal int, phase string, done, total int64) {
