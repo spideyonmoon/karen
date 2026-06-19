@@ -118,18 +118,24 @@ const (
 
 // uploadPartSize is Telegram's maximum upload part size (512 KB) — cannot go higher.
 // uploadThreads is how many parts gotd keeps in flight concurrently over the single
-// DC connection. On a high-bandwidth, high-latency path (e.g. NZ→Telegram DC, ~150-280ms
+// DC connection. On a high-bandwidth, high-latency path (e.g. NZ→Telegram DC5, ~176ms
 // RTT) the throughput ceiling is roughly (uploadThreads × uploadPartSize) ÷ RTT, so the
-// thread count trades raw throughput against keepalive headroom.
+// thread count is the dominant speed lever:
+//   threads=8  → 4 MB in flight → ~22 MB/s ceiling
+//   threads=16 → 8 MB in flight → ~45 MB/s ceiling
 //
-// Trialing 8 (4 MB in flight): at 16 (~8 MB in flight) the single-connection TCP send
-// buffer to DC5 saturated, starving gotd's keepalive ping write → "pong missed" i/o
-// timeout → engine teardown → the upload drop/resume sawtooth (see AGENTS.md). 8 leaves
-// more buffer headroom for the ping at some cost to peak speed; revert to 16 (or make
-// this a per-DC config) if throughput regresses without curing the sawtooth.
+// History: 16 originally starved gotd's keepalive ping write — at 8 MB in flight the
+// DC5 TCP send buffer (then the 4 MB kernel default) had no room for the ping → "pong
+// missed" i/o timeout → engine teardown → upload drop/resume sawtooth (see AGENTS.md).
+// The fix was capping at 8. That blocker is now removed: docker-compose.yml sets
+// net.ipv4.tcp_wmem max to 16 MB (verified live in the container), so 8 MB in flight
+// sits in a 16 MB buffer — half — leaving the other half as keepalive headroom. Back to
+// 16 to reclaim the ~45 MB/s ceiling. Watch the zap log for "pong missed" recurrence; if
+// it returns, the buffer raise didn't hold and this should drop to 8 (or become a
+// per-DC config field).
 const (
 	uploadPartSize = 512 * 1024
-	uploadThreads  = 8
+	uploadThreads  = 16
 )
 
 // awaitReady blocks until the supervisor has a live, authenticated client again and
