@@ -128,14 +128,20 @@ const (
 // DC5 TCP send buffer (then the 4 MB kernel default) had no room for the ping → "pong
 // missed" i/o timeout → engine teardown → upload drop/resume sawtooth (see AGENTS.md).
 // The fix was capping at 8. That blocker is now removed: docker-compose.yml sets
-// net.ipv4.tcp_wmem max to 16 MB (verified live in the container), so 8 MB in flight
-// sits in a 16 MB buffer — half — leaving the other half as keepalive headroom. Back to
-// 16 to reclaim the ~45 MB/s ceiling. Watch the zap log for "pong missed" recurrence; if
-// it returns, the buffer raise didn't hold and this should drop to 8 (or become a
-// per-DC config field).
+// net.ipv4.tcp_wmem max to 16 MB (verified live in the container), so the in-flight
+// window can grow while leaving room for the keepalive ping.
+//
+// At 16 the sawtooth was cured (clean log over a full 168 MB upload) but throughput
+// stayed moderate (~6-7 MB/s) — gotd serializes RPC writes over the one connection, so
+// raising threads has diminishing returns. Trialing 20 (10 MB in flight = 62% of the
+// 16 MB buffer, ~6 MB keepalive headroom) as the decisive test of whether more threads
+// buy throughput on a single connection. If speed climbs AND the log stays clean, 24 is
+// the next notch (12 MB = 75% of buffer — getting tight). If it flatlines at ~6-7, the
+// single connection is protocol-saturated and only a multi-connection path (Pyrofork
+// sidecar) lifts it. Watch the zap log for "pong missed"; if it returns, drop back to 16.
 const (
 	uploadPartSize = 512 * 1024
-	uploadThreads  = 16
+	uploadThreads  = 20
 )
 
 // awaitReady blocks until the supervisor has a live, authenticated client again and
