@@ -1,7 +1,9 @@
 bot/config.yaml
+bot/state/
+bot/downloads/
+# Legacy single-file state (superseded by bot/state/); ignored if still present.
 bot/telegram-cache.json
 bot/telegram-state.json
-bot/downloads/
 wrapper/wrapper-data/
 *.zip
 .env

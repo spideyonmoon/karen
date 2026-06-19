@@ -164,7 +164,8 @@ type TelegramBot struct {
 	// It is a LEAF lock: never acquire queueMu while holding it, and never hold
 	// it across an enqueue*/cancel/purge call (those take queueMu).
 	stateMu       sync.Mutex
-	stateFile     string
+	stateFile     string               // admin lock + user profiles (DM-backed-up daily)
+	scheduleFile  string               // pending sleeptime rips (persisted, NOT backed up)
 	adminLock     bool                 // true => only admins may use the bot (persisted)
 	scheduledJobs []*scheduledJob      // pending sleeptime rips (persisted)
 	userPrefs     map[int64]*UserPrefs // saved per-user rip profiles (persisted, keyed by user ID)
@@ -515,16 +516,21 @@ func newTelegramBot(token, appleToken string) *TelegramBot {
 	if maxFileBytes <= 0 {
 		maxFileBytes = 50 * 1024 * 1024
 	}
+	// All mutable JSON state lives together in the bind-mounted state/ directory
+	// (see docker-compose.yml) so atomic tmp+rename saves actually persist. The
+	// cache file defaults into that dir; the state + schedule files are derived
+	// from its directory so an explicit telegram-cache-file override keeps them
+	// colocated.
 	cacheFile := strings.TrimSpace(Config.TelegramCacheFile)
 	if cacheFile == "" {
-		cacheFile = "telegram-cache.json"
+		cacheFile = "state/telegram-cache.json"
 	}
-	// State file lives beside the cache file so a single download-folder volume
-	// covers both; defaults to telegram-state.json in the working dir (/app),
-	// which is bind-mounted in docker-compose.yml.
+	stateDir := filepath.Dir(cacheFile)
 	stateFile := "telegram-state.json"
-	if dir := filepath.Dir(cacheFile); dir != "." && dir != "" {
-		stateFile = filepath.Join(dir, "telegram-state.json")
+	scheduleFile := "telegram-schedule.json"
+	if stateDir != "." && stateDir != "" {
+		stateFile = filepath.Join(stateDir, "telegram-state.json")
+		scheduleFile = filepath.Join(stateDir, "telegram-schedule.json")
 	}
 	queueSize := defaultQueueSize
 	if queueSize <= 0 {
@@ -547,17 +553,20 @@ func newTelegramBot(token, appleToken string) *TelegramBot {
 		userTaskCount:    make(map[int64]int),
 		activeBoards:     make(map[string]*DownloadStatus),
 		chatBoards:       make(map[int64]*chatBoard),
-		cacheFile:        Config.TelegramCacheFile,
+		cacheFile:        cacheFile,
 		cache:            make(map[string]CachedAudio),
 		docCache:         make(map[string]CachedDocument),
 		admins:           admins,
 		stateFile:        stateFile,
+		scheduleFile:     scheduleFile,
 	}
 	bot.loadCache()
 	bot.loadState()
+	bot.loadSchedule()
 	bot.startDownloadWorker()
 	bot.startPurgeRoutine()
 	bot.startScheduler()
+	bot.startBackupRoutine()
 	return bot
 }
 

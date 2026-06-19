@@ -74,11 +74,23 @@ type UserPrefs struct {
 	UpdatedAtUnix  int64  `json:"updated_at_unix"`
 }
 
+// telegramStateFile is the IMPORTANT, DM-backed-up state: the admin lock and
+// every user's saved /profile. ScheduledJobs is retained only for one-time
+// backward-compat reading of pre-split telegram-state.json files (it is no
+// longer written here — see scheduleStateFile).
 type telegramStateFile struct {
 	Version       int                  `json:"version"`
 	AdminLock     bool                 `json:"admin_lock"`
-	ScheduledJobs []*scheduledJob      `json:"scheduled_jobs"`
+	ScheduledJobs []*scheduledJob      `json:"scheduled_jobs,omitempty"`
 	UserPrefs     map[int64]*UserPrefs `json:"user_prefs"`
+}
+
+// scheduleStateFile is the ephemeral sleeptime-rip queue, kept in its own file
+// (telegram-schedule.json) so it is NOT swept into the daily admin backup — it
+// is best-effort working state, not user data worth preserving across a VPS loss.
+type scheduleStateFile struct {
+	Version       int             `json:"version"`
+	ScheduledJobs []*scheduledJob `json:"scheduled_jobs"`
 }
 
 // loadState reads telegram-state.json into adminLock + scheduledJobs. A missing
@@ -120,10 +132,10 @@ func (b *TelegramBot) saveStateLocked() {
 		_ = os.MkdirAll(dir, 0755)
 	}
 	payload := telegramStateFile{
-		Version:       1,
-		AdminLock:     b.adminLock,
-		ScheduledJobs: b.scheduledJobs,
-		UserPrefs:     b.userPrefs,
+		Version:   1,
+		AdminLock: b.adminLock,
+		UserPrefs: b.userPrefs,
+		// ScheduledJobs intentionally omitted — it now lives in telegram-schedule.json.
 	}
 	data, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
@@ -134,6 +146,57 @@ func (b *TelegramBot) saveStateLocked() {
 		return
 	}
 	_ = os.Rename(tmp, b.stateFile)
+}
+
+// loadSchedule reads telegram-schedule.json into scheduledJobs. It runs AFTER
+// loadState, so if the schedule file is absent but loadState parsed jobs out of a
+// pre-split telegram-state.json, those legacy jobs are migrated into the new file
+// here. A missing/empty file with no legacy jobs just means "no pending rips".
+func (b *TelegramBot) loadSchedule() {
+	b.stateMu.Lock()
+	defer b.stateMu.Unlock()
+	if b.scheduleFile == "" {
+		return
+	}
+	data, err := os.ReadFile(b.scheduleFile)
+	if err != nil || len(data) == 0 {
+		if len(b.scheduledJobs) > 0 {
+			// Legacy jobs carried over by loadState → persist into the new file.
+			b.saveScheduleLocked()
+		}
+		return
+	}
+	var payload scheduleStateFile
+	if err := json.Unmarshal(data, &payload); err != nil {
+		fmt.Println("schedule load: corrupt telegram-schedule.json, starting fresh:", err)
+		return
+	}
+	b.scheduledJobs = payload.ScheduledJobs
+}
+
+// saveScheduleLocked persists the pending sleeptime-rip queue. Caller must hold
+// stateMu. Atomic tmp+rename like saveStateLocked.
+func (b *TelegramBot) saveScheduleLocked() {
+	if b.scheduleFile == "" {
+		return
+	}
+	dir := filepath.Dir(b.scheduleFile)
+	if dir != "." && dir != "" {
+		_ = os.MkdirAll(dir, 0755)
+	}
+	payload := scheduleStateFile{
+		Version:       1,
+		ScheduledJobs: b.scheduledJobs,
+	}
+	data, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return
+	}
+	tmp := b.scheduleFile + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, b.scheduleFile)
 }
 
 // getPrefs returns a copy of userID's saved profile, or a zero-value UserPrefs
@@ -299,7 +362,7 @@ func (b *TelegramBot) releaseDueJobs() {
 	}
 	if len(due) > 0 {
 		b.scheduledJobs = remaining
-		b.saveStateLocked()
+		b.saveScheduleLocked()
 	}
 	b.stateMu.Unlock()
 	for _, j := range due {
@@ -324,7 +387,7 @@ func (b *TelegramBot) releaseJob(j *scheduledJob) {
 func (b *TelegramBot) scheduleJob(j *scheduledJob) {
 	b.stateMu.Lock()
 	b.scheduledJobs = append(b.scheduledJobs, j)
-	b.saveStateLocked()
+	b.saveScheduleLocked()
 	b.stateMu.Unlock()
 }
 
@@ -354,6 +417,87 @@ func (b *TelegramBot) scheduleOrRun(j *scheduledJob) {
 	_ = b.sendMessageWithReply(j.ChatID, fmt.Sprintf(
 		"🌙 This %s is heavy, so it's scheduled for the sleeptime window. It'll start around %s (Dhaka time) and deliver as a Gofile ZIP.",
 		label, when), nil, j.ReplyToID)
+}
+
+// =============================================================================
+// Daily state backup to admin DM
+// =============================================================================
+
+// backupHourDhaka is the daily wall-clock hour (Dhaka) at which the bot DMs each
+// admin a copy of telegram-state.json. 04:00 sits inside the quiet sleeptime
+// window, after the 02:30 scheduled rips have kicked off.
+const backupHourDhaka = 4
+
+// nextDailyAt returns the next hour:min Dhaka strictly after t.
+func nextDailyAt(t time.Time, hour, min int) time.Time {
+	lt := t.In(dhakaZone)
+	next := time.Date(lt.Year(), lt.Month(), lt.Day(), hour, min, 0, 0, dhakaZone)
+	if !next.After(lt) {
+		next = next.AddDate(0, 0, 1)
+	}
+	return next
+}
+
+// startBackupRoutine DMs every admin a copy of the important state (admin lock +
+// user profiles) once a day at backupHourDhaka, so a VPS loss costs at most one
+// day of profile changes. The fire time is computed from the clock rather than
+// "every 24h from boot", so frequent restarts/deploys never spam backups. The
+// scheduled-rip queue is deliberately excluded — it is best-effort working state,
+// not user data worth preserving.
+func (b *TelegramBot) startBackupRoutine() {
+	if len(b.admins) == 0 {
+		return // nobody to back up to
+	}
+	go func() {
+		for {
+			time.Sleep(time.Until(nextDailyAt(time.Now(), backupHourDhaka, 0)))
+			b.performBackup()
+		}
+	}()
+}
+
+// performBackup marshals a snapshot of admin lock + user profiles and sends it as
+// a JSON document to every configured admin's DM. Errors are logged, never fatal.
+func (b *TelegramBot) performBackup() {
+	b.stateMu.Lock()
+	payload := telegramStateFile{
+		Version:   1,
+		AdminLock: b.adminLock,
+		UserPrefs: b.userPrefs,
+	}
+	profileCount := len(b.userPrefs)
+	locked := b.adminLock
+	data, err := json.MarshalIndent(payload, "", "  ")
+	b.stateMu.Unlock()
+	if err != nil {
+		fmt.Println("backup: marshal failed:", err)
+		return
+	}
+
+	day := time.Now().In(dhakaZone).Format("2006-01-02")
+	name := fmt.Sprintf("karen-state-%s.json", day)
+
+	// sendDocumentFile streams from a path, so spill the snapshot to a temp file
+	// in the (bind-mounted) state dir and clean it up afterward.
+	tmp := filepath.Join(filepath.Dir(b.stateFile), ".backup-"+name)
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		fmt.Println("backup: write temp failed:", err)
+		return
+	}
+	defer os.Remove(tmp)
+
+	lockState := "off"
+	if locked {
+		lockState = "on"
+	}
+	header := fmt.Sprintf("🗄️ Daily backup — %d profile(s), admin-lock %s.", profileCount, lockState)
+
+	for adminID := range b.admins {
+		_ = b.sendMessageWithReply(adminID, header, nil, 0)
+		if err := b.sendDocumentFile(adminID, tmp, name, 0, nil, ""); err != nil {
+			fmt.Printf("backup: send to %d failed: %v\n", adminID, err)
+		}
+	}
 }
 
 // =============================================================================
