@@ -100,10 +100,15 @@ func GetLicense(adamId string, challenge string, uri string, token string, music
 	if respJson["errors"] != nil {
 		return "", 0, errors.New("failed to get license")
 	}
-	if respJson["license"] == nil {
+	license, ok := respJson["license"].(string)
+	if !ok || license == "" {
 		return "", 0, errors.New("failed to get license")
 	}
-	license := respJson["license"].(string)
-	renew := int(respJson["renew-after"].(float64))
+	// renew-after is optional and not always present; default to 0 when absent
+	// or of an unexpected type rather than panicking on a bare type assertion.
+	renew := 0
+	if r, ok := respJson["renew-after"].(float64); ok {
+		renew = int(r)
+	}
 	return license, renew, nil
 }

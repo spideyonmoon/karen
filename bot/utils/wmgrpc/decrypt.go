@@ -169,6 +169,9 @@ func DownloadAndDecrypt(ctx context.Context, wm *Client, adamID string, playlist
 	}
 	fmt.Printf("M3U8: %d segments, duration=%.3fs\n", totalSegments, playlistDuration)
 
+	if len(segments) == 0 || totalSegments == 0 {
+		return errors.New("no segments in playlist")
+	}
 	segment0 := segments[0]
 	if segment0 == nil {
 		return errors.New("no segments in playlist")
@@ -276,7 +279,10 @@ func DownloadAndDecrypt(ctx context.Context, wm *Client, adamID string, playlist
 		go func() {
 			segParsed, err := url.Parse(segments[i].URI)
 			if err != nil {
-				errChan <- fmt.Errorf("parse segment %d URI: %w", i, err)
+				select {
+				case errChan <- fmt.Errorf("parse segment %d URI: %w", i, err):
+				case <-downloadCtx.Done():
+				}
 				return
 			}
 			segURL := mediaParsed.ResolveReference(segParsed).String()
@@ -288,7 +294,13 @@ func DownloadAndDecrypt(ctx context.Context, wm *Client, adamID string, playlist
 				data, err = downloadBytes(downloadCtx, segURL)
 			}
 			if err != nil {
-				errChan <- fmt.Errorf("download segment %d: %w", i, err)
+				// ctx-aware send: errChan is buffered to 1, so once the consumer has
+				// read one error and returned, a second failing goroutine would block
+				// here forever. Bail out when downloads are cancelled instead.
+				select {
+				case errChan <- fmt.Errorf("download segment %d: %w", i, err):
+				case <-downloadCtx.Done():
+				}
 				return
 			}
 			segChan <- segResult{i, data, segmentKeyURIs[i]}
@@ -438,6 +450,11 @@ func DownloadAndDecrypt(ctx context.Context, wm *Client, adamID string, playlist
 		case err := <-errChan:
 			cancelDownloads()
 			return err
+		case <-ctx.Done():
+			// Cancellation (e.g. user /stop) or any unforeseen producer stall must not
+			// leave this loop blocked forever while holding a wrapper-pool token.
+			cancelDownloads()
+			return ctx.Err()
 		}
 	}
 

@@ -128,11 +128,19 @@ const (
 // DC5 TCP send buffer (then the 4 MB kernel default) had no room for the ping → "pong
 // missed" i/o timeout → engine teardown → upload drop/resume sawtooth (see AGENTS.md).
 // The fix was capping at 8. That blocker is now removed: docker-compose.yml sets
-// net.ipv4.tcp_wmem max to 16 MB (verified live in the container), so 8 MB in flight
-// sits in a 16 MB buffer — half — leaving the other half as keepalive headroom. Back to
-// 16 to reclaim the ~45 MB/s ceiling. Watch the zap log for "pong missed" recurrence; if
-// it returns, the buffer raise didn't hold and this should drop to 8 (or become a
-// per-DC config field).
+// net.ipv4.tcp_wmem max to 16 MB (verified live in the container), so the in-flight
+// window can grow while leaving room for the keepalive ping.
+//
+// At 16 the sawtooth was cured (clean log over a full 168 MB upload). Trialing 20 (10 MB
+// in flight = 62% of the 16 MB buffer) RE-INTRODUCED the teardown: dc_id=5 "engine
+// forcibly closed: context canceled" mid-upload (e.g. part 197), the same drop/resume
+// sawtooth. So 20 over-fills the send buffer and re-starves the keepalive write even at
+// 16 MB — the safe ceiling on this single connection is 16. Throughput at 16 stays
+// moderate (the displayed ~6-7 MB/s is itself suspect — known progress-board display
+// bug), but it is STABLE. gotd serializes RPC writes over the one connection, so the
+// single connection is protocol-saturated; only a multi-connection path (Pyrofork
+// sidecar or a Go client pool) lifts it further. DO NOT raise above 16 without a buffer
+// increase. Watch the zap log for "pong missed" / "engine forcibly closed".
 const (
 	uploadPartSize = 512 * 1024
 	uploadThreads  = 16
@@ -595,7 +603,8 @@ func (m *MTProtoClient) uploadAndSendAudioOnce(
 	_, err = api.MessagesSendMedia(ctx, req)
 	if waited, _ := tgerr.FloodWait(ctx, err); waited {
 		fmt.Println("FLOOD_WAIT for audio, retrying...")
-		req.RandomID = cryptoRandID()
+		// Reuse the original RandomID so Telegram deduplicates the resend — a fresh
+		// RandomID would post a duplicate if the first send committed server-side.
 		_, err = api.MessagesSendMedia(ctx, req)
 	}
 	if err != nil {
@@ -848,7 +857,7 @@ func (m *MTProtoClient) uploadAndSendDocumentOnce(
 	_, err = api.MessagesSendMedia(ctx, req)
 	if waited, _ := tgerr.FloodWait(ctx, err); waited {
 		fmt.Println("FLOOD_WAIT for document, retrying...")
-		req.RandomID = cryptoRandID()
+		// Reuse the original RandomID so Telegram deduplicates the resend.
 		_, err = api.MessagesSendMedia(ctx, req)
 	}
 	if err != nil {
@@ -960,7 +969,7 @@ func (m *MTProtoClient) uploadAndSendVideoOnce(
 	_, err = api.MessagesSendMedia(ctx, req)
 	if waited, _ := tgerr.FloodWait(ctx, err); waited {
 		fmt.Println("FLOOD_WAIT for video, retrying...")
-		req.RandomID = cryptoRandID()
+		// Reuse the original RandomID so Telegram deduplicates the resend.
 		_, err = api.MessagesSendMedia(ctx, req)
 	}
 	if err != nil {

@@ -48,6 +48,9 @@ func (a *Station) GetResp(mutoken, token, l string) error {
 		return errors.New("error getting station response")
 	}
 	a.Resp = *resp
+	if len(a.Resp.Data) == 0 {
+		return errors.New("station not found or unavailable")
+	}
 	//简化高频调用名称
 	a.Type = a.Resp.Data[0].Attributes.PlayParams.Format
 	a.Name = a.Resp.Data[0].Attributes.Name
@@ -64,6 +67,9 @@ func (a *Station) GetResp(mutoken, token, l string) error {
 		albumResp, err := ampapi.GetAlbumRespByHref(trackData.Href, a.Language, token)
 		if err != nil {
 			fmt.Println("Error getting album response:", err)
+			continue
+		}
+		if len(albumResp.Data) == 0 || len(albumResp.Data[0].Relationships.Tracks.Data) == 0 {
 			continue
 		}
 		albumLen := len(albumResp.Data[0].Relationships.Tracks.Data)

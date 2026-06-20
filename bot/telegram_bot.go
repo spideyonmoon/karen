@@ -134,6 +134,13 @@ type TelegramBot struct {
 	schedHeadRip   *RipState
 	schedHeadMode  string
 	schedBorrowReq *downloadRequest
+	// uploadingReqs tracks head tasks that have finished downloading and are now
+	// delivering/uploading (guarded by queueMu). Under task concurrency the scheduler
+	// promotes the next head into activeReq at download-done, so a head still uploading
+	// is no longer activeReq, not the borrower, and gone from the queue — this map lets
+	// /stop still find and cancel it. Keyed by taskID; entries are removed when the task
+	// fully finishes.
+	uploadingReqs map[string]*downloadRequest
 	// activeBoards is the per-task render/data source for every running task, keyed
 	// by taskID (guarded by queueMu). Under task concurrency the head and the sticky
 	// borrower each register their own entry, so /status can resurface all of them;
@@ -554,6 +561,7 @@ func newTelegramBot(token, appleToken string) *TelegramBot {
 		userTaskCount:    make(map[int64]int),
 		activeBoards:     make(map[string]*DownloadStatus),
 		chatBoards:       make(map[int64]*chatBoard),
+		uploadingReqs:    make(map[string]*downloadRequest),
 		cacheFile:        cacheFile,
 		cache:            make(map[string]CachedAudio),
 		docCache:         make(map[string]CachedDocument),
@@ -754,7 +762,16 @@ func (b *TelegramBot) startTask(req *downloadRequest, borrower bool, budget int)
 
 	done := make(chan struct{})
 	var once sync.Once
-	req.onDownloadComplete = func() { once.Do(func() { close(done) }) }
+	req.onDownloadComplete = func() {
+		once.Do(func() {
+			// The download phase is done; the task now moves to delivery/upload and is
+			// no longer activeReq. Register it so /stop can still cancel it mid-upload.
+			b.queueMu.Lock()
+			b.uploadingReqs[req.taskID] = req
+			b.queueMu.Unlock()
+			close(done)
+		})
+	}
 
 	b.queueMu.Lock()
 	req.startedAt = time.Now()
@@ -779,6 +796,7 @@ func (b *TelegramBot) startTask(req *downloadRequest, borrower bool, budget int)
 		req.onDownloadComplete()
 
 		b.queueMu.Lock()
+		delete(b.uploadingReqs, req.taskID)
 		if borrower {
 			if b.schedBorrowReq == req {
 				b.schedBorrowReq = nil
@@ -1478,7 +1496,14 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args
 			b.queueMu.Lock()
 			grp := b.chatBoards[chatID]
 			b.queueMu.Unlock()
-			grp.relocate(replyToID)
+			if grp != nil {
+				grp.relocate(replyToID)
+			} else {
+				// The chat's last task retired in the window between the snapshot and
+				// this lookup, so there's no live board to resurface — fall back to the
+				// idle/queue board instead of producing no /status output at all.
+				b.replaceIdleStatusBoard(chatID, replyToID, "📊 Karen Status Board\n\nNo active tasks."+b.queueBoardSuffix())
+			}
 		case len(others) > 0:
 			var sb strings.Builder
 			for i, s := range others {
@@ -1600,6 +1625,14 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args
 				format := b.resolveFormat(chatID, forceFlac)
 				if forceNoCache || !b.trySendCachedTrack(chatID, replyToID, songID, format) {
 					b.enqueueDownload(chatID, userID, "", replyToID, 0, true, format, headlessMode, "", forceNoCache, func(ctx context.Context) error {
+						// Honor -atmos for headless single-song rips (see handleTransferMode).
+						if forceAtmos {
+							if rs := ripStateFrom(ctx); rs != nil {
+								rs.Atmos = true
+							} else {
+								dl_atmos = true
+							}
+						}
 						return ripSong(songID, b.appleToken, Config.Storefront, forceAAC, ctx)
 					})
 				}
@@ -1665,7 +1698,14 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args
 			return
 		}
 
-		_ = b.sendMessageWithReply(chatID, "Invalid Apple Music link.", nil, replyToID)
+		switch {
+		case strings.TrimSpace(link) == "":
+			_ = b.sendMessageWithReply(chatID, "No Apple Music link found. Paste a music.apple.com URL after /dl (flags like -aac/-atmos/-flac can go before or after it).", nil, replyToID)
+		case !strings.Contains(link, "music.apple.com"):
+			_ = b.sendMessageWithReply(chatID, "That doesn't look like an Apple Music link. Copy the share URL from the Apple Music app — it should start with music.apple.com.", nil, replyToID)
+		default:
+			_ = b.sendMessageWithReply(chatID, "Couldn't recognize that Apple Music link. Supported: songs, albums, playlists, stations, artists, and music videos.", nil, replyToID)
+		}
 	case "count":
 		if len(args) == 0 {
 			_ = b.sendMessageWithReply(chatID, "Usage: /count <apple-music-link>", nil, replyToID)
@@ -1863,6 +1903,16 @@ func (b *TelegramBot) handleTransferMode(chatID int64, messageID int, mode strin
 
 	if pending.Single && pending.SongID != "" {
 		b.enqueueDownload(chatID, userID, username, replyToID, messageID, true, b.resolveFormat(chatID, pending.ForceFlac), mode, "", pending.NoCache, func(ctx context.Context) error {
+			// Honor -atmos for single songs too. ripSong → ripAlbum reads the codec
+			// from the rip state, so without this the flag was silently dropped and
+			// the user got ALAC instead of the Atmos they asked for.
+			if pending.ForceAtmos {
+				if rs := ripStateFrom(ctx); rs != nil {
+					rs.Atmos = true
+				} else {
+					dl_atmos = true
+				}
+			}
 			return ripSong(pending.SongID, b.appleToken, Config.Storefront, pending.ForceAAC, ctx)
 		})
 	} else if pending.PlaylistID != "" {
@@ -2305,7 +2355,40 @@ func (b *TelegramBot) trySendCachedAlbumZip(chatID int64, albumID string, replyT
 	return true
 }
 
+// friendlyTaskError turns an internal error into a concise, user-facing one-liner
+// for the status board. Cancellation reads as "Cancelled"; everything else is
+// trimmed to a single capped line so raw ffmpeg/mp4decrypt stderr and segment URLs
+// don't spill into the chat. The full error is still logged for debugging.
+func friendlyTaskError(prefix string, err error) string {
+	if err == nil {
+		return prefix
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return "⛔ Cancelled."
+	}
+	msg := strings.TrimSpace(err.Error())
+	if i := strings.IndexAny(msg, "\n\r"); i >= 0 {
+		msg = strings.TrimSpace(msg[:i]) // first line only — drop multi-line stderr dumps
+	}
+	const maxLen = 180
+	if len(msg) > maxLen {
+		msg = msg[:maxLen] + "…"
+	}
+	if msg == "" {
+		return "❌ " + prefix + "."
+	}
+	return "❌ " + prefix + ": " + msg
+}
+
 func (b *TelegramBot) runDownload(req *downloadRequest) {
+	// Last-resort safety net: a panic on the single-track/song/MV path (which does
+	// not go through the per-track recover in main.go) must not take the whole bot
+	// down with it. The per-rip cleanup defers below still run during the unwind.
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("runDownload panic recovered (chat %d): %v\n", req.chatID, r)
+		}
+	}()
 	chatID := req.chatID
 	fn := req.fn
 	single := req.single
@@ -2428,7 +2511,8 @@ func (b *TelegramBot) runDownload(req *downloadRequest) {
 		req.onDownloadComplete()
 	}
 	if err != nil {
-		status.UpdateSync(fmt.Sprintf("Failed: %v", err), 0, 0)
+		fmt.Printf("rip failed (chat %d, task %s): %v\n", chatID, req.taskID, err)
+		status.UpdateSync(friendlyTaskError("Download failed", err), 0, 0)
 		return
 	}
 
@@ -2928,6 +3012,23 @@ func (b *TelegramBot) sendVideoFileMTProto(chatID int64, path string, replyToID 
 		defer os.Remove(thumbPath)
 	}
 
+	// Append a video-quality + file-size line to the caption (best-effort; only
+	// the parts we actually have are shown).
+	var details []string
+	if quality := videoQualityLabel(height); quality != "" {
+		if width > 0 && height > 0 {
+			details = append(details, fmt.Sprintf("%s (%d×%d)", quality, width, height))
+		} else {
+			details = append(details, quality)
+		}
+	}
+	if sizeBytes > 0 {
+		details = append(details, formatBytes(sizeBytes))
+	}
+	if len(details) > 0 {
+		caption = fmt.Sprintf("%s\n%s", caption, strings.Join(details, " · "))
+	}
+
 	// Try native video first.
 	err := b.mtproto.UploadAndSendVideo(chatID, path, caption, durationSecs, width, height, thumbPath, replyToID, status, ctx)
 	if err == nil {
@@ -2951,6 +3052,20 @@ func (b *TelegramBot) sendVideoFileMTProto(chatID int64, path string, replyToID 
 	return errDoc
 }
 
+// mvBoardTitle derives a human heading for the status board from the MV's recorded
+// metadata ("Performer — Title"), falling back to the file's base name (sans
+// extension) when no metadata is available. Mirrors the caption logic in
+// sendVideoFileMTProto.
+func mvBoardTitle(ctx context.Context, path string) string {
+	if meta, ok := getDownloadedMeta(ctx, path); ok && meta.Title != "" {
+		if meta.Performer != "" {
+			return fmt.Sprintf("%s — %s", meta.Performer, meta.Title)
+		}
+		return meta.Title
+	}
+	return strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+}
+
 // deliverMusicVideo sends a downloaded music video as a native Telegram video (inline
 // player + thumbnail), falling back to a document and then Gofile. The status board is
 // always resolved to a terminal state.
@@ -2959,6 +3074,10 @@ func (b *TelegramBot) deliverMusicVideo(chatID int64, path string, replyToID int
 		status.UpdateSync("Cancelled", 0, 0)
 		return
 	}
+
+	// Give the board a real heading; MV progress flows through status.Update, which
+	// never sets releaseTitle, so without this the board reads "Untitled".
+	status.SetReleaseTitle(mvBoardTitle(ctx, path))
 
 	var sizeBytes int64
 	if info, err := os.Stat(path); err == nil {
@@ -3004,6 +3123,7 @@ func (b *TelegramBot) deliverMvGofile(chatID int64, path string, replyToID int, 
 		status.UpdateSync("Cancelled", 0, 0)
 		return
 	}
+	status.SetReleaseTitle(mvBoardTitle(ctx, path))
 	status.UpdateSync("Uploading to Gofile...", 0, 0)
 	link, err := apputils.UploadToGofile(ctx, path, Config.GofileToken)
 	if err != nil {
@@ -3350,7 +3470,7 @@ func (b *TelegramBot) sendAudioFile(ctx context.Context, chatID int64, filePath 
 	}
 	if info.Size() > b.maxFileBytes {
 		if format != telegramFormatFlac {
-			return fmt.Errorf("ALAC file exceeds Telegram limit (%dMB). Use /settings flac or raise telegram-max-file-mb.", b.maxFileBytes/1024/1024)
+			return fmt.Errorf("ALAC file exceeds the %dMB Telegram limit. Re-run /dl with -flac to compress it under the limit, or raise telegram-max-file-mb.", b.maxFileBytes/1024/1024)
 		}
 		if status != nil {
 			status.Update("Compressing", 0, 0)
@@ -3758,6 +3878,14 @@ type trackProgressState struct {
 	phase        string
 	done         int64
 	size         int64
+	// maxBytes is the high-water mark of every byte count ever seen for this track
+	// (max of `done` and `total` across all phases). `size` mirrors only the reported
+	// `total`, which stays 0 for the HLS-segment download path and gets clobbered to
+	// 0/1 by the post-download Decrypting/Converting sentinels — so it can't be trusted
+	// as the final size. maxBytes survives those, giving finishedSizes a real number
+	// (and keeping the upload bar's aggregate total honest) while `size` is left alone
+	// so the live per-track % stays indeterminate for unknown-total downloads.
+	maxBytes     int64
 	startedAt    time.Time
 	updatedAt    time.Time
 	workerID     string
@@ -4162,6 +4290,25 @@ func (s *DownloadStatus) UpdateSync(phase string, done, total int64) {
 	s.group.flush(true)
 }
 
+// SetReleaseTitle sets the board's heading when no per-track UpdateTrack call will
+// supply one — e.g. music-video / artwork deliveries, whose progress flows through
+// status.Update (not UpdateTrack), leaving releaseTitle empty and the board showing
+// "Untitled". First non-empty value wins, mirroring UpdateTrack.
+func (s *DownloadStatus) SetReleaseTitle(title string) {
+	if s == nil {
+		return
+	}
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return
+	}
+	s.mu.Lock()
+	if s.releaseTitle == "" {
+		s.releaseTitle = title
+	}
+	s.mu.Unlock()
+}
+
 func (s *DownloadStatus) UpdateTrack(id, title, releaseTitle, workerID string, number, trackTotal int, phase string, done, total int64) {
 	if s == nil {
 		return
@@ -4177,8 +4324,12 @@ func (s *DownloadStatus) UpdateTrack(id, title, releaseTitle, workerID string, n
 	if phase == "Finished" {
 		if prev, ok := s.tracks[id]; ok {
 			// Retain the size so the aggregate progress bar keeps a stable total.
-			// Prefer the final reported size; fall back to the last seen done.
-			size := prev.size
+			// maxBytes is the trustworthy high-water size (see field doc); fall back to
+			// the reported total, then the last seen done, for older/edge cases.
+			size := prev.maxBytes
+			if size <= 0 {
+				size = prev.size
+			}
 			if size <= 0 {
 				size = prev.done
 			}
@@ -4206,6 +4357,18 @@ func (s *DownloadStatus) UpdateTrack(id, title, releaseTitle, workerID string, n
 		state.phase = phase
 		state.done = done
 		state.size = total
+		// Maintain maxBytes as the true-size high-water mark (see field doc). The
+		// direct-stream path reports total=resp.ContentLength; the HLS-segment path
+		// reports total=0 and exposes size only via accumulated `done`. Post-download
+		// phases report 0/1 sentinels and Decrypting rewinds `done` to 0 — none of
+		// which can lower maxBytes, so finishedSizes captures the real track size and
+		// the upload bar no longer collapses to "7.00MB / 7.00MB".
+		if total > state.maxBytes {
+			state.maxBytes = total
+		}
+		if done > state.maxBytes {
+			state.maxBytes = done
+		}
 		state.updatedAt = now
 		if workerID != "" {
 			state.workerID = workerID
@@ -4690,6 +4853,11 @@ var richMDEscaper = strings.NewReplacer(
 	"[", `\[`,
 	"]", `\]`,
 	"#", `\#`,
+	// '<' opens an HTML tag in the Bot API 10.1 Rich renderer (which interprets the
+	// <details>/<summary> tags we emit), so a track/album/user name containing '<'
+	// could break rendering or smuggle in markup. Map it to the HTML entity, which
+	// the renderer decodes back to a literal '<' and never treats as a tag.
+	"<", "&lt;",
 	">", `\>`,
 	"=", `\=`,
 )
@@ -4928,6 +5096,29 @@ func formatBytes(value int64) string {
 		precision = 2
 	}
 	return fmt.Sprintf("%.*f%s", precision, size, units[unitIndex])
+}
+
+// videoQualityLabel maps a video's pixel height to a familiar quality tag
+// (e.g. 1080 -> "1080p", 2160 -> "4K"). Returns "" when the height is unknown.
+func videoQualityLabel(height int) string {
+	switch {
+	case height <= 0:
+		return ""
+	case height >= 2160:
+		return "4K"
+	case height >= 1440:
+		return "1440p"
+	case height >= 1080:
+		return "1080p"
+	case height >= 720:
+		return "720p"
+	case height >= 480:
+		return "480p"
+	case height >= 360:
+		return "360p"
+	default:
+		return fmt.Sprintf("%dp", height)
+	}
 }
 
 func calcBitrateKbps(sizeBytes int64, durationMillis int64) float64 {
@@ -6218,10 +6409,12 @@ func buildCoverCaption(ctx context.Context, paths []string) string {
 		explicit = "True"
 	}
 
-	lines := []string{
-		fmt.Sprintf("Artist : %s", artist),
-		fmt.Sprintf("Album : %s", albumName),
+	lines := []string{}
+	// Skip the Artist line entirely when unknown rather than printing a blank field.
+	if artist != "" {
+		lines = append(lines, fmt.Sprintf("Artist : %s", artist))
 	}
+	lines = append(lines, fmt.Sprintf("Album : %s", albumName))
 	// Release Date is omitted for playlists (it has no single meaningful value)
 	// and whenever it's otherwise unknown, rather than printing a blank field.
 	if releaseDate != "" {
@@ -6352,10 +6545,28 @@ func (b *TelegramBot) cancelTask(chatID int64, issuerID int64, taskID string, re
 		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("⛔ Task %s stopped.", taskID), nil, replyToID)
 		return
 	}
+	// Check in-flight uploads (task-concurrency head): once a head finishes its
+	// download phase the scheduler promotes the next head into activeReq, so a head
+	// still uploading is neither activeReq nor the borrower nor in the queue. Without
+	// this it would falsely report "not found" and the upload couldn't be stopped.
+	if req, ok := b.uploadingReqs[taskID]; ok {
+		if req.userID != 0 && issuerID != req.userID && !b.isAdmin(issuerID) {
+			b.queueMu.Unlock()
+			_ = b.sendMessageWithReply(chatID, notYours, nil, replyToID)
+			return
+		}
+		if req.cancel != nil {
+			req.cancel()
+		}
+		b.queueMu.Unlock()
+		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("⛔ Task %s stopped.", taskID), nil, replyToID)
+		return
+	}
 	// Check queued tasks — drain and re-enqueue without the target
 	found := false
 	denied := false
 	queueLen := len(b.downloadQueue)
+drain:
 	for i := 0; i < queueLen; i++ {
 		select {
 		case req := <-b.downloadQueue:
@@ -6380,7 +6591,9 @@ func (b *TelegramBot) cancelTask(chatID int64, issuerID int64, taskID string, re
 				found = true
 			}
 		default:
-			break
+			// A bare `break` here would only break the select, leaving the for loop
+			// spinning the remaining count. Break the loop once the queue is drained.
+			break drain
 		}
 	}
 	b.queueMu.Unlock()
@@ -6403,14 +6616,18 @@ Commands:
 /profile                         set your saved rip preferences (buttons)
 /help                            show this message
 
-Heavy rips (full artist discographies, and playlists over 100 tracks) are
-delivered as a Gofile ZIP and, outside 2:30–6:00 AM Dhaka time, are scheduled
-to run during that window.
+Delivery: playlists over 40 tracks are always delivered as a Gofile ZIP
+(sending dozens of individual files trips Telegram's rate limits). Very heavy
+rips (full artist discographies, playlists over 100 tracks) also wait for the
+2:30–6:00 AM Dhaka window.
+
+Default quality is ALAC. -aac and -atmos pick a different source codec; -flac
+re-encodes the downloaded audio to FLAC. If you combine codec flags, one wins.
 
 Flags:
   -aac     download in AAC-LC format
   -atmos   download in Dolby Atmos format
-  -flac    convert to FLAC after download
+  -flac    convert the downloaded audio to FLAC
   -art     grab cover art + motion artwork (no audio)
   -nc      no-cache: delete any cached copy and re-rip fresh
   -tgu     send as individual Telegram tracks (skip keyboard)
@@ -6439,7 +6656,9 @@ Rips lossless ALAC, Dolby Atmos, and AAC from Apple Music straight to your chat.
 | ` + "`/profile`" + ` | Set your saved rip preferences (all buttons) |
 | ` + "`/help`" + ` | Show this message |
 
-> Heavy rips (full artist discographies, playlists over 100 tracks) deliver as a Gofile ZIP and, outside 2:30–6:00 AM Dhaka time, are scheduled for that window.
+> Playlists over **40 tracks** are always delivered as a Gofile ZIP (dozens of individual uploads trip Telegram's rate limits). Very heavy rips (full artist discographies, playlists over 100 tracks) also wait for the 2:30–6:00 AM Dhaka window.
+>
+> Default quality is ALAC. ` + "`-aac`/`-atmos`" + ` pick a different source codec; ` + "`-flac`" + ` re-encodes after download. If you combine codec flags, one wins.
 
 ## Flags
 
@@ -6447,7 +6666,7 @@ Rips lossless ALAC, Dolby Atmos, and AAC from Apple Music straight to your chat.
 |:-----|:-------|
 | ` + "`-aac`" + ` | Download in AAC-LC format |
 | ` + "`-atmos`" + ` | Download in Dolby Atmos format |
-| ` + "`-flac`" + ` | Convert to FLAC after download |
+| ` + "`-flac`" + ` | Convert the downloaded audio to FLAC |
 | ` + "`-art`" + ` | Grab cover art + motion artwork (no audio) |
 | ` + "`-nc`" + ` | No-cache: delete any cached copy and re-rip fresh |
 | ` + "`-tgu`" + ` | Send as individual Telegram tracks |

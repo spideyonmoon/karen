@@ -738,9 +738,11 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 	var downloadM3u8 string
 	if needDlAacLc {
 		for attempt := 0; attempt < 2; attempt++ {
-			wm := wmPool.Acquire()
-			downloadM3u8, err = wm.WebPlayback(ctx, track.ID)
-			wmPool.Release(wm)
+			func() {
+				wm := wmPool.Acquire()
+				defer wmPool.Release(wm)
+				downloadM3u8, err = wm.WebPlayback(ctx, track.ID)
+			}()
 			if err == nil {
 				break
 			}
@@ -757,9 +759,11 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 		}
 	} else {
 		for attempt := 0; attempt < 2; attempt++ {
-			wm := wmPool.Acquire()
-			downloadM3u8, err = wm.M3U8(ctx, track.ID)
-			wmPool.Release(wm)
+			func() {
+				wm := wmPool.Acquire()
+				defer wmPool.Release(wm)
+				downloadM3u8, err = wm.M3U8(ctx, track.ID)
+			}()
 			if err == nil {
 				break
 			}
@@ -921,10 +925,16 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 		// the M3U8/WebPlayback retry pattern added in b7d1ea9 — without this,
 		// a single bad wrapper takes the whole track down.
 		for attempt := 0; attempt < 2; attempt++ {
-			wm := wmPool.Acquire()
-			track.WorkerID = wm.ID()
-			err = wmgrpc.DownloadAndDecrypt(ctx, wm, track.ID, downloadM3u8, trackPath, wmgrpc.ProgressFunc(trackProgress))
-			wmPool.Release(wm)
+			// Release in a deferred closure per attempt so a panic inside
+			// DownloadAndDecrypt (mp4 decode/encode, sample handling) can never
+			// leak a pool token — a leaked token permanently shrinks the pool and
+			// would eventually deadlock every future rip.
+			func() {
+				wm := wmPool.Acquire()
+				defer wmPool.Release(wm)
+				track.WorkerID = wm.ID()
+				err = wmgrpc.DownloadAndDecrypt(ctx, wm, track.ID, downloadM3u8, trackPath, wmgrpc.ProgressFunc(trackProgress))
+			}()
 			if err == nil {
 				break
 			}
@@ -1141,9 +1151,11 @@ func ripStation(albumId string, token string, storefront string, ctx context.Con
 			return err
 		}
 		trackM3U8 := strings.ReplaceAll(assetsUrl, "index.m3u8", "256/prog_index.m3u8")
-		wm := wmPool.Acquire()
-		err = wmgrpc.DownloadAndDecrypt(ctx, wm, station.ID, trackM3U8, trackPath, nil)
-		wmPool.Release(wm)
+		func() {
+			wm := wmPool.Acquire()
+			defer wmPool.Release(wm)
+			err = wmgrpc.DownloadAndDecrypt(ctx, wm, station.ID, trackM3U8, trackPath, nil)
+		}()
 		if err != nil {
 			fmt.Println("Failed to download station stream.", err)
 			ctr.Error++
@@ -1205,6 +1217,15 @@ func ripStation(albumId string, token string, storefront string, ctx context.Con
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(idx int) {
+			// Contain any unforeseen panic in a single track so it degrades to one
+			// failed track instead of crashing the whole process (and every other
+			// concurrent rip). Registered first so it runs after the resource defers.
+			defer func() {
+				if r := recover(); r != nil {
+					recordDownloadFailure(ctx, "%s: internal error: %v", station.Tracks[idx].Name, r)
+					ctr.Inc(&ctr.Error)
+				}
+			}()
 			defer wg.Done()
 			defer rs.trackDone()
 			defer func() { <-sem }()
@@ -1446,10 +1467,17 @@ func ripAlbum(albumId string, token string, storefront string, urlArg_i string, 
 		}
 	}
 	Tag_string := strings.Join(stringsToJoin, " ")
+	// ReleaseDate can be empty or shorter than 4 chars; slicing [:4] blindly would
+	// panic in this recover-less goroutine. Derive the year defensively.
+	releaseDate := meta.Data[0].Attributes.ReleaseDate
+	releaseYear := releaseDate
+	if len(releaseDate) >= 4 {
+		releaseYear = releaseDate[:4]
+	}
 	var albumFolderName string
 	albumFolderName = strings.NewReplacer(
-		"{ReleaseDate}", meta.Data[0].Attributes.ReleaseDate,
-		"{ReleaseYear}", meta.Data[0].Attributes.ReleaseDate[:4],
+		"{ReleaseDate}", releaseDate,
+		"{ReleaseYear}", releaseYear,
 		"{ArtistName}", LimitString(meta.Data[0].Attributes.ArtistName),
 		"{AlbumName}", LimitString(meta.Data[0].Attributes.Name),
 		"{UPC}", meta.Data[0].Attributes.Upc,
@@ -1590,6 +1618,15 @@ func ripAlbum(albumId string, token string, storefront string, urlArg_i string, 
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(idx int) {
+			// Contain any unforeseen panic in a single track so it degrades to one
+			// failed track instead of crashing the whole process (and every other
+			// concurrent rip). Registered first so it runs after the resource defers.
+			defer func() {
+				if r := recover(); r != nil {
+					recordDownloadFailure(ctx, "%s: internal error: %v", album.Tracks[idx].Name, r)
+					ctr.Inc(&ctr.Error)
+				}
+			}()
 			defer wg.Done()
 			defer rs.trackDone()
 			defer func() { <-sem }()
@@ -1826,6 +1863,15 @@ func ripPlaylist(playlistId string, token string, storefront string, forceAAC bo
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(idx int) {
+			// Contain any unforeseen panic in a single track so it degrades to one
+			// failed track instead of crashing the whole process (and every other
+			// concurrent rip). Registered first so it runs after the resource defers.
+			defer func() {
+				if r := recover(); r != nil {
+					recordDownloadFailure(ctx, "%s: internal error: %v", playlist.Tracks[idx].Name, r)
+					ctr.Inc(&ctr.Error)
+				}
+			}()
 			defer wg.Done()
 			defer rs.trackDone()
 			defer func() { <-sem }()
@@ -1837,6 +1883,13 @@ func ripPlaylist(playlistId string, token string, storefront string, forceAAC bo
 }
 
 func writeMP4Tags(track *task.Track, lrc string) error {
+	// GenreNames is absent for many tracks (region-locked, pre-release); indexing [0]
+	// unconditionally would panic and — since ripTrack runs in a recover-less goroutine
+	// — crash the whole bot. Default to no genre instead.
+	genre := ""
+	if len(track.Resp.Attributes.GenreNames) > 0 {
+		genre = track.Resp.Attributes.GenreNames[0]
+	}
 	t := &mp4tag.MP4Tags{
 		Title:      track.Resp.Attributes.Name,
 		TitleSort:  track.Resp.Attributes.Name,
@@ -1851,7 +1904,7 @@ func writeMP4Tags(track *task.Track, lrc string) error {
 		},
 		Composer:     track.Resp.Attributes.ComposerName,
 		ComposerSort: track.Resp.Attributes.ComposerName,
-		CustomGenre:  track.Resp.Attributes.GenreNames[0],
+		CustomGenre:  genre,
 		Lyrics:       lrc,
 		TrackNumber:  int16(track.Resp.Attributes.TrackNumber),
 		DiscNumber:   int16(track.Resp.Attributes.DiscNumber),
@@ -2129,7 +2182,12 @@ func mvDownloader(ctx context.Context, adamID string, saveDir string, token stri
 	MVInfo, err := ampapi.GetMusicVideoResp(storefront, adamID, Config.Language, token)
 	if err != nil {
 		fmt.Println("\u26A0 Failed to get MV manifest:", err)
-		return nil
+		// Returning nil here previously reported a hard failure as a successful rip,
+		// delivering nothing. Surface the error so the user sees it failed.
+		return fmt.Errorf("failed to get music video info: %w", err)
+	}
+	if MVInfo == nil || len(MVInfo.Data) == 0 {
+		return fmt.Errorf("music video %s not found or unavailable", adamID)
 	}
 
 	if strings.HasSuffix(saveDir, ".") {
@@ -2139,6 +2197,11 @@ func mvDownloader(ctx context.Context, adamID string, saveDir string, token stri
 
 	vidPath := filepath.Join(saveDir, fmt.Sprintf("%s_vid.mp4", adamID))
 	audPath := filepath.Join(saveDir, fmt.Sprintf("%s_aud.mp4", adamID))
+	// Register cleanup of the intermediate video/audio files up front so they are
+	// removed even when a download/decrypt step fails partway (previously the defers
+	// sat after each ExtMvData call and were skipped on its error path, leaking temps).
+	defer os.Remove(vidPath)
+	defer os.Remove(audPath)
 	mvSaveName := fmt.Sprintf("%s (%s)", MVInfo.Data[0].Attributes.Name, adamID)
 	if track != nil {
 		mvSaveName = fmt.Sprintf("%02d. %s", track.TaskNum, MVInfo.Data[0].Attributes.Name)
@@ -2148,6 +2211,27 @@ func mvDownloader(ctx context.Context, adamID string, saveDir string, token stri
 
 	fmt.Println(MVInfo.Data[0].Attributes.Name)
 
+	// Register the muxed MV with the rip state so the Telegram delivery layer can find
+	// it the same way it finds audio tracks. Used by both the cached and freshly-ripped
+	// paths so a cached file is still delivered/uploaded. Harmless for the CLI path.
+	registerMV := func() {
+		rs := ripStateFrom(ctx)
+		rs.addPath(mvOutPath)
+		mvMeta := AudioMeta{
+			TrackID:        strings.TrimSpace(adamID),
+			Title:          strings.TrimSpace(MVInfo.Data[0].Attributes.Name),
+			Performer:      strings.TrimSpace(MVInfo.Data[0].Attributes.ArtistName),
+			DurationMillis: int64(MVInfo.Data[0].Attributes.DurationInMillis),
+			AlbumName:      strings.TrimSpace(MVInfo.Data[0].Attributes.AlbumName),
+			ReleaseDate:    strings.TrimSpace(MVInfo.Data[0].Attributes.ReleaseDate),
+			ContentRating:  strings.TrimSpace(MVInfo.Data[0].Attributes.ContentRating),
+			Codec:          "MV",
+		}
+		if mvMeta.Title != "" || mvMeta.Performer != "" {
+			rs.putMeta(mvOutPath, mvMeta)
+		}
+	}
+
 	exists, _ := fileExists(mvOutPath)
 	if ripStateFrom(ctx).noCache() && exists {
 		fmt.Println("--no-cache: removing existing MV to re-rip fresh.")
@@ -2155,7 +2239,11 @@ func mvDownloader(ctx context.Context, adamID string, saveDir string, token stri
 		exists = false
 	}
 	if exists {
-		fmt.Println("MV already exists locally.")
+		fmt.Println("MV already cached locally — skipping download, will upload.")
+		if progress != nil {
+			progress("Cached, preparing upload", 0, 0)
+		}
+		registerMV()
 		return nil
 	}
 
@@ -2176,7 +2264,6 @@ func mvDownloader(ctx context.Context, adamID string, saveDir string, token stri
 	if err := runv3.ExtMvData(ctx, videokeyAndUrls, vidPath, runv3.ProgressFunc(progress)); err != nil {
 		return fmt.Errorf("video track download failed: %w", err)
 	}
-	defer os.Remove(vidPath)
 	audiom3u8url, _ := extractMvAudio(mvm3u8url)
 	audiokeyAndUrls, err := runv3.Run(ctx, adamID, audiom3u8url, token, Config.MediaUserToken, true, "", nil)
 	if err != nil {
@@ -2185,13 +2272,16 @@ func mvDownloader(ctx context.Context, adamID string, saveDir string, token stri
 	if err := runv3.ExtMvData(ctx, audiokeyAndUrls, audPath, runv3.ProgressFunc(progress)); err != nil {
 		return fmt.Errorf("audio track download failed: %w", err)
 	}
-	defer os.Remove(audPath)
 
+	mvGenre := ""
+	if len(MVInfo.Data[0].Attributes.GenreNames) > 0 {
+		mvGenre = MVInfo.Data[0].Attributes.GenreNames[0]
+	}
 	tags := []string{
 		"tool=",
 		fmt.Sprintf("artist=%s", MVInfo.Data[0].Attributes.ArtistName),
 		fmt.Sprintf("title=%s", MVInfo.Data[0].Attributes.Name),
-		fmt.Sprintf("genre=%s", MVInfo.Data[0].Attributes.GenreNames[0]),
+		fmt.Sprintf("genre=%s", mvGenre),
 		fmt.Sprintf("created=%s", MVInfo.Data[0].Attributes.ReleaseDate),
 		fmt.Sprintf("ISRC=%s", MVInfo.Data[0].Attributes.Isrc),
 	}
@@ -2264,23 +2354,9 @@ func mvDownloader(ctx context.Context, adamID string, saveDir string, token stri
 	}
 	fmt.Printf("\rMV Remuxed.   \n")
 
-	// Register the muxed MV so the Telegram delivery layer can find it the same way
-	// it finds audio tracks (recordDownloadedTrack). Harmless for the CLI path.
-	rs := ripStateFrom(ctx)
-	rs.addPath(mvOutPath)
-	mvMeta := AudioMeta{
-		TrackID:        strings.TrimSpace(adamID),
-		Title:          strings.TrimSpace(MVInfo.Data[0].Attributes.Name),
-		Performer:      strings.TrimSpace(MVInfo.Data[0].Attributes.ArtistName),
-		DurationMillis: int64(MVInfo.Data[0].Attributes.DurationInMillis),
-		AlbumName:      strings.TrimSpace(MVInfo.Data[0].Attributes.AlbumName),
-		ReleaseDate:    strings.TrimSpace(MVInfo.Data[0].Attributes.ReleaseDate),
-		ContentRating:  strings.TrimSpace(MVInfo.Data[0].Attributes.ContentRating),
-		Codec:          "MV",
-	}
-	if mvMeta.Title != "" || mvMeta.Performer != "" {
-		rs.putMeta(mvOutPath, mvMeta)
-	}
+	// Register the muxed MV so the Telegram delivery layer can find it (same as the
+	// cached path above).
+	registerMV()
 	return nil
 }
 
@@ -2367,8 +2443,8 @@ func checkM3u8(b string, f string) (string, error) {
 		return "", errors.New("wrapper-manager pool not initialized")
 	}
 	wm := wmPool.Acquire()
+	defer wmPool.Release(wm)
 	m3u8URL, err := wm.M3U8(context.Background(), b)
-	wmPool.Release(wm)
 	if err != nil {
 		return "none", fmt.Errorf("M3U8 RPC failed for %s: %w", b, err)
 	}
@@ -2552,7 +2628,7 @@ func extractMedia(ctx context.Context, b string, more_mode bool) (string, string
 					}
 					streamUrlTemp, err := masterUrl.Parse(variant.URI)
 					if err != nil {
-						panic(err)
+						return "", "", err
 					}
 					streamUrl = streamUrlTemp
 					split := strings.Split(variant.Audio, "-")
@@ -2574,7 +2650,7 @@ func extractMedia(ctx context.Context, b string, more_mode bool) (string, string
 					}
 					streamUrlTemp, err := masterUrl.Parse(variant.URI)
 					if err != nil {
-						panic(err)
+						return "", "", err
 					}
 					streamUrl = streamUrlTemp
 					KHZ := float64(length_int) / 1000.0

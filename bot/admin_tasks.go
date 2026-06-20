@@ -416,7 +416,7 @@ func (b *TelegramBot) scheduleOrRun(j *scheduledJob) {
 	}
 	when := nextWindowStart(now).In(dhakaZone).Format("Mon Jan 2, 3:04 PM")
 	_ = b.sendMessageWithReply(j.ChatID, fmt.Sprintf(
-		"🌙 This %s is heavy, so it's scheduled for the sleeptime window. It'll start around %s (Dhaka time) and deliver as a Gofile ZIP.",
+		"🌙 This %s is heavy, so it's scheduled for the sleeptime window. It'll start around %s (Dhaka time) and deliver as a Gofile ZIP. (It won't appear in /status or respond to /stop until the window starts.)",
 		label, when), nil, j.ReplyToID)
 }
 
@@ -725,7 +725,14 @@ func (b *TelegramBot) handleCount(chatID int64, link string, replyToID int) {
 		b.countArtist(chatID, orStorefront(sf), artistID, replyToID)
 		return
 	}
-	_ = b.sendMessageWithReply(chatID, "Invalid Apple Music link.", nil, replyToID)
+	switch {
+	case strings.TrimSpace(link) == "":
+		_ = b.sendMessageWithReply(chatID, "Usage: /count <apple-music-link> (album, playlist, station, or artist).", nil, replyToID)
+	case !strings.Contains(link, "music.apple.com"):
+		_ = b.sendMessageWithReply(chatID, "That doesn't look like an Apple Music link. Copy the share URL from the Apple Music app — it should start with music.apple.com.", nil, replyToID)
+	default:
+		_ = b.sendMessageWithReply(chatID, "Couldn't recognize that Apple Music link. /count supports albums, playlists, stations, and artists.", nil, replyToID)
+	}
 }
 
 // countArtist sums streamable tracks across an artist's albums. For artists with
