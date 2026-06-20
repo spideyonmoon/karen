@@ -6657,7 +6657,7 @@ Rips lossless ALAC, Dolby Atmos, and AAC from Apple Music straight to your chat.
 
 > Playlists over **40 tracks** are always delivered as a Gofile ZIP (dozens of individual uploads trip Telegram's rate limits). Very heavy rips (full artist discographies, playlists over 100 tracks) also wait for the 2:30–6:00 AM Dhaka window.
 >
-> Default quality is ALAC. `-aac`/`-atmos` pick a different source codec; `-flac` re-encodes after download. If you combine codec flags, one wins.
+> Default quality is ALAC. ` + "`-aac`/`-atmos`" + ` pick a different source codec; ` + "`-flac`" + ` re-encodes after download. If you combine codec flags, one wins.
 
 ## Flags
 
