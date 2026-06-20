@@ -51,6 +51,9 @@ var (
 	pfMVChoices = []pfChoice{
 		{"0", "Default"}, {"360", "360p"}, {"480", "480p"}, {"720", "720p"}, {"1080", "1080p"}, {"2160", "2160p"},
 	}
+	pfArtistZipChoices = []pfChoice{
+		{"", "Default"}, {"per_release", "Per release"}, {"combined", "Combined"},
+	}
 )
 
 // profileKey is the ownership map key: a Rich Message panel is owned by the user
@@ -99,6 +102,8 @@ func (b *TelegramBot) handleProfileCallback(cb *CallbackQuery, data string, clic
 
 	panel := "root"
 	switch action {
+	case "nop":
+		return ""
 	case "nav":
 		if len(parts) >= 2 {
 			panel = parts[1]
@@ -148,7 +153,7 @@ func panelForField(parts []string) string {
 		return "lyrics"
 	case "cover_delivery":
 		return "artwork"
-	case "delivery_target", "language", "mv_max":
+	case "delivery_target", "language", "mv_max", "artist_zip":
 		return "delivery"
 	}
 	return "root"
@@ -191,6 +196,8 @@ func applyProfileSet(p *UserPrefs, field, value string) {
 		} else {
 			p.MVMax = n
 		}
+	case "artist_zip":
+		p.ArtistZip = toggleSame(p.ArtistZip, value)
 	}
 }
 
@@ -234,77 +241,147 @@ func (b *TelegramBot) renderProfile(panel string, p UserPrefs) (rich, plain stri
 	switch panel {
 	case "done":
 		rb.WriteString("# " + symDone + " Profile saved\n")
-		rb.WriteString(profileSummaryRich(p))
+		rb.WriteString(profileCompactRich(p))
 		pb.WriteString("Profile saved.\n")
-		pb.WriteString(profileSummaryPlain(p))
+		pb.WriteString(profileCompactPlain(p))
 		return rb.String(), pb.String()
 	case "audio":
-		writeProfilePanelHeader(&rb, &pb, "🎵 Audio", p)
+		writeProfilePanelHeader(&rb, &pb, "🎵 Audio", audioSummaryRows(p))
 		return rb.String(), pb.String()
 	case "lyrics":
-		writeProfilePanelHeader(&rb, &pb, "🎤 Lyrics", p)
+		writeProfilePanelHeader(&rb, &pb, "🎤 Lyrics", lyricsSummaryRows(p))
 		return rb.String(), pb.String()
 	case "artwork":
-		writeProfilePanelHeader(&rb, &pb, "🖼 Artwork", p)
+		writeProfilePanelHeader(&rb, &pb, "🖼 Artwork", artworkSummaryRows(p))
 		return rb.String(), pb.String()
 	case "delivery":
-		writeProfilePanelHeader(&rb, &pb, "📤 Delivery", p)
+		writeProfilePanelHeader(&rb, &pb, "📤 Delivery", deliverySummaryRows(p))
 		return rb.String(), pb.String()
 	default: // root
 		rb.WriteString("# ⚙︎ Your rip profile\n")
 		rb.WriteString("Tap a category to change it. Unset values follow the bot defaults.\n")
-		rb.WriteString(profileSummaryRich(p))
+		rb.WriteString(profileCompactRich(p))
 		pb.WriteString("⚙︎ Your rip profile\n")
 		pb.WriteString("Tap a category to change it. Unset values follow the bot defaults.\n")
-		pb.WriteString(profileSummaryPlain(p))
+		pb.WriteString(profileCompactPlain(p))
 		return rb.String(), pb.String()
 	}
 }
 
-func writeProfilePanelHeader(rb, pb *strings.Builder, title string, p UserPrefs) {
+func writeProfilePanelHeader(rb, pb *strings.Builder, title string, rows [][2]string) {
 	rb.WriteString("# " + escapeRichMD(title) + "\n")
 	rb.WriteString("Active choice is marked " + symDone + ". Tap it again to clear.\n")
-	rb.WriteString(profileSummaryRich(p))
+	rb.WriteString(panelTableRich(rows))
 	pb.WriteString(title + "\n")
-	pb.WriteString(profileSummaryPlain(p))
+	pb.WriteString("Active choice is marked. Tap it again to clear.\n")
+	pb.WriteString(panelTablePlain(rows))
 }
 
-// profileSummaryRich renders the current settings as a compact two-column table.
-func profileSummaryRich(p UserPrefs) string {
+// panelTableRich renders a small two-column table for a sub-panel.
+func panelTableRich(rows [][2]string) string {
 	var b strings.Builder
 	b.WriteString("\n| Setting | Value |\n|:--------|:------|\n")
-	for _, row := range profileSummaryRows(p) {
+	for _, row := range rows {
 		fmt.Fprintf(&b, "| %s | %s |\n", escapeRichMD(row[0]), escapeRichMD(row[1]))
 	}
 	return b.String()
 }
 
-func profileSummaryPlain(p UserPrefs) string {
+func panelTablePlain(rows [][2]string) string {
 	var b strings.Builder
 	b.WriteString("\n")
-	for _, row := range profileSummaryRows(p) {
+	for _, row := range rows {
 		fmt.Fprintf(&b, "%s: %s\n", row[0], row[1])
 	}
 	return b.String()
 }
 
-// profileSummaryRows is the single source of truth for the live values shown in
-// every panel, so the table never drifts from the keyboard state.
-func profileSummaryRows(p UserPrefs) [][2]string {
+// profileCompactRich renders all settings as one condensed line per category
+// (much smaller than the old 12-row table).
+func profileCompactRich(p UserPrefs) string {
+	var b strings.Builder
+	b.WriteString("\n")
+	for _, g := range profileGroups(p) {
+		fmt.Fprintf(&b, "%s  %s\n", g.icon, escapeRichMD(g.line))
+	}
+	return b.String()
+}
+
+func profileCompactPlain(p UserPrefs) string {
+	var b strings.Builder
+	b.WriteString("\n")
+	for _, g := range profileGroups(p) {
+		fmt.Fprintf(&b, "%s  %s\n", g.icon, g.line)
+	}
+	return b.String()
+}
+
+type profileGroup struct {
+	icon string
+	line string
+}
+
+// profileGroups builds the compact one-liner-per-category view.
+func profileGroups(p UserPrefs) []profileGroup {
+	join := func(rows [][2]string) string {
+		parts := make([]string, len(rows))
+		for i, r := range rows {
+			parts[i] = r[0] + ": " + r[1]
+		}
+		return strings.Join(parts, " · ")
+	}
+	return []profileGroup{
+		{"🎵", join(audioSummaryRows(p))},
+		{"🎤", join(lyricsSummaryRows(p))},
+		{"🖼", join(artworkSummaryRows(p))},
+		{"📤", join(deliverySummaryRows(p))},
+	}
+}
+
+// Per-category summary row functions — the single source of truth for which
+// settings belong to each panel.
+
+func audioSummaryRows(p UserPrefs) [][2]string {
 	return [][2]string{
 		{"Codec", choiceLabel(pfCodecChoices, p.Codec)},
 		{"Quality", choiceLabel(pfQualityChoices, p.Quality)},
 		{"AAC variant", choiceLabel(pfAacChoices, p.AacType)},
 		{"Apple Master", boolLabel(p.AppleMaster)},
+	}
+}
+
+func lyricsSummaryRows(p UserPrefs) [][2]string {
+	return [][2]string{
 		{"Lyrics", choiceLabel(pfLyricChoices, p.LyricMode)},
 		{"Embed lyrics", boolLabel(p.EmbedLrc)},
+	}
+}
+
+func artworkSummaryRows(p UserPrefs) [][2]string {
+	return [][2]string{
 		{"Cover delivery", choiceLabel(pfCoverDelivChoices, p.CoverDelivery)},
 		{"Animated artwork", boolLabel(p.AnimatedArt)},
 		{"Embed cover", boolLabel(p.EmbedCover)},
+	}
+}
+
+func deliverySummaryRows(p UserPrefs) [][2]string {
+	return [][2]string{
 		{"Delivery target", choiceLabel(pfTargetChoices, p.DeliveryTarget)},
 		{"Lyric language", choiceLabel(pfLanguageChoices, p.Language)},
 		{"MV resolution", mvLabel(p.MVMax)},
+		{"Artist zip", choiceLabel(pfArtistZipChoices, p.ArtistZip)},
 	}
+}
+
+// profileSummaryRows returns all rows (used by callers that need the full list).
+func profileSummaryRows(p UserPrefs) [][2]string {
+	var all [][2]string
+	all = append(all, audioSummaryRows(p)...)
+	all = append(all, lyricsSummaryRows(p)...)
+	all = append(all, artworkSummaryRows(p)...)
+	all = append(all, deliverySummaryRows(p)...)
+	return all
 }
 
 func choiceLabel(choices []pfChoice, value string) string {
@@ -347,20 +424,25 @@ func (b *TelegramBot) profileMarkup(panel string, p UserPrefs) InlineKeyboardMar
 	switch panel {
 	case "audio":
 		return InlineKeyboardMarkup{InlineKeyboard: concatRows(
+			labelRow("Codec"),
 			choiceRows("codec", pfCodecChoices, p.Codec),
+			labelRow("Quality"),
 			choiceRows("quality", pfQualityChoices, p.Quality),
+			labelRow("AAC variant"),
 			choiceRows("aac_type", pfAacChoices, p.AacType),
 			toggleRow("apple_master", "Apple Master", p.AppleMaster),
 			backRow(),
 		)}
 	case "lyrics":
 		return InlineKeyboardMarkup{InlineKeyboard: concatRows(
+			labelRow("Lyrics mode"),
 			choiceRows("lyric_mode", pfLyricChoices, p.LyricMode),
 			toggleRow("embed_lrc", "Embed lyrics", p.EmbedLrc),
 			backRow(),
 		)}
 	case "artwork":
 		return InlineKeyboardMarkup{InlineKeyboard: concatRows(
+			labelRow("Cover delivery"),
 			choiceRows("cover_delivery", pfCoverDelivChoices, p.CoverDelivery),
 			toggleRow("animated_art", "Animated artwork", p.AnimatedArt),
 			toggleRow("embed_cover", "Embed cover", p.EmbedCover),
@@ -368,24 +450,29 @@ func (b *TelegramBot) profileMarkup(panel string, p UserPrefs) InlineKeyboardMar
 		)}
 	case "delivery":
 		return InlineKeyboardMarkup{InlineKeyboard: concatRows(
+			labelRow("Delivery target"),
 			choiceRows("delivery_target", pfTargetChoices, p.DeliveryTarget),
+			labelRow("Language"),
 			choiceRows("language", pfLanguageChoices, p.Language),
+			labelRow("MV resolution"),
 			choiceRows("mv_max", pfMVChoices, strconv.Itoa(p.MVMax)),
+			labelRow("Artist zip"),
+			choiceRows("artist_zip", pfArtistZipChoices, p.ArtistZip),
 			backRow(),
 		)}
 	default: // root
 		return InlineKeyboardMarkup{InlineKeyboard: [][]InlineKeyboardButton{
 			{
-				{Text: "🎵 Audio", CallbackData: "pf:nav:audio"},
-				{Text: "🎤 Lyrics", CallbackData: "pf:nav:lyrics"},
+				{Text: "🎵 Audio", CallbackData: "pf:nav:audio", Style: "primary"},
+				{Text: "🎤 Lyrics", CallbackData: "pf:nav:lyrics", Style: "primary"},
 			},
 			{
-				{Text: "🖼 Artwork", CallbackData: "pf:nav:artwork"},
-				{Text: "📤 Delivery", CallbackData: "pf:nav:delivery"},
+				{Text: "🖼 Artwork", CallbackData: "pf:nav:artwork", Style: "primary"},
+				{Text: "📤 Delivery", CallbackData: "pf:nav:delivery", Style: "primary"},
 			},
 			{
-				{Text: "↺ Reset", CallbackData: "pf:reset"},
-				{Text: "✓ Done", CallbackData: "pf:done"},
+				{Text: "↺ Reset", CallbackData: "pf:reset", Style: "danger"},
+				{Text: "✓ Done", CallbackData: "pf:done", Style: "success"},
 			},
 		}}
 	}
@@ -398,12 +485,15 @@ func choiceRows(field string, choices []pfChoice, current string) [][]InlineKeyb
 	var row []InlineKeyboardButton
 	for _, c := range choices {
 		label := c.label
+		style := ""
 		if c.value == current {
 			label = symDone + " " + label
+			style = "success"
 		}
 		row = append(row, InlineKeyboardButton{
 			Text:         label,
 			CallbackData: "pf:set:" + field + ":" + c.value,
+			Style:        style,
 		})
 		if len(row) == 3 {
 			rows = append(rows, row)
@@ -419,15 +509,24 @@ func choiceRows(field string, choices []pfChoice, current string) [][]InlineKeyb
 // toggleRow renders a tri-state boolean as a single button showing its state.
 func toggleRow(field, label string, v *bool) [][]InlineKeyboardButton {
 	state := "Default"
+	style := ""
 	if v != nil {
 		if *v {
 			state = "On"
+			style = "success"
 		} else {
 			state = "Off"
+			style = "danger"
 		}
 	}
 	return [][]InlineKeyboardButton{{
-		{Text: fmt.Sprintf("%s: %s", label, state), CallbackData: "pf:toggle:" + field},
+		{Text: fmt.Sprintf("%s: %s", label, state), CallbackData: "pf:toggle:" + field, Style: style},
+	}}
+}
+
+func labelRow(text string) [][]InlineKeyboardButton {
+	return [][]InlineKeyboardButton{{
+		{Text: "── " + text + " ──", CallbackData: "pf:nop", Style: "primary"},
 	}}
 }
 

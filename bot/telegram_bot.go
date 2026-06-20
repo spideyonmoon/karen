@@ -310,6 +310,7 @@ type InlineKeyboardMarkup struct {
 type InlineKeyboardButton struct {
 	Text                         string  `json:"text"`
 	CallbackData                 string  `json:"callback_data,omitempty"`
+	Style                        string  `json:"style,omitempty"`
 	SwitchInlineQuery            *string `json:"switch_inline_query,omitempty"`
 	SwitchInlineQueryCurrentChat *string `json:"switch_inline_query_current_chat,omitempty"`
 	Url                          string  `json:"url,omitempty"`

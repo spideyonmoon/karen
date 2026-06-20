@@ -17,7 +17,7 @@ cp .env.example .env
 - The count of `APPLE_ID_N`/`APPLE_PASS_N` pairs in `.env` drives instance count: wrapper services, volumes, ports (`8080+N`), and the `wrapper-manager-addrs` list all follow from it.
 - `storefront` is fixed to `us` in the generator (not in `.env`). Authoritative non-secret config values live in `generate.sh`'s heredoc, NOT `bot/config.yaml.example` (kept only as human reference and may drift).
 - `setup.sh` = full bootstrap (generate + clone AMD login client + build + per-account login + start). Re-run it only when the account list changes.
-- Gitignored: `.env`, `docker-compose.override.yml`, `bot/config.yaml`, `bot/telegram-cache.json`, `bot/downloads/`, `.logins/wm-*.toml`.
+- Gitignored: `.env`, `docker-compose.override.yml`, `bot/config.yaml`, `bot/state/`, `bot/downloads/`, `.logins/wm-*.toml`.
 
 ## Day-2 operations (steady state)
 | Goal | Action |
@@ -51,6 +51,17 @@ cp .env.example .env
   2. MTProto (`gotd/td`) — ZIP up to 2GB; session in `mtproto-session.json`
   3. Gofile — fallback for oversized packages
 - Bot API (long-polling `getUpdates`) for receiving messages; MTProto only for file uploads
+
+## State & persistence (`bot/state/`)
+- **All JSON state lives in one directory mount: `./bot/state:/app/state`** (`docker-compose.yml`). It holds three files:
+  - `telegram-cache.json` — Telegram `file_id` cache (re-send without re-upload).
+  - `telegram-state.json` — admin lock + per-user `/profile` rip prefs (`UserPrefs map[int64]*UserPrefs`). This is the **important** data — the only thing the daily backup ships.
+  - `telegram-schedule.json` — queued sleeptime-window jobs. Persisted (so the scheduler survives restarts) but **not** backed up; gitignore + ephemeral by design.
+- **Why a directory mount, not three single-file mounts:** saves are atomic (write `<file>.tmp` → `os.Rename` over target). A single-file bind mount puts `.tmp` on the container overlay fs while the target is a separate device, so `os.Rename` returns `EXDEV` and the host file silently never updates. A dir mount keeps tmp+target on the same fs. This was a real bug: it's why the scheduler "never delivered" (jobs only lived in memory, wiped on every deploy) and why the cache never persisted. Mount the *directory* of any file you save with tmp+rename — never the file.
+- `generate.sh` does `mkdir -p bot/state` (not `touch` a file) so Docker mounts a directory.
+- Paths derive from `cacheFile` (default `state/telegram-cache.json`) in `newTelegramBot`; `stateFile`/`scheduleFile` are siblings in the same dir.
+- **Daily backup:** `startBackupRoutine`/`performBackup` (`bot/admin_tasks.go`) DM every `ADMIN_IDS` a copy of the admin-lock + profiles (a `karen-state-YYYY-MM-DD.json` document) once a day at **04:00 Dhaka**. The next fire time is computed from the wall clock, so frequent restarts don't spam backups. Worst-case data loss on a VPS wipe is one day. Schedule jobs are deliberately excluded from the backup.
+- Legacy orphans: old `bot/telegram-cache.json` / `bot/telegram-state.json` host files (pre-dir-mount) are unused; harmless, can be `rm`'d on the VPS.
 
 ## Docker services
 - `docker-compose.yml` (tracked) — base, defines only the `bot` service. No `depends_on` (wrappers aren't in this file; bot reaches them via gRPC at runtime).
@@ -91,7 +102,8 @@ cp .env.example .env
 - **CI compile gate:** `.github/workflows/build-check.yml` runs `go build ./...` (working-dir `bot/`, Go version read from `bot/go.mod`) on **feature-branch pushes and all PRs** (pushes to `main` are excluded — Deploy's own `--build` is the gate there). Green = it compiles. This is the ONLY automated compile check — there is no test suite.
 - **Deploy:** `.github/workflows/deploy.yml` triggers **only on push to `main`**. It SSHes to the VPS and runs `git fetch origin main` → `git reset --hard origin/main` → `docker compose up -d --build bot`. It never references any other branch, so feature-branch pushes are deploy-safe.
 - **Branch workflow:** do work on a feature branch (e.g. `UX`) → push → confirm "Build Check" is green on the GitHub Actions page → merge to `main` (PR or fast-forward) → the `main` push deploys. A feature branch can never reach prod until you deliberately merge it.
-- **Gotchas when committing here:** the shell mangles pasted multi-line `-m "$(cat <<EOF …)"` commit messages (indentation breaks the heredoc; wrapped lines make `git` see `-m` with no value). Use a single-line `-m`, or several `-m` flags each on ONE physical line. The `gh` CLI is not installed — check CI via the browser (github.com/spideyonmoon/karen/actions), not `gh run`.
+- **Gotchas when committing here:** the shell mangles pasted multi-line `-m "$(cat <<EOF …)"` commit messages (indentation breaks the heredoc; wrapped lines make `git` see `-m` with no value). Use a single-line `-m`, or several `-m` flags each on ONE physical line.
+- **`gh` CLI is installed** (v2.94+) — use `gh run list`/`gh run watch` to check CI, `gh pr create`/`gh pr merge` to ship. Note `gh pr view --json` has no `merged` field; use `state,mergedAt,mergeCommit`.
 
 ## Branches
 - `main` — current development (post-wrapper-manager overhaul, "v2")

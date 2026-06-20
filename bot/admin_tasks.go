@@ -70,6 +70,7 @@ type UserPrefs struct {
 	CoverSize      string `json:"cover_size"`      // "" | e.g. 1000x1000 | 3000x3000
 	Language       string `json:"language"`        // "" | metadata/lyric locale (e.g. ja, en)
 	MVMax          int    `json:"mv_max"`          // 0=inherit | 360|480|720|1080|2160 (max cap)
+	ArtistZip      string `json:"artist_zip"`      // "" | per_release | combined
 	SilentDelivery *bool  `json:"silent_delivery"` // disable_notification on sends
 	UpdatedAtUnix  int64  `json:"updated_at_unix"`
 }
@@ -501,13 +502,19 @@ func (b *TelegramBot) performBackup() {
 }
 
 // =============================================================================
-// Artist rips (re-enabled): fan an artist out into one Gofile-ZIP album job each
+// Artist rips (re-enabled): fan an artist out into Gofile-ZIP job(s)
 // =============================================================================
 
-// runArtistRip enumerates every album for an artist and enqueues each as a
-// forced-Gofile-ZIP download. It stops and reports truncation if the download
-// queue fills. Blocks on network (album enumeration) — call in a goroutine from
-// the update loop.
+// runArtistRip enumerates every album for an artist and enqueues them as
+// Gofile-ZIP downloads. The user's ArtistZip profile pref selects between:
+//   - "per_release" / "" (default): one queue slot per album, each zipped and
+//     uploaded separately (N Gofile links).
+//   - "combined": one queue slot for the whole discography, all albums
+//     downloaded sequentially into a single RipState, then one combined ZIP
+//     uploaded to Gofile (1 Gofile link).
+//
+// Blocks on network (album enumeration) — call in a goroutine from the update
+// loop.
 func (b *TelegramBot) runArtistRip(chatID, userID int64, username, storefront, artistID string, replyToID int, forceAAC, forceAtmos, forceFlac bool) {
 	if storefront == "" {
 		storefront = Config.Storefront
@@ -521,6 +528,18 @@ func (b *TelegramBot) runArtistRip(chatID, userID int64, username, storefront, a
 		_ = b.sendMessageWithReply(chatID, "No albums found for this artist.", nil, replyToID)
 		return
 	}
+
+	combined := userID != 0 && b.getPrefs(userID).ArtistZip == "combined"
+
+	if combined {
+		b.runArtistRipCombined(chatID, userID, username, storefront, artistID, albums, replyToID, forceAAC, forceAtmos, forceFlac)
+	} else {
+		b.runArtistRipPerRelease(chatID, userID, username, albums, replyToID, forceAAC, forceAtmos, forceFlac)
+	}
+}
+
+// runArtistRipPerRelease is the default: one queue slot per album.
+func (b *TelegramBot) runArtistRipPerRelease(chatID, userID int64, username string, albums []apputils.SearchResultItem, replyToID int, forceAAC, forceAtmos, forceFlac bool) {
 	queued := 0
 	for _, alb := range albums {
 		if alb.ID == "" {
@@ -535,6 +554,37 @@ func (b *TelegramBot) runArtistRip(chatID, userID int64, username, storefront, a
 		queued++
 	}
 	_ = b.sendMessageWithReply(chatID, fmt.Sprintf("📀 Queued %d album(s) for the artist rip (Gofile ZIP).", queued), nil, replyToID)
+}
+
+// runArtistRipCombined enqueues one download request that iterates every album
+// sequentially. All tracks accumulate in the same RipState, so delivery creates
+// a single combined ZIP uploaded to Gofile.
+func (b *TelegramBot) runArtistRipCombined(chatID, userID int64, username, storefront, artistID string, albums []apputils.SearchResultItem, replyToID int, forceAAC, forceAtmos, forceFlac bool) {
+	format := b.resolveFormat(chatID, forceFlac)
+	ok := b.enqueueDownloadWithAfter(chatID, userID, username, replyToID, 0, false, format, transferModeGofileZip, "artist:"+artistID, false, func(ctx context.Context) error {
+		if forceAtmos {
+			if rs := ripStateFrom(ctx); rs != nil {
+				rs.Atmos = true
+			} else {
+				dl_atmos = true
+			}
+		}
+		for i, alb := range albums {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if alb.ID == "" {
+				continue
+			}
+			if err := ripAlbum(alb.ID, b.appleToken, storefront, "", forceAAC, ctx); err != nil {
+				fmt.Printf("Artist combined rip: album %d/%d (%s) failed: %v\n", i+1, len(albums), alb.ID, err)
+			}
+		}
+		return nil
+	}, nil)
+	if ok {
+		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("📀 Queued artist rip (%d albums → combined ZIP).", len(albums)), nil, replyToID)
+	}
 }
 
 // enqueueAlbumDownloadChecked mirrors enqueueAlbumDownload but returns whether
