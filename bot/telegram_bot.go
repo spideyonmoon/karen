@@ -2586,6 +2586,26 @@ func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, re
 		}
 	}
 
+	// Send animated artwork as labeled videos right after the cover photo,
+	// then exclude them from the regular track delivery.
+	var remaining []string
+	for _, p := range paths {
+		if isAnimatedArtwork(p) {
+			caption := "Animated Artwork"
+			if strings.Contains(filepath.Base(p), "tall") {
+				caption = "Animated Artwork (Tall)"
+			}
+			if err := b.sendVideoWithReply(chatID, p, caption, replyToID); err != nil {
+				fmt.Printf("animated artwork send failed for %s: %v\n", filepath.Base(p), err)
+			} else {
+				sentAny = true
+			}
+			continue
+		}
+		remaining = append(remaining, p)
+	}
+	paths = remaining
+
 	// Music videos that land inside an album/playlist rip (e.g. a playlist that mixes
 	// songs and MVs) must go out as native Telegram video, not as an audio message —
 	// otherwise Telegram tags the .mp4 with an audio attribute and plays it as a song.
@@ -2757,6 +2777,24 @@ func (b *TelegramBot) deliverTelegramIndividualFallback(chatID int64, paths []st
 			_ = b.sendPhotoWithReply(chatID, coverPath, coverCaption, replyToID)
 		}
 	}
+	// Send animated artwork as labeled videos, then exclude from track delivery.
+	var remaining []string
+	for _, p := range paths {
+		if isAnimatedArtwork(p) {
+			caption := "Animated Artwork"
+			if strings.Contains(filepath.Base(p), "tall") {
+				caption = "Animated Artwork (Tall)"
+			}
+			if err := b.sendVideoWithReply(chatID, p, caption, replyToID); err != nil {
+				fmt.Printf("animated artwork send failed for %s: %v\n", filepath.Base(p), err)
+			} else {
+				sentAny = true
+			}
+			continue
+		}
+		remaining = append(remaining, p)
+	}
+	paths = remaining
 	for _, path := range paths {
 		if ctx != nil && ctx.Err() != nil {
 			status.UpdateSync("Cancelled", 0, 0)
@@ -2873,6 +2911,24 @@ func (b *TelegramBot) deliverGofileZip(chatID int64, paths []string, replyToID i
 				_ = b.sendPhotoWithReply(chatID, coverPath, coverCaption, replyToID)
 			}
 		}
+		// Send animated artwork as Telegram videos before Gofile uploads.
+		var gofilePaths []string
+		for _, p := range paths {
+			if isAnimatedArtwork(p) {
+				caption := "Animated Artwork"
+				if strings.Contains(filepath.Base(p), "tall") {
+					caption = "Animated Artwork (Tall)"
+				}
+				if err := b.sendVideoWithReply(chatID, p, caption, replyToID); err != nil {
+					fmt.Printf("animated artwork send failed for %s: %v\n", filepath.Base(p), err)
+				} else {
+					sentAny = true
+				}
+				continue
+			}
+			gofilePaths = append(gofilePaths, p)
+		}
+		paths = gofilePaths
 		for _, path := range paths {
 			if ctx != nil && ctx.Err() != nil {
 				status.UpdateSync("Cancelled", 0, 0)
@@ -2962,6 +3018,11 @@ func isVideoFile(path string) bool {
 		return true
 	}
 	return false
+}
+
+func isAnimatedArtwork(path string) bool {
+	base := filepath.Base(path)
+	return base == "square_animated_artwork.mp4" || base == "tall_animated_artwork.mp4"
 }
 
 // sendVideoFileMTProto uploads a single video as a native Telegram video (inline player +

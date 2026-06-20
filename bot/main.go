@@ -1093,19 +1093,22 @@ func ripStation(albumId string, token string, storefront string, ctx context.Con
 		if err != nil {
 			fmt.Println("no motion video square.\n", err)
 		} else {
-			exists, err := fileExists(filepath.Join(playlistFolderPath, "square_animated_artwork.mp4"))
+			squarePath := filepath.Join(playlistFolderPath, "square_animated_artwork.mp4")
+			exists, err := fileExists(squarePath)
 			if err != nil {
 				fmt.Println("Failed to check if animated artwork square exists.")
 			}
 			if exists {
 				fmt.Println("Animated artwork square already exists locally.")
+				ripStateFrom(ctx).addPath(squarePath)
 			} else {
 				fmt.Println("Animation Artwork Square Downloading...")
-				cmd := exec.CommandContext(ctx, "ffmpeg", "-loglevel", "quiet", "-y", "-i", motionvideoUrlSquare, "-c", "copy", filepath.Join(playlistFolderPath, "square_animated_artwork.mp4"))
+				cmd := exec.CommandContext(ctx, "ffmpeg", "-loglevel", "quiet", "-y", "-i", motionvideoUrlSquare, "-c", "copy", squarePath)
 				if err := cmd.Run(); err != nil {
 					fmt.Printf("animated artwork square dl err: %v\n", err)
 				} else {
 					fmt.Println("Animation Artwork Square Downloaded")
+					ripStateFrom(ctx).addPath(squarePath)
 				}
 			}
 		}
@@ -1516,19 +1519,22 @@ func ripAlbum(albumId string, token string, storefront string, urlArg_i string, 
 		if err != nil {
 			fmt.Println("no motion video square.\n", err)
 		} else {
-			exists, err := fileExists(filepath.Join(albumFolderPath, "square_animated_artwork.mp4"))
+			squarePath := filepath.Join(albumFolderPath, "square_animated_artwork.mp4")
+			exists, err := fileExists(squarePath)
 			if err != nil {
 				fmt.Println("Failed to check if animated artwork square exists.")
 			}
 			if exists {
 				fmt.Println("Animated artwork square already exists locally.")
+				ripStateFrom(ctx).addPath(squarePath)
 			} else {
 				fmt.Println("Animation Artwork Square Downloading...")
-				cmd := exec.CommandContext(ctx, "ffmpeg", "-loglevel", "quiet", "-y", "-i", motionvideoUrlSquare, "-c", "copy", filepath.Join(albumFolderPath, "square_animated_artwork.mp4"))
+				cmd := exec.CommandContext(ctx, "ffmpeg", "-loglevel", "quiet", "-y", "-i", motionvideoUrlSquare, "-c", "copy", squarePath)
 				if err := cmd.Run(); err != nil {
 					fmt.Printf("animated artwork square dl err: %v\n", err)
 				} else {
 					fmt.Println("Animation Artwork Square Downloaded")
+					ripStateFrom(ctx).addPath(squarePath)
 				}
 			}
 		}
@@ -1544,19 +1550,22 @@ func ripAlbum(albumId string, token string, storefront string, urlArg_i string, 
 		if err != nil {
 			fmt.Println("no motion video tall.\n", err)
 		} else {
-			exists, err := fileExists(filepath.Join(albumFolderPath, "tall_animated_artwork.mp4"))
+			tallPath := filepath.Join(albumFolderPath, "tall_animated_artwork.mp4")
+			exists, err := fileExists(tallPath)
 			if err != nil {
 				fmt.Println("Failed to check if animated artwork tall exists.")
 			}
 			if exists {
 				fmt.Println("Animated artwork tall already exists locally.")
+				ripStateFrom(ctx).addPath(tallPath)
 			} else {
 				fmt.Println("Animation Artwork Tall Downloading...")
-				cmd := exec.CommandContext(ctx, "ffmpeg", "-loglevel", "quiet", "-y", "-i", motionvideoUrlTall, "-c", "copy", filepath.Join(albumFolderPath, "tall_animated_artwork.mp4"))
+				cmd := exec.CommandContext(ctx, "ffmpeg", "-loglevel", "quiet", "-y", "-i", motionvideoUrlTall, "-c", "copy", tallPath)
 				if err := cmd.Run(); err != nil {
 					fmt.Printf("animated artwork tall dl err: %v\n", err)
 				} else {
 					fmt.Println("Animation Artwork Tall Downloaded")
+					ripStateFrom(ctx).addPath(tallPath)
 				}
 			}
 		}
@@ -1783,19 +1792,22 @@ func ripPlaylist(playlistId string, token string, storefront string, forceAAC bo
 		if err != nil {
 			fmt.Println("no motion video square.\n", err)
 		} else {
-			exists, err := fileExists(filepath.Join(playlistFolderPath, "square_animated_artwork.mp4"))
+			squarePath := filepath.Join(playlistFolderPath, "square_animated_artwork.mp4")
+			exists, err := fileExists(squarePath)
 			if err != nil {
 				fmt.Println("Failed to check if animated artwork square exists.")
 			}
 			if exists {
 				fmt.Println("Animated artwork square already exists locally.")
+				ripStateFrom(ctx).addPath(squarePath)
 			} else {
 				fmt.Println("Animation Artwork Square Downloading...")
-				cmd := exec.CommandContext(ctx, "ffmpeg", "-loglevel", "quiet", "-y", "-i", motionvideoUrlSquare, "-c", "copy", filepath.Join(playlistFolderPath, "square_animated_artwork.mp4"))
+				cmd := exec.CommandContext(ctx, "ffmpeg", "-loglevel", "quiet", "-y", "-i", motionvideoUrlSquare, "-c", "copy", squarePath)
 				if err := cmd.Run(); err != nil {
 					fmt.Printf("animated artwork square dl err: %v\n", err)
 				} else {
 					fmt.Println("Animation Artwork Square Downloaded")
+					ripStateFrom(ctx).addPath(squarePath)
 				}
 			}
 		}
@@ -1811,19 +1823,22 @@ func ripPlaylist(playlistId string, token string, storefront string, forceAAC bo
 		if err != nil {
 			fmt.Println("no motion video tall.\n", err)
 		} else {
-			exists, err := fileExists(filepath.Join(playlistFolderPath, "tall_animated_artwork.mp4"))
+			tallPath := filepath.Join(playlistFolderPath, "tall_animated_artwork.mp4")
+			exists, err := fileExists(tallPath)
 			if err != nil {
 				fmt.Println("Failed to check if animated artwork tall exists.")
 			}
 			if exists {
 				fmt.Println("Animated artwork tall already exists locally.")
+				ripStateFrom(ctx).addPath(tallPath)
 			} else {
 				fmt.Println("Animation Artwork Tall Downloading...")
-				cmd := exec.CommandContext(ctx, "ffmpeg", "-loglevel", "quiet", "-y", "-i", motionvideoUrlTall, "-c", "copy", filepath.Join(playlistFolderPath, "tall_animated_artwork.mp4"))
+				cmd := exec.CommandContext(ctx, "ffmpeg", "-loglevel", "quiet", "-y", "-i", motionvideoUrlTall, "-c", "copy", tallPath)
 				if err := cmd.Run(); err != nil {
 					fmt.Printf("animated artwork tall dl err: %v\n", err)
 				} else {
 					fmt.Println("Animation Artwork Tall Downloaded")
+					ripStateFrom(ctx).addPath(tallPath)
 				}
 			}
 		}
