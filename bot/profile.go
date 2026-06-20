@@ -102,6 +102,8 @@ func (b *TelegramBot) handleProfileCallback(cb *CallbackQuery, data string, clic
 
 	panel := "root"
 	switch action {
+	case "nop":
+		return ""
 	case "nav":
 		if len(parts) >= 2 {
 			panel = parts[1]
@@ -422,20 +424,25 @@ func (b *TelegramBot) profileMarkup(panel string, p UserPrefs) InlineKeyboardMar
 	switch panel {
 	case "audio":
 		return InlineKeyboardMarkup{InlineKeyboard: concatRows(
+			labelRow("Codec"),
 			choiceRows("codec", pfCodecChoices, p.Codec),
+			labelRow("Quality"),
 			choiceRows("quality", pfQualityChoices, p.Quality),
+			labelRow("AAC variant"),
 			choiceRows("aac_type", pfAacChoices, p.AacType),
 			toggleRow("apple_master", "Apple Master", p.AppleMaster),
 			backRow(),
 		)}
 	case "lyrics":
 		return InlineKeyboardMarkup{InlineKeyboard: concatRows(
+			labelRow("Lyrics mode"),
 			choiceRows("lyric_mode", pfLyricChoices, p.LyricMode),
 			toggleRow("embed_lrc", "Embed lyrics", p.EmbedLrc),
 			backRow(),
 		)}
 	case "artwork":
 		return InlineKeyboardMarkup{InlineKeyboard: concatRows(
+			labelRow("Cover delivery"),
 			choiceRows("cover_delivery", pfCoverDelivChoices, p.CoverDelivery),
 			toggleRow("animated_art", "Animated artwork", p.AnimatedArt),
 			toggleRow("embed_cover", "Embed cover", p.EmbedCover),
@@ -443,25 +450,29 @@ func (b *TelegramBot) profileMarkup(panel string, p UserPrefs) InlineKeyboardMar
 		)}
 	case "delivery":
 		return InlineKeyboardMarkup{InlineKeyboard: concatRows(
+			labelRow("Delivery target"),
 			choiceRows("delivery_target", pfTargetChoices, p.DeliveryTarget),
+			labelRow("Language"),
 			choiceRows("language", pfLanguageChoices, p.Language),
+			labelRow("MV resolution"),
 			choiceRows("mv_max", pfMVChoices, strconv.Itoa(p.MVMax)),
+			labelRow("Artist zip"),
 			choiceRows("artist_zip", pfArtistZipChoices, p.ArtistZip),
 			backRow(),
 		)}
 	default: // root
 		return InlineKeyboardMarkup{InlineKeyboard: [][]InlineKeyboardButton{
 			{
-				{Text: "🎵 Audio", CallbackData: "pf:nav:audio"},
-				{Text: "🎤 Lyrics", CallbackData: "pf:nav:lyrics"},
+				{Text: "🎵 Audio", CallbackData: "pf:nav:audio", Style: "primary"},
+				{Text: "🎤 Lyrics", CallbackData: "pf:nav:lyrics", Style: "primary"},
 			},
 			{
-				{Text: "🖼 Artwork", CallbackData: "pf:nav:artwork"},
-				{Text: "📤 Delivery", CallbackData: "pf:nav:delivery"},
+				{Text: "🖼 Artwork", CallbackData: "pf:nav:artwork", Style: "primary"},
+				{Text: "📤 Delivery", CallbackData: "pf:nav:delivery", Style: "primary"},
 			},
 			{
-				{Text: "↺ Reset", CallbackData: "pf:reset"},
-				{Text: "✓ Done", CallbackData: "pf:done"},
+				{Text: "↺ Reset", CallbackData: "pf:reset", Style: "danger"},
+				{Text: "✓ Done", CallbackData: "pf:done", Style: "success"},
 			},
 		}}
 	}
@@ -474,12 +485,15 @@ func choiceRows(field string, choices []pfChoice, current string) [][]InlineKeyb
 	var row []InlineKeyboardButton
 	for _, c := range choices {
 		label := c.label
+		style := ""
 		if c.value == current {
 			label = symDone + " " + label
+			style = "success"
 		}
 		row = append(row, InlineKeyboardButton{
 			Text:         label,
 			CallbackData: "pf:set:" + field + ":" + c.value,
+			Style:        style,
 		})
 		if len(row) == 3 {
 			rows = append(rows, row)
@@ -495,15 +509,24 @@ func choiceRows(field string, choices []pfChoice, current string) [][]InlineKeyb
 // toggleRow renders a tri-state boolean as a single button showing its state.
 func toggleRow(field, label string, v *bool) [][]InlineKeyboardButton {
 	state := "Default"
+	style := ""
 	if v != nil {
 		if *v {
 			state = "On"
+			style = "success"
 		} else {
 			state = "Off"
+			style = "danger"
 		}
 	}
 	return [][]InlineKeyboardButton{{
-		{Text: fmt.Sprintf("%s: %s", label, state), CallbackData: "pf:toggle:" + field},
+		{Text: fmt.Sprintf("%s: %s", label, state), CallbackData: "pf:toggle:" + field, Style: style},
+	}}
+}
+
+func labelRow(text string) [][]InlineKeyboardButton {
+	return [][]InlineKeyboardButton{{
+		{Text: "── " + text + " ──", CallbackData: "pf:nop", Style: "primary"},
 	}}
 }
 
