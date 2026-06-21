@@ -1723,9 +1723,9 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args
 		default:
 			_ = b.sendMessageWithReply(chatID, "Couldn't recognize that Apple Music link. Supported: songs, albums, playlists, stations, artists, and music videos.", nil, replyToID)
 		}
-	case "count":
+	case "check":
 		if len(args) == 0 {
-			_ = b.sendMessageWithReply(chatID, "Usage: /count <apple-music-link>", nil, replyToID)
+			_ = b.sendMessageWithReply(chatID, "Usage: /check <apple-music-link> (album, playlist, song, music video, or artist).", nil, replyToID)
 			return
 		}
 		// Blocking metadata fetches — run off the update loop.
@@ -6748,7 +6748,7 @@ func botHelpText() string {
 	return strings.TrimSpace(`
 Commands:
 /dl <apple-music-link> [flags]   download a song, album, artist, or playlist
-/count <apple-music-link>        count the streamable tracks behind a link
+/check <apple-music-link>        inspect a link: track count + metadata, or a full artist breakdown
 /status or /queue                show active task and queue count
 /stop_<task_id>                  cancel a running or queued download
 /profile                         set your saved rip preferences (buttons)
@@ -6788,7 +6788,7 @@ Rips lossless ALAC, Dolby Atmos, and AAC from Apple Music straight to your chat.
 | Command | What it does |
 |:--------|:-------------|
 | ` + "`/dl <link> [flags]`" + ` | Download a song, album, artist, or playlist |
-| ` + "`/count <link>`" + ` | Count the streamable tracks behind a link |
+| ` + "`/check <link>`" + ` | Inspect a link: track count + metadata, or a full artist breakdown |
 | ` + "`/status`" + ` or ` + "`/queue`" + ` | Show the active task and queue |
 | ` + "`/stop_<task_id>`" + ` | Cancel a running or queued download |
 | ` + "`/profile`" + ` | Set your saved rip preferences (all buttons) |

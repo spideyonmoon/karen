@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -650,15 +651,24 @@ func (b *TelegramBot) dispatchPlaylistNormal(chatID, userID int64, playlistID st
 }
 
 // =============================================================================
-// /count — streamable (rip-able) track count for any Apple Music link
+// /check — metadata + track count for any Apple Music link (album, playlist,
+// song, music video), or a full categorized breakdown for an artist
 // =============================================================================
 
-const artistCountAlbumCap = 50 // above this, /count skips the per-album scan
+// inlineTracklistMax is the cutoff for inlining the tracklist in the Telegram
+// message. At or below it the full list renders as a table in the card; above
+// it the list is published to a Telegraph page and the card just links it.
+const inlineTracklistMax = 40
 
-// countTracklistCap bounds how many rows the collapsible tracklist renders so a
-// huge playlist can't blow past Telegram's message-size limit. Extra tracks fold
-// into an "…and N more" line.
+// countTracklistCap bounds inline rows in the fallback case (Telegraph publish
+// failed for a >inlineTracklistMax list) so the message can't blow past
+// Telegram's size limit. Extra tracks fold into an "…and N more" line.
 const countTracklistCap = 60
+
+// qualityProbeCap bounds how many tracks /check probes for exact per-track audio
+// quality, so a huge playlist can't fan out into thousands of CDN requests.
+// Tracks beyond it are listed without a quality column.
+const qualityProbeCap = 100
 
 // countStreamable counts tracks that are actually playable/rip-able: a track
 // with an empty PlayParams.ID is unavailable (region-locked, pulled, etc.).
@@ -752,7 +762,7 @@ func shortDuration(ms int) string {
 	return fmt.Sprintf("%d:%02d", s/60, s%60)
 }
 
-// countCard is the assembled metadata for an album- or playlist-style /count
+// countCard is the assembled metadata for an album- or playlist-style /check
 // reply. Empty fields are dropped from the render, so the same struct serves a
 // bare playlist (just name + tracks) and a fully-tagged album.
 type countCard struct {
@@ -770,6 +780,18 @@ type countCard struct {
 	totalTracks int
 	duration    time.Duration
 	tracks      []ampapi.TrackRespData
+	// quality holds the coarse audioTraits badge ("Hi-Res Lossless · Dolby Atmos").
+	// preciseQuality, when set, is the exact probed spec ("ALAC 24-bit/48 kHz · …")
+	// and supersedes it on the headline. qualityReports is aligned to the rendered
+	// (capped) tracklist, one entry per shown track ("" / nil = lossy/unavailable).
+	preciseQuality string
+	qualityReports []*trackQualityReport
+	// seqNumbers numbers the tracklist by position (1…N) rather than by each
+	// track's source-album TrackNumber — correct for playlists, where album
+	// numbers repeat. tracklistURL, when set, is a Telegraph page holding the
+	// full list; the card links it instead of inlining the table.
+	seqNumbers   bool
+	tracklistURL string
 }
 
 // richLines joins body lines with GFM hard breaks (two trailing spaces + a
@@ -820,9 +842,14 @@ func (c countCard) render() (rich, plain string) {
 		richBody = append(richBody, escapeRichMD(strings.Join(meta, " · ")))
 		plainBody = append(plainBody, strings.Join(meta, " · "))
 	}
-	if c.quality != "" {
-		richBody = append(richBody, "🎧 "+escapeRichMD(c.quality))
-		plainBody = append(plainBody, "🎧 "+c.quality)
+	// Prefer the exact probed spec over the coarse audioTraits badge when available.
+	qualityLine := c.quality
+	if c.preciseQuality != "" {
+		qualityLine = c.preciseQuality
+	}
+	if qualityLine != "" {
+		richBody = append(richBody, "🎧 "+escapeRichMD(qualityLine))
+		plainBody = append(plainBody, "🎧 "+qualityLine)
 	}
 	richBody = append(richBody, escapeRichMD(headline))
 	plainBody = append(plainBody, headline)
@@ -830,24 +857,38 @@ func (c countCard) render() (rich, plain string) {
 		richBody = append(richBody, "🌍 "+escapeRichMD(c.region))
 		plainBody = append(plainBody, "🌍 "+c.region)
 	}
+	// Full tracklist hosted on Telegraph (large lists). Link is intentionally NOT
+	// escaped so the Markdown link renders (and triggers Instant View).
+	if c.tracklistURL != "" {
+		richBody = append(richBody, fmt.Sprintf("📄 [Full tracklist · %d track(s)](%s)", len(c.tracks), c.tracklistURL))
+		plainBody = append(plainBody, fmt.Sprintf("📄 Full tracklist (%d tracks): %s", len(c.tracks), c.tracklistURL))
+	}
 	rb.WriteString(richLines(richBody))
 	rb.WriteString("\n")
 	pb.WriteString(strings.Join(plainBody, "\n"))
 	pb.WriteString("\n")
 
-	if len(c.tracks) > 0 {
+	// Inline tracklist (only when not hosted on Telegraph). The track number is
+	// folded into the Track cell rather than a dedicated "#" column, which the
+	// Rich renderer pads wide for little benefit.
+	if c.tracklistURL == "" && len(c.tracks) > 0 {
 		shown := c.tracks
 		extra := 0
 		if len(shown) > countTracklistCap {
 			extra = len(shown) - countTracklistCap
 			shown = shown[:countTracklistCap]
 		}
+		withQuality := len(c.qualityReports) > 0
 		fmt.Fprintf(&rb, "\n<details>\n<summary>Tracklist · %d track(s)</summary>\n\n", len(c.tracks))
-		rb.WriteString("| # | Track | ⏱ |\n|--:|:------|--:|\n")
+		if withQuality {
+			rb.WriteString("| Track | Quality | ⏱ |\n|:------|:------|--:|\n")
+		} else {
+			rb.WriteString("| Track | ⏱ |\n|:------|--:|\n")
+		}
 		pb.WriteString("\nTracklist:\n")
 		for i, t := range shown {
 			num := t.Attributes.TrackNumber
-			if num == 0 {
+			if c.seqNumbers || num == 0 {
 				num = i + 1
 			}
 			mark := ""
@@ -855,8 +896,19 @@ func (c countCard) render() (rich, plain string) {
 				mark = " ⚠️" // unavailable / not rip-able
 			}
 			dur := shortDuration(t.Attributes.DurationInMillis)
-			fmt.Fprintf(&rb, "| %d | %s%s | %s |\n", num, escapeRichMD(truncateStatusTitle(t.Attributes.Name, 48)), mark, dur)
-			fmt.Fprintf(&pb, "%d. %s%s — %s\n", num, t.Attributes.Name, mark, dur)
+			label := fmt.Sprintf("%d. %s", num, truncateStatusTitle(t.Attributes.Name, 48))
+			name := escapeRichMD(label)
+			if withQuality {
+				q := "—"
+				if i < len(c.qualityReports) {
+					q = qualityCell(c.qualityReports[i])
+				}
+				fmt.Fprintf(&rb, "| %s%s | %s | %s |\n", name, mark, escapeRichMD(q), dur)
+				fmt.Fprintf(&pb, "%s%s [%s] — %s\n", label, mark, q, dur)
+			} else {
+				fmt.Fprintf(&rb, "| %s%s | %s |\n", name, mark, dur)
+				fmt.Fprintf(&pb, "%s%s — %s\n", label, mark, dur)
+			}
 		}
 		if extra > 0 {
 			fmt.Fprintf(&rb, "\n…and %d more\n", extra)
@@ -880,14 +932,107 @@ func (c countCard) render() (rich, plain string) {
 	return rb.String(), strings.TrimRight(pb.String(), "\n")
 }
 
+// probeCardQuality reads exact per-track audio quality from each track's HLS
+// manifest (capped at qualityProbeCap) and fills the card's preciseQuality +
+// qualityReports. Bounded-concurrency network work; for larger sets it posts a
+// brief progress note so the chat isn't silent during the fetches.
+func (b *TelegramBot) probeCardQuality(chatID int64, card *countCard, replyToID int) {
+	shown := card.tracks
+	if len(shown) > qualityProbeCap {
+		shown = shown[:qualityProbeCap]
+	}
+	urls := make([]string, len(shown))
+	any := false
+	for i, t := range shown {
+		urls[i] = t.Attributes.ExtendedAssetUrls.EnhancedHls
+		if urls[i] != "" {
+			any = true
+		}
+	}
+	if !any {
+		return
+	}
+	if len(shown) >= 10 {
+		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("🔎 Reading per-track quality from %d track(s)…", len(shown)), nil, replyToID)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	reports := probeTracksQuality(ctx, urls, 8)
+	card.qualityReports = reports
+	card.preciseQuality = bestQualitySummary(reports)
+}
+
+// publishTracklist renders the card's full tracklist to a Telegraph page (a
+// numbered list — Telegraph has no tables) and returns its URL. Per-track
+// quality is included where it was probed (qualityProbeCap); tracks beyond that
+// list name + duration only, with a footnote.
+func (b *TelegramBot) publishTracklist(c countCard) (string, error) {
+	lis := make([]interface{}, 0, len(c.tracks))
+	for i, t := range c.tracks {
+		parts := []string{t.Attributes.Name}
+		// On playlists the per-track artist varies, so include it; on a
+		// single-artist album it would just repeat the subtitle.
+		if c.seqNumbers && t.Attributes.ArtistName != "" && t.Attributes.ArtistName != c.subtitle {
+			parts = append(parts, t.Attributes.ArtistName)
+		}
+		line := strings.Join(parts, " — ")
+
+		var tail []string
+		if i < len(c.qualityReports) && c.qualityReports[i] != nil {
+			if q := qualityCell(c.qualityReports[i]); q != "" && q != "—" {
+				tail = append(tail, q)
+			}
+		}
+		if t.Attributes.PlayParams.ID == "" {
+			tail = append(tail, "unavailable")
+		}
+		tail = append(tail, shortDuration(t.Attributes.DurationInMillis))
+		line += " · " + strings.Join(tail, " · ")
+		lis = append(lis, tgEl("li", tgText(line)))
+	}
+
+	var content []interface{}
+	var intro []string
+	if c.subtitle != "" {
+		intro = append(intro, c.subtitle)
+	}
+	summary := fmt.Sprintf("%d track(s)", c.streamable)
+	if c.totalTracks > c.streamable {
+		summary = fmt.Sprintf("%d of %d track(s) streamable", c.streamable, c.totalTracks)
+	}
+	if c.duration > 0 {
+		summary += " · " + formatDuration(c.duration)
+	}
+	intro = append(intro, summary)
+	content = append(content, tgEl("p", tgText(strings.Join(intro, " · "))))
+	content = append(content, tgEl("ol", lis...))
+	if len(c.qualityReports) > 0 && len(c.qualityReports) < len(c.tracks) {
+		content = append(content, tgEl("p", tgText(fmt.Sprintf("Per-track quality probed for the first %d tracks.", len(c.qualityReports)))))
+	}
+
+	return telegraphCreatePage(c.title, c.subtitle, content)
+}
+
+// maybePublishTracklist sends the card's tracklist to Telegraph when it's larger
+// than the inline cap, setting tracklistURL on success. On failure it leaves the
+// URL empty so render falls back to a capped inline table.
+func (b *TelegramBot) maybePublishTracklist(card *countCard) {
+	if len(card.tracks) <= inlineTracklistMax {
+		return
+	}
+	if url, err := b.publishTracklist(*card); err == nil {
+		card.tracklistURL = url
+	}
+}
+
 // handleCount replies with the number of streamable tracks behind a link. Runs
 // on its own goroutine (album/artist fetches are blocking HTTP) so it never
 // stalls the update loop.
 func (b *TelegramBot) handleCount(chatID int64, link string, replyToID int) {
 	link = strings.TrimSpace(link)
 
-	if _, mvID := checkUrlMv(link); mvID != "" {
-		_ = b.sendMessageWithReply(chatID, "🎬 That's a music video — 1 rip-able item.", nil, replyToID)
+	if sf, mvID := checkUrlMv(link); mvID != "" {
+		b.countMusicVideo(chatID, orStorefront(sf), mvID, sf, replyToID)
 		return
 	}
 	if sf, songID := checkUrlSong(link); songID != "" {
@@ -923,6 +1068,8 @@ func (b *TelegramBot) handleCount(chatID int64, link string, replyToID int) {
 			duration:    sumTrackDuration(tracks),
 			tracks:      tracks,
 		}
+		b.probeCardQuality(chatID, &card, replyToID)
+		b.maybePublishTracklist(&card)
 		rich, plain := card.render()
 		_, _ = b.sendRichMessage(chatID, rich, plain, nil, replyToID)
 		return
@@ -946,7 +1093,10 @@ func (b *TelegramBot) handleCount(chatID int64, link string, replyToID int) {
 			totalTracks: len(tracks),
 			duration:    sumTrackDuration(tracks),
 			tracks:      tracks,
+			seqNumbers:  true, // playlist: number by position, not source-album track #
 		}
+		b.probeCardQuality(chatID, &card, replyToID)
+		b.maybePublishTracklist(&card)
 		rich, plain := card.render()
 		_, _ = b.sendRichMessage(chatID, rich, plain, nil, replyToID)
 		return
@@ -961,11 +1111,11 @@ func (b *TelegramBot) handleCount(chatID int64, link string, replyToID int) {
 	}
 	switch {
 	case strings.TrimSpace(link) == "":
-		_ = b.sendMessageWithReply(chatID, "Usage: /count <apple-music-link> (album, playlist, station, or artist).", nil, replyToID)
+		_ = b.sendMessageWithReply(chatID, "Usage: /check <apple-music-link> (album, playlist, song, music video, or artist).", nil, replyToID)
 	case !strings.Contains(link, "music.apple.com"):
 		_ = b.sendMessageWithReply(chatID, "That doesn't look like an Apple Music link. Copy the share URL from the Apple Music app — it should start with music.apple.com.", nil, replyToID)
 	default:
-		_ = b.sendMessageWithReply(chatID, "Couldn't recognize that Apple Music link. /count supports albums, playlists, stations, and artists.", nil, replyToID)
+		_ = b.sendMessageWithReply(chatID, "Couldn't recognize that Apple Music link. /check supports songs, albums, playlists, stations, music videos, and artists.", nil, replyToID)
 	}
 }
 
@@ -1009,9 +1159,18 @@ func (b *TelegramBot) countSong(chatID int64, storefront, songID, sfCode string,
 		richBody = append(richBody, escapeRichMD(strings.Join(meta, " · ")))
 		plainBody = append(plainBody, strings.Join(meta, " · "))
 	}
-	if q := qualityBadge(a.AudioTraits); q != "" {
-		richBody = append(richBody, "🎧 "+escapeRichMD(q))
-		plainBody = append(plainBody, "🎧 "+q)
+	// Exact probed spec when the manifest is readable; else the coarse badge.
+	quality := qualityBadge(a.AudioTraits)
+	if a.ExtendedAssetUrls.EnhancedHls != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		if s := bestQualitySummary([]*trackQualityReport{probeTrackQuality(ctx, a.ExtendedAssetUrls.EnhancedHls)}); s != "" {
+			quality = s
+		}
+		cancel()
+	}
+	if quality != "" {
+		richBody = append(richBody, "🎧 "+escapeRichMD(quality))
+		plainBody = append(plainBody, "🎧 "+quality)
 	}
 	richBody = append(richBody, escapeRichMD(headline))
 	plainBody = append(plainBody, headline)
@@ -1025,70 +1184,249 @@ func (b *TelegramBot) countSong(chatID int64, storefront, songID, sfCode string,
 	_, _ = b.sendRichMessage(chatID, rich, plain, nil, replyToID)
 }
 
-// countArtist sums streamable tracks across an artist's albums. For artists with
-// more albums than artistCountAlbumCap it bails with the album count rather than
-// firing dozens of sequential album fetches. sfCode is the link's storefront
-// code for the region badge.
-func (b *TelegramBot) countArtist(chatID int64, storefront, artistID, sfCode string, replyToID int) {
-	albums, _, err := apputils.FetchArtistAlbums(storefront, artistID, b.appleToken, 0, 0, b.searchLanguage())
-	if err != nil {
-		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Failed to load artist albums: %v", err), nil, replyToID)
+// countMusicVideo renders a card for a music-video link: title, artist, album,
+// genre, duration, region, and a video-quality line (4K / HDR) read from the
+// MV's catalog attributes. Falls back to a one-liner if it can't be loaded.
+func (b *TelegramBot) countMusicVideo(chatID int64, storefront, mvID, sfCode string, replyToID int) {
+	resp, err := ampapi.GetMusicVideoResp(storefront, mvID, b.searchLanguage(), b.appleToken)
+	if err != nil || resp == nil || len(resp.Data) == 0 {
+		_ = b.sendMessageWithReply(chatID, "🎬 That's a music video — 1 rip-able item.", nil, replyToID)
 		return
 	}
-	if len(albums) == 0 {
-		_ = b.sendMessageWithReply(chatID, "No albums found for this artist.", nil, replyToID)
-		return
+	a := resp.Data[0].Attributes
+
+	var meta []string
+	if a.AlbumName != "" {
+		meta = append(meta, "💿 "+a.AlbumName)
+	}
+	if g := primaryGenre(a.GenreNames); g != "" {
+		meta = append(meta, "🎸 "+g)
+	}
+	if a.ReleaseDate != "" {
+		meta = append(meta, "📅 "+a.ReleaseDate)
 	}
 
-	artistName := "This artist"
-	if albums[0].Artist != "" {
-		artistName = albums[0].Artist
+	// Video-quality line from catalog flags (resolution class + dynamic range).
+	video := "HD 1080p"
+	if a.Has4K {
+		video = "4K (2160p)"
 	}
-	region := regionBadge(orStorefront(sfCode))
-
-	if len(albums) > artistCountAlbumCap {
-		var richBody, plainBody []string
-		richBody = append(richBody, fmt.Sprintf("💿 %d albums", len(albums)))
-		plainBody = append(plainBody, fmt.Sprintf("💿 %d albums", len(albums)))
-		if region != "" {
-			richBody = append(richBody, "🌍 "+escapeRichMD(region))
-			plainBody = append(plainBody, "🌍 "+region)
-		}
-		note := "Too many albums to tally track-by-track — send an album or playlist link for an exact count."
-		rich := fmt.Sprintf("## 👤 %s\n\n%s\n\n> %s\n", escapeRichMD(artistName), richLines(richBody), escapeRichMD(note))
-		plain := "👤 " + artistName + "\n" + strings.Join(plainBody, "\n") + "\n" + note
-		_, _ = b.sendRichMessage(chatID, rich, plain, nil, replyToID)
-		return
+	if a.HasHDR {
+		video += " · HDR"
 	}
 
-	_ = b.sendMessageWithReply(chatID, fmt.Sprintf("🔎 Counting streamable tracks across %d album(s)…", len(albums)), nil, replyToID)
-	total := 0
-	var dur time.Duration
-	for _, alb := range albums {
-		if alb.ID == "" {
-			continue
-		}
-		resp, err := ampapi.GetAlbumResp(storefront, alb.ID, b.searchLanguage(), b.appleToken)
-		if err != nil || resp == nil || len(resp.Data) == 0 {
-			continue
-		}
-		tracks := resp.Data[0].Relationships.Tracks.Data
-		total += countStreamable(tracks)
-		dur += sumTrackDuration(tracks)
+	headline := "🔢 1 music video"
+	if a.PlayParams.ID == "" {
+		headline = "🔢 1 music video (unavailable)"
+	}
+	if a.DurationInMillis > 0 {
+		headline += " · ⏱️ " + shortDuration(a.DurationInMillis)
 	}
 
-	headline := fmt.Sprintf("💿 %d album(s) · 🔢 %d streamable track(s)", len(albums), total)
-	if dur > 0 {
-		headline += " · ⏱️ " + formatDuration(dur)
-	}
 	var richBody, plainBody []string
+	if a.ArtistName != "" {
+		richBody = append(richBody, "**"+escapeRichMD(a.ArtistName)+"**")
+		plainBody = append(plainBody, a.ArtistName)
+	}
+	if len(meta) > 0 {
+		richBody = append(richBody, escapeRichMD(strings.Join(meta, " · ")))
+		plainBody = append(plainBody, strings.Join(meta, " · "))
+	}
+	richBody = append(richBody, "📺 "+escapeRichMD(video))
+	plainBody = append(plainBody, "📺 "+video)
 	richBody = append(richBody, escapeRichMD(headline))
 	plainBody = append(plainBody, headline)
-	if region != "" {
-		richBody = append(richBody, "🌍 "+escapeRichMD(region))
-		plainBody = append(plainBody, "🌍 "+region)
+	if r := regionBadge(orStorefront(sfCode)); r != "" {
+		richBody = append(richBody, "🌍 "+escapeRichMD(r))
+		plainBody = append(plainBody, "🌍 "+r)
 	}
-	rich := fmt.Sprintf("## 👤 %s\n\n%s\n", escapeRichMD(artistName), richLines(richBody))
-	plain := "👤 " + artistName + "\n" + strings.Join(plainBody, "\n")
+
+	rich := fmt.Sprintf("## 🎬 %s\n\n%s\n", escapeRichMD(a.Name), richLines(richBody))
+	plain := "🎬 " + a.Name + "\n" + strings.Join(plainBody, "\n")
 	_, _ = b.sendRichMessage(chatID, rich, plain, nil, replyToID)
+}
+
+// groupThousands renders an int with comma thousands separators (1842 → "1,842").
+func groupThousands(n int) string {
+	neg := ""
+	if n < 0 {
+		neg = "-"
+		n = -n
+	}
+	s := strconv.Itoa(n)
+	var out []byte
+	for i := 0; i < len(s); i++ {
+		if i > 0 && (len(s)-i)%3 == 0 {
+			out = append(out, ',')
+		}
+		out = append(out, s[i])
+	}
+	return neg + string(out)
+}
+
+// countLabel formats a count with its noun, pluralized regularly and grouped
+// with thousands separators: countLabel(1, "album") → "1 album",
+// countLabel(120, "album") → "120 albums".
+func countLabel(n int, noun string) string {
+	if n == 1 {
+		return "1 " + noun
+	}
+	return groupThousands(n) + " " + noun + "s"
+}
+
+// isLiveAlbum is a conservative live-release heuristic: it only fires on an
+// explicit parenthesized/suffixed "live" marker so studio titles like
+// "Live and Let Die" aren't miscategorized.
+func isLiveAlbum(name string) bool {
+	l := strings.ToLower(name)
+	return strings.Contains(l, "(live") || strings.HasSuffix(l, " - live") || strings.HasSuffix(l, " [live]")
+}
+
+// artistBreakdown is the tallied, categorized view of an artist's catalog used
+// by the /check artist card. Track totals are summed from each release's
+// catalog trackCount (no per-album tracklist fetch), so it scales to any
+// discography size.
+type artistBreakdown struct {
+	name        string
+	region      string
+	genre       string
+	releases    int // total album-type releases (albums + EPs + singles + compilations + live)
+	tracks      int // summed catalog trackCount across all releases
+	fullAlbums  int
+	eps         int
+	singles     int
+	comps       int
+	live        int
+	musicVideos int
+	playlists   int
+	appearsOn   int
+}
+
+// countArtist builds a categorized breakdown of an artist's entire catalog:
+// albums / EPs / singles / compilations / live releases (split from the single
+// paginated `albums` relationship via Apple's isSingle/isCompilation flags +
+// name heuristics), plus music-video / playlist / appears-on counts from their
+// own relationships. Track totals come from each release's catalog trackCount,
+// so there are no per-album fetches and no discography-size cap. sfCode is the
+// link's storefront code for the region badge.
+func (b *TelegramBot) countArtist(chatID int64, storefront, artistID, sfCode string, replyToID int) {
+	albums, err := ampapi.GetArtistAlbums(storefront, artistID, b.searchLanguage(), b.appleToken)
+	if err != nil {
+		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Failed to load this artist: %v", err), nil, replyToID)
+		return
+	}
+
+	bd := artistBreakdown{
+		name:     "This artist",
+		region:   regionBadge(orStorefront(sfCode)),
+		releases: len(albums),
+	}
+
+	var genres []string
+	for _, a := range albums {
+		if bd.name == "This artist" && a.ArtistName != "" {
+			bd.name = a.ArtistName
+		}
+		if len(genres) == 0 {
+			genres = a.GenreNames
+		}
+		bd.tracks += a.TrackCount
+		switch {
+		case a.IsCompilation:
+			bd.comps++
+		case isLiveAlbum(a.Name):
+			bd.live++
+		case a.IsSingle && strings.HasSuffix(strings.ToLower(a.Name), " - ep"):
+			bd.eps++
+		case a.IsSingle:
+			bd.singles++
+		default:
+			bd.fullAlbums++
+		}
+	}
+	bd.genre = primaryGenre(genres)
+
+	// Count-only relationships. A missing bucket (some artists/storefronts lack
+	// playlists or appears-on) just contributes 0; the error is ignored on
+	// purpose so one absent relationship doesn't sink the whole card.
+	bd.musicVideos, _ = ampapi.CountArtistRelationship(storefront, artistID, "music-videos", b.searchLanguage(), b.appleToken)
+	bd.playlists, _ = ampapi.CountArtistRelationship(storefront, artistID, "playlists", b.searchLanguage(), b.appleToken)
+	bd.appearsOn, _ = ampapi.CountArtistRelationship(storefront, artistID, "view/appears-on-albums", b.searchLanguage(), b.appleToken)
+
+	if bd.releases == 0 && bd.musicVideos == 0 && bd.playlists == 0 && bd.appearsOn == 0 {
+		_ = b.sendMessageWithReply(chatID, "Nothing found for this artist.", nil, replyToID)
+		return
+	}
+
+	rich, plain := bd.render()
+	_, _ = b.sendRichMessage(chatID, rich, plain, nil, replyToID)
+}
+
+// render builds the artist /check card: a name heading, a region/genre line, a
+// track + release total, a release-type breakdown, and a media line. Any line
+// (or any bucket within a line) whose count is zero is dropped, so a singles-only
+// artist and a 177-release composer both read cleanly.
+func (bd artistBreakdown) render() (rich, plain string) {
+	var body []string // each entry becomes its own visual line
+
+	// Region · genre.
+	var head []string
+	if bd.region != "" {
+		head = append(head, "🌍 "+bd.region)
+	}
+	if bd.genre != "" {
+		head = append(head, "🎸 "+bd.genre)
+	}
+	if len(head) > 0 {
+		body = append(body, strings.Join(head, " · "))
+	}
+
+	// Track + release totals.
+	if bd.releases > 0 {
+		body = append(body, fmt.Sprintf("🔢 %s across %s", countLabel(bd.tracks, "track"), countLabel(bd.releases, "release")))
+	}
+
+	// Release-type breakdown — only non-zero buckets.
+	var rel []string
+	if bd.fullAlbums > 0 {
+		rel = append(rel, "💿 "+countLabel(bd.fullAlbums, "album"))
+	}
+	if bd.eps > 0 {
+		rel = append(rel, "💽 "+countLabel(bd.eps, "EP"))
+	}
+	if bd.singles > 0 {
+		rel = append(rel, "🎵 "+countLabel(bd.singles, "single"))
+	}
+	if bd.comps > 0 {
+		rel = append(rel, "🗂 "+countLabel(bd.comps, "compilation"))
+	}
+	if bd.live > 0 {
+		rel = append(rel, "🎤 "+countLabel(bd.live, "live release"))
+	}
+	if len(rel) > 0 {
+		body = append(body, strings.Join(rel, " · "))
+	}
+
+	// Media + related — only non-zero buckets.
+	var media []string
+	if bd.musicVideos > 0 {
+		media = append(media, "📺 "+countLabel(bd.musicVideos, "music video"))
+	}
+	if bd.playlists > 0 {
+		media = append(media, "🎶 "+countLabel(bd.playlists, "playlist"))
+	}
+	if bd.appearsOn > 0 {
+		media = append(media, "🤝 "+groupThousands(bd.appearsOn)+" appears-on")
+	}
+	if len(media) > 0 {
+		body = append(body, strings.Join(media, " · "))
+	}
+
+	var richBody []string
+	for _, line := range body {
+		richBody = append(richBody, escapeRichMD(line))
+	}
+	rich = fmt.Sprintf("## 👤 %s\n\n%s\n", escapeRichMD(bd.name), richLines(richBody))
+	plain = "👤 " + bd.name + "\n" + strings.Join(body, "\n")
+	return rich, plain
 }
