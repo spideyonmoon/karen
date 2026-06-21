@@ -417,7 +417,7 @@ func (b *TelegramBot) scheduleOrRun(j *scheduledJob) {
 	}
 	when := nextWindowStart(now).In(dhakaZone).Format("Mon Jan 2, 3:04 PM")
 	_ = b.sendMessageWithReply(j.ChatID, fmt.Sprintf(
-		"🌙 This %s is heavy, so it's scheduled for the sleeptime window. It'll start around %s (Dhaka time) and deliver as a Gofile ZIP. (It won't appear in /status or respond to /stop until the window starts.)",
+		"🌙 This %s is heavy, so it's scheduled for the sleeptime window. It'll start around %s (Dhaka time) and deliver as a Gofile ZIP. (Track or cancel it any time with /scheduled.)",
 		label, when), nil, j.ReplyToID)
 }
 
