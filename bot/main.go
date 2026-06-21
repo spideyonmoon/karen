@@ -311,7 +311,9 @@ func checkUrlStation(url string) (string, string) {
 }
 
 func checkUrlArtist(url string) (string, string) {
-	pat := regexp.MustCompile(`^(?:https:\/\/(?:beta\.music|music|classical\.music)\.apple\.com\/(\w{2})(?:\/artist|\/artist\/.+))\/(?:id)?(\d[^\D]+)(?:$|\?)`)
+	// Trailing anchor allows a section suffix (…/<id>/full-albums) to still match
+	// and return (storefront, id); the section itself is read by artistURLSection.
+	pat := regexp.MustCompile(`^(?:https:\/\/(?:beta\.music|music|classical\.music)\.apple\.com\/(\w{2})(?:\/artist|\/artist\/.+))\/(?:id)?(\d[^\D]+)(?:$|\?|\/)`)
 	matches := pat.FindAllStringSubmatch(url, -1)
 
 	if matches == nil {
@@ -319,6 +321,19 @@ func checkUrlArtist(url string) (string, string) {
 	} else {
 		return matches[0][1], matches[0][2]
 	}
+}
+
+// artistURLSection extracts the section word that follows an artist id in the
+// path (e.g. "full-albums", "singles", "music-videos"), or "" for a bare artist
+// link. The web routes use these words; the API path mapping lives in the bot
+// package (artistSectionPath).
+func artistURLSection(link string) string {
+	pat := regexp.MustCompile(`(?:beta\.music|music|classical\.music)\.apple\.com\/\w{2}\/artist\/[^\/]+\/(?:id)?\d[^\D]*\/([a-z-]+)(?:$|\?)`)
+	m := pat.FindStringSubmatch(link)
+	if m == nil {
+		return ""
+	}
+	return m[1]
 }
 func resolveAppleMusicURL(rawURL string) string {
 	rawURL = strings.TrimSpace(rawURL)

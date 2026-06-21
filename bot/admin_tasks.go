@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	apputils "main/utils"
 	"main/utils/ampapi"
 )
 
@@ -29,7 +28,8 @@ import (
 // timezone-in-JSON ambiguity.
 type scheduledJob struct {
 	ID            string `json:"id"`
-	Kind          string `json:"kind"` // "artist" | "playlist"
+	Kind          string `json:"kind"`              // "artist" | "playlist"
+	Section       string `json:"section,omitempty"` // artist scope: "" (all) | full-albums | singles | music-videos
 	ChatID        int64  `json:"chat_id"`
 	UserID        int64  `json:"user_id"`
 	Username      string `json:"username"`
@@ -381,7 +381,7 @@ func (b *TelegramBot) releaseJob(j *scheduledJob) {
 		b.enqueuePlaylistDownload(j.ChatID, j.ResourceID, j.ReplyToID, 0, transferModeGofileZip, j.ForceAAC, j.ForceAtmos, j.ForceFlac, false, j.UserID, j.Username)
 	case "artist":
 		_ = b.sendMessageWithReply(j.ChatID, "🌙 Sleeptime reached — starting your scheduled artist rip (Gofile ZIP).", nil, j.ReplyToID)
-		b.runArtistRip(j.ChatID, j.UserID, j.Username, j.Storefront, j.ResourceID, j.ReplyToID, j.ForceAAC, j.ForceAtmos, j.ForceFlac)
+		b.runArtistRipScoped(j.ChatID, j.UserID, j.Username, j.Storefront, j.ResourceID, j.Section, j.ReplyToID, j.ForceAAC, j.ForceAtmos, j.ForceFlac)
 	}
 }
 
@@ -419,6 +419,76 @@ func (b *TelegramBot) scheduleOrRun(j *scheduledJob) {
 	_ = b.sendMessageWithReply(j.ChatID, fmt.Sprintf(
 		"🌙 This %s is heavy, so it's scheduled for the sleeptime window. It'll start around %s (Dhaka time) and deliver as a Gofile ZIP. (It won't appear in /status or respond to /stop until the window starts.)",
 		label, when), nil, j.ReplyToID)
+}
+
+// autoDelete removes a message after the given delay (best-effort). Used for
+// short-lived live boards like /scheduled.
+func (b *TelegramBot) autoDelete(chatID int64, messageID int, after time.Duration) {
+	if messageID == 0 {
+		return
+	}
+	time.AfterFunc(after, func() { _ = b.deleteMessage(chatID, messageID) })
+}
+
+// handleScheduledBoard posts the list of deferred (sleeptime) rips — each as the
+// raw stored link (no re-fetch), its requester, and a /cancel_<id> command — and
+// auto-deletes the message after 60s since it's a transient live board.
+func (b *TelegramBot) handleScheduledBoard(chatID int64, replyToID int) {
+	b.stateMu.Lock()
+	jobs := make([]*scheduledJob, len(b.scheduledJobs))
+	copy(jobs, b.scheduledJobs)
+	b.stateMu.Unlock()
+
+	if len(jobs) == 0 {
+		res, _ := b.sendRichMessage(chatID, "## 🌙 Scheduled tasks\n\nNothing scheduled.", "🌙 Scheduled tasks\nNothing scheduled.", nil, replyToID)
+		b.autoDelete(chatID, res.messageID, 60*time.Second)
+		return
+	}
+
+	var rb, pb strings.Builder
+	rb.WriteString("## 🌙 Scheduled tasks\n\n")
+	pb.WriteString("🌙 Scheduled tasks — start ~2:30 AM Dhaka\n")
+	for i, j := range jobs {
+		who := "@" + j.Username
+		if j.Username == "" {
+			who = fmt.Sprintf("user %d", j.UserID)
+		}
+		// Link sits in a code span (literal, not expanded); the command escapes its
+		// underscore so the Rich renderer keeps it as a tappable /cancel_<id>.
+		fmt.Fprintf(&rb, "%d. `%s` by %s — /cancel\\_%s  \n", i+1, j.Link, escapeRichMD(who), j.ID)
+		fmt.Fprintf(&pb, "%d. %s by %s — /cancel_%s\n", i+1, j.Link, who, j.ID)
+	}
+	rb.WriteString("\n> Auto-clears in 60s.")
+	res, _ := b.sendRichMessage(chatID, rb.String(), pb.String(), nil, replyToID)
+	b.autoDelete(chatID, res.messageID, 60*time.Second)
+}
+
+// cancelScheduledJob removes a deferred job by ID. Only its requester or an admin
+// may cancel it; the change is persisted immediately.
+func (b *TelegramBot) cancelScheduledJob(chatID, userID int64, jobID string, replyToID int) {
+	b.stateMu.Lock()
+	idx := -1
+	var job *scheduledJob
+	for i, j := range b.scheduledJobs {
+		if j.ID == jobID {
+			idx, job = i, j
+			break
+		}
+	}
+	if job == nil {
+		b.stateMu.Unlock()
+		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("No scheduled task %s found (it may have already started).", jobID), nil, replyToID)
+		return
+	}
+	if job.UserID != userID && !b.isAdmin(userID) {
+		b.stateMu.Unlock()
+		_ = b.sendMessageWithReply(chatID, "That scheduled task isn't yours to cancel.", nil, replyToID)
+		return
+	}
+	b.scheduledJobs = append(b.scheduledJobs[:idx], b.scheduledJobs[idx+1:]...)
+	b.saveScheduleLocked()
+	b.stateMu.Unlock()
+	_ = b.sendMessageWithReply(chatID, fmt.Sprintf("❌ Cancelled scheduled task %s.", jobID), nil, replyToID)
 }
 
 // =============================================================================
@@ -506,41 +576,89 @@ func (b *TelegramBot) performBackup() {
 // Artist rips (re-enabled): fan an artist out into Gofile-ZIP job(s)
 // =============================================================================
 
-// runArtistRip enumerates every album for an artist and enqueues them as
-// Gofile-ZIP downloads. The user's ArtistZip profile pref selects between:
-//   - "per_release" / "" (default): one queue slot per album, each zipped and
-//     uploaded separately (N Gofile links).
-//   - "combined": one queue slot for the whole discography, all albums
-//     downloaded sequentially into a single RipState, then one combined ZIP
-//     uploaded to Gofile (1 Gofile link).
+// artistScope describes a rippable slice of an artist's catalog. apiPath is
+// appended to /artists/{id}/ (a relationship like "albums"/"music-videos" or a
+// "view/<name>" path). The same keys serve both URL section suffixes and the
+// selector-button callback data.
+type artistScope struct {
+	key     string
+	apiPath string
+	label   string
+	isMV    bool
+}
+
+// artistScopeFor maps a section key (URL suffix or button choice) to its Apple
+// endpoint. Unknown keys return ok=false so the caller falls back to the
+// selector prompt rather than guessing.
+func artistScopeFor(key string) (artistScope, bool) {
+	switch key {
+	case "", "all", "albums":
+		return artistScope{key: "all", apiPath: "albums", label: "entire discography"}, true
+	case "full-albums":
+		return artistScope{key: "full-albums", apiPath: "view/full-albums", label: "full albums"}, true
+	case "singles":
+		return artistScope{key: "singles", apiPath: "view/singles", label: "singles & EPs"}, true
+	case "music-videos":
+		return artistScope{key: "music-videos", apiPath: "music-videos", label: "music videos", isMV: true}, true
+	}
+	return artistScope{}, false
+}
+
+// runArtistRipScoped enumerates one section of an artist's catalog (the whole
+// discography, full albums, singles/EPs, or music videos) and enqueues it as
+// Gofile delivery. Album sections honor the user's ArtistZip profile pref
+// (per-release N links vs one combined ZIP); music videos are queued per item.
 //
-// Blocks on network (album enumeration) — call in a goroutine from the update
+// Blocks on network (section enumeration) — call in a goroutine from the update
 // loop.
-func (b *TelegramBot) runArtistRip(chatID, userID int64, username, storefront, artistID string, replyToID int, forceAAC, forceAtmos, forceFlac bool) {
+func (b *TelegramBot) runArtistRipScoped(chatID, userID int64, username, storefront, artistID, sectionKey string, replyToID int, forceAAC, forceAtmos, forceFlac bool) {
 	if storefront == "" {
 		storefront = Config.Storefront
 	}
-	albums, _, err := apputils.FetchArtistAlbums(storefront, artistID, b.appleToken, 0, 0, b.searchLanguage())
+	scope, ok := artistScopeFor(sectionKey)
+	if !ok {
+		scope, _ = artistScopeFor("all")
+	}
+
+	items, err := ampapi.ListArtistSection(storefront, artistID, scope.apiPath, b.searchLanguage(), b.appleToken)
 	if err != nil {
-		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Failed to load artist albums: %v", err), nil, replyToID)
+		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Failed to load this artist's %s: %v", scope.label, err), nil, replyToID)
 		return
 	}
-	if len(albums) == 0 {
-		_ = b.sendMessageWithReply(chatID, "No albums found for this artist.", nil, replyToID)
+	if len(items) == 0 {
+		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("No %s found for this artist.", scope.label), nil, replyToID)
+		return
+	}
+
+	if scope.isMV {
+		b.runArtistMusicVideos(chatID, userID, storefront, items, replyToID)
 		return
 	}
 
 	combined := userID != 0 && b.getPrefs(userID).ArtistZip == "combined"
-
 	if combined {
-		b.runArtistRipCombined(chatID, userID, username, storefront, artistID, albums, replyToID, forceAAC, forceAtmos, forceFlac)
+		b.runArtistRipCombined(chatID, userID, username, storefront, artistID, items, replyToID, forceAAC, forceAtmos, forceFlac, scope.label)
 	} else {
-		b.runArtistRipPerRelease(chatID, userID, username, albums, replyToID, forceAAC, forceAtmos, forceFlac)
+		b.runArtistRipPerRelease(chatID, userID, username, items, replyToID, forceAAC, forceAtmos, forceFlac, scope.label)
 	}
 }
 
-// runArtistRipPerRelease is the default: one queue slot per album.
-func (b *TelegramBot) runArtistRipPerRelease(chatID, userID int64, username string, albums []apputils.SearchResultItem, replyToID int, forceAAC, forceAtmos, forceFlac bool) {
+// runArtistMusicVideos queues each of an artist's music videos as a direct
+// Gofile delivery (per item — MVs don't combine into one ZIP).
+func (b *TelegramBot) runArtistMusicVideos(chatID, userID int64, storefront string, items []ampapi.ArtistSectionItem, replyToID int) {
+	queued := 0
+	for _, mv := range items {
+		if mv.ID == "" {
+			continue
+		}
+		b.enqueueMvDownload(chatID, userID, storefront, mv.ID, replyToID, 0, transferModeMvGofile, false)
+		queued++
+	}
+	_ = b.sendMessageWithReply(chatID, fmt.Sprintf("📺 Queued %d music video(s) (Gofile).", queued), nil, replyToID)
+}
+
+// runArtistRipPerRelease is the default: one queue slot per release.
+func (b *TelegramBot) runArtistRipPerRelease(chatID, userID int64, username string, albums []ampapi.ArtistSectionItem, replyToID int, forceAAC, forceAtmos, forceFlac bool, label string) {
 	queued := 0
 	for _, alb := range albums {
 		if alb.ID == "" {
@@ -548,19 +666,19 @@ func (b *TelegramBot) runArtistRipPerRelease(chatID, userID int64, username stri
 		}
 		if !b.enqueueAlbumDownloadChecked(chatID, alb.ID, replyToID, transferModeGofileZip, forceAAC, forceAtmos, forceFlac, userID, username) {
 			_ = b.sendMessageWithReply(chatID, fmt.Sprintf(
-				"⚠️ Download queue is full — queued %d of %d album(s). Re-send the artist link later for the rest.",
+				"⚠️ Download queue is full — queued %d of %d release(s). Re-send later for the rest.",
 				queued, len(albums)), nil, replyToID)
 			return
 		}
 		queued++
 	}
-	_ = b.sendMessageWithReply(chatID, fmt.Sprintf("📀 Queued %d album(s) for the artist rip (Gofile ZIP).", queued), nil, replyToID)
+	_ = b.sendMessageWithReply(chatID, fmt.Sprintf("📀 Queued %d release(s) from %s (Gofile ZIP).", queued, label), nil, replyToID)
 }
 
-// runArtistRipCombined enqueues one download request that iterates every album
+// runArtistRipCombined enqueues one download request that iterates every release
 // sequentially. All tracks accumulate in the same RipState, so delivery creates
 // a single combined ZIP uploaded to Gofile.
-func (b *TelegramBot) runArtistRipCombined(chatID, userID int64, username, storefront, artistID string, albums []apputils.SearchResultItem, replyToID int, forceAAC, forceAtmos, forceFlac bool) {
+func (b *TelegramBot) runArtistRipCombined(chatID, userID int64, username, storefront, artistID string, albums []ampapi.ArtistSectionItem, replyToID int, forceAAC, forceAtmos, forceFlac bool, label string) {
 	format := b.resolveFormat(chatID, forceFlac)
 	ok := b.enqueueDownloadWithAfter(chatID, userID, username, replyToID, 0, false, format, transferModeGofileZip, "artist:"+artistID, false, func(ctx context.Context) error {
 		if forceAtmos {
@@ -578,13 +696,13 @@ func (b *TelegramBot) runArtistRipCombined(chatID, userID int64, username, store
 				continue
 			}
 			if err := ripAlbum(alb.ID, b.appleToken, storefront, "", forceAAC, ctx); err != nil {
-				fmt.Printf("Artist combined rip: album %d/%d (%s) failed: %v\n", i+1, len(albums), alb.ID, err)
+				fmt.Printf("Artist combined rip: release %d/%d (%s) failed: %v\n", i+1, len(albums), alb.ID, err)
 			}
 		}
 		return nil
 	}, nil)
 	if ok {
-		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("📀 Queued artist rip (%d albums → combined ZIP).", len(albums)), nil, replyToID)
+		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("📀 Queued %s (%d releases → combined ZIP).", label, len(albums)), nil, replyToID)
 	}
 }
 
@@ -616,7 +734,7 @@ const playlistSleeptimeThreshold = 100
 // threshold, schedules it for the sleeptime window; otherwise it runs the normal
 // delivery path. A count failure falls through to the normal path so a transient
 // API error never blocks the user. Blocking HTTP — call in a goroutine.
-func (b *TelegramBot) routePlaylistNonAdmin(chatID, userID int64, storefront, playlistID, link string, replyToID int, headlessMode string, forceAAC, forceAtmos, forceFlac, noCache bool) {
+func (b *TelegramBot) routePlaylistNonAdmin(chatID, userID int64, username, storefront, playlistID, link string, replyToID int, headlessMode string, forceAAC, forceAtmos, forceFlac, noCache bool) {
 	resp, err := ampapi.GetPlaylistResp(orStorefront(storefront), playlistID, b.searchLanguage(), b.appleToken)
 	if err != nil || resp == nil || len(resp.Data) == 0 {
 		b.dispatchPlaylistNormal(chatID, userID, playlistID, replyToID, headlessMode, forceAAC, forceAtmos, forceFlac, noCache)
@@ -627,6 +745,7 @@ func (b *TelegramBot) routePlaylistNonAdmin(chatID, userID int64, storefront, pl
 			Kind:       "playlist",
 			ChatID:     chatID,
 			UserID:     userID,
+			Username:   username,
 			ReplyToID:  replyToID,
 			Link:       link,
 			Storefront: storefront,

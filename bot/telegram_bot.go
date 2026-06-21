@@ -119,6 +119,11 @@ type TelegramBot struct {
 	transferMu       sync.Mutex
 	pendingTransfers map[int64]*PendingTransfer
 
+	// artistSelMu guards pendingArtistSels, the open artist-scope selector prompts
+	// keyed by "chatID:messageID" (mirrors the /profile owner-tracked panels).
+	artistSelMu       sync.Mutex
+	pendingArtistSels map[string]*pendingArtistSel
+
 	queueMu       sync.Mutex
 	downloadQueue chan *downloadRequest
 	queuedReqs    []*downloadRequest // display-only mirror of downloadQueue for status board (guarded by queueMu)
@@ -1332,10 +1337,12 @@ func (b *TelegramBot) handleMessage(msg *Message) {
 			return
 		}
 		userID := int64(0)
+		username := ""
 		if msg.From != nil {
 			userID = msg.From.ID
+			username = msg.From.Username
 		}
-		b.handleCommand(msg.Chat.ID, userID, cmd, args, msg.MessageID)
+		b.handleCommand(msg.Chat.ID, userID, username, cmd, args, msg.MessageID)
 		return
 	}
 }
@@ -1387,6 +1394,8 @@ func (b *TelegramBot) handleCallback(cb *CallbackQuery) {
 		}
 	} else if strings.HasPrefix(data, "pf:") {
 		alert = b.handleProfileCallback(cb, data, clickerID)
+	} else if strings.HasPrefix(data, "artsel:") {
+		alert = b.handleArtistScope(cb, strings.TrimPrefix(data, "artsel:"), clickerID)
 	}
 	if alert != "" {
 		_ = b.answerCallbackAlert(cb.ID, alert)
@@ -1477,7 +1486,7 @@ func (b *TelegramBot) handleChosenInlineResult(result *ChosenInlineResult) {
 	b.queueInlineSongDownload(chatID, songID, result.InlineMessageID)
 }
 
-func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args []string, replyToID int) {
+func (b *TelegramBot) handleCommand(chatID int64, userID int64, username string, cmd string, args []string, replyToID int) {
 	// Admin lockdown: when /auth is active, non-admins can't run ANY command
 	// (including /stop and /status). Admins are unaffected.
 	if b.isLocked() && !b.isAdmin(userID) {
@@ -1489,8 +1498,15 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args
 		b.cancelTask(chatID, userID, taskID, replyToID)
 		return
 	}
+	if strings.HasPrefix(cmd, "cancel_") {
+		jobID := strings.TrimPrefix(cmd, "cancel_")
+		b.cancelScheduledJob(chatID, userID, jobID, replyToID)
+		return
+	}
 
 	switch cmd {
+	case "scheduled", "pending":
+		b.handleScheduledBoard(chatID, replyToID)
 	case "start", "help":
 		_, _ = b.sendRichMessage(chatID, botHelpRich(), botHelpText(), nil, replyToID)
 	case "profile":
@@ -1677,7 +1693,7 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args
 			} else {
 				// Non-admins: count first (blocking → goroutine); >100 tracks defers
 				// to the sleeptime window forced to Gofile ZIP.
-				go b.routePlaylistNonAdmin(chatID, userID, playlistStorefront, playlistID, link, replyToID, headlessMode, forceAAC, forceAtmos, forceFlac, forceNoCache)
+				go b.routePlaylistNonAdmin(chatID, userID, username, playlistStorefront, playlistID, link, replyToID, headlessMode, forceAAC, forceAtmos, forceFlac, forceNoCache)
 			}
 			return
 		}
@@ -1694,24 +1710,28 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, cmd string, args
 
 		artistStorefront, artistID := checkUrlArtist(link)
 		if artistID != "" {
-			if b.isAdmin(userID) {
-				// Admins bypass sleeptime gating — rip the whole discography now,
-				// forced to Gofile ZIP. Blocking enumeration → goroutine.
-				go b.runArtistRip(chatID, userID, "", artistStorefront, artistID, replyToID, forceAAC, forceAtmos, forceFlac)
-			} else {
-				go b.scheduleOrRun(&scheduledJob{
-					Kind:       "artist",
-					ChatID:     chatID,
-					UserID:     userID,
-					ReplyToID:  replyToID,
-					Link:       link,
-					Storefront: artistStorefront,
-					ResourceID: artistID,
-					ForceAAC:   forceAAC,
-					ForceAtmos: forceAtmos,
-					ForceFlac:  forceFlac,
-				})
+			sel := &pendingArtistSel{
+				chatID:     chatID,
+				userID:     userID,
+				username:   username,
+				storefront: artistStorefront,
+				artistID:   artistID,
+				link:       link,
+				replyToID:  replyToID,
+				forceAAC:   forceAAC,
+				forceAtmos: forceAtmos,
+				forceFlac:  forceFlac,
 			}
+			// A recognized section suffix (…/full-albums, /singles, /music-videos)
+			// skips the prompt and rips that bucket directly; a bare artist link
+			// shows the scope selector.
+			if section := artistURLSection(link); section != "" {
+				if _, ok := artistScopeFor(section); ok {
+					go b.startArtistScope(sel, section)
+					return
+				}
+			}
+			b.promptArtistScope(chatID, sel)
 			return
 		}
 
@@ -2153,6 +2173,115 @@ func (b *TelegramBot) enqueueMvDownload(chatID int64, userID int64, storefront s
 	}
 	b.enqueueDownload(chatID, userID, "", replyToID, statusMessageID, true, "", transferMode, "", noCache, func(ctx context.Context) error {
 		return mvDownloader(ctx, mvID, saveDir, b.appleToken, storefront, nil, nil)
+	})
+}
+
+// pendingArtistSel is an open artist-scope selector prompt: everything needed to
+// start (or schedule) a scoped rip once the user taps a button.
+type pendingArtistSel struct {
+	chatID     int64
+	userID     int64
+	username   string
+	storefront string
+	artistID   string
+	link       string
+	replyToID  int
+	forceAAC   bool
+	forceAtmos bool
+	forceFlac  bool
+	createdAt  time.Time
+}
+
+// buildArtistScopeKeyboard renders the scope selector for an artist link.
+func buildArtistScopeKeyboard() InlineKeyboardMarkup {
+	return InlineKeyboardMarkup{InlineKeyboard: [][]InlineKeyboardButton{
+		{{Text: "🎼 Entire discography", CallbackData: "artsel:all", Style: "primary"}},
+		{
+			{Text: "💿 Full albums", CallbackData: "artsel:full-albums"},
+			{Text: "🎵 Singles & EPs", CallbackData: "artsel:singles"},
+		},
+		{{Text: "📺 Music videos", CallbackData: "artsel:music-videos"}},
+		{{Text: "❌ Cancel", CallbackData: "artsel:cancel", Style: "danger"}},
+	}}
+}
+
+// promptArtistScope sends the scope selector and records the pending selection
+// keyed by chatID:messageID (owner-guarded on tap).
+func (b *TelegramBot) promptArtistScope(chatID int64, sel *pendingArtistSel) {
+	sel.createdAt = time.Now()
+	messageID, err := b.sendMessageWithReplyReturn(chatID, "Which part of this artist's catalog?", buildArtistScopeKeyboard(), sel.replyToID)
+	if err != nil || messageID == 0 {
+		return
+	}
+	b.artistSelMu.Lock()
+	if b.pendingArtistSels == nil {
+		b.pendingArtistSels = make(map[string]*pendingArtistSel)
+	}
+	b.pendingArtistSels[profileKey(chatID, messageID)] = sel
+	b.artistSelMu.Unlock()
+}
+
+// handleArtistScope processes a scope-selector tap: owner-guard, then start
+// (admin) or schedule (non-admin) the chosen scope. Returns a non-empty alert to
+// reject an unauthorized or stale tap.
+func (b *TelegramBot) handleArtistScope(cb *CallbackQuery, choice string, clickerID int64) string {
+	chatID := cb.Message.Chat.ID
+	messageID := cb.Message.MessageID
+	key := profileKey(chatID, messageID)
+
+	b.artistSelMu.Lock()
+	sel, ok := b.pendingArtistSels[key]
+	b.artistSelMu.Unlock()
+	if !ok {
+		return ""
+	}
+	if sel.userID != 0 && clickerID != sel.userID {
+		return "This isn't your selection."
+	}
+
+	b.artistSelMu.Lock()
+	delete(b.pendingArtistSels, key)
+	b.artistSelMu.Unlock()
+
+	if time.Since(sel.createdAt) > pendingTTL {
+		_ = b.editMessageText(chatID, messageID, "Selection expired — send the artist link again.", nil)
+		return ""
+	}
+
+	if choice == "cancel" {
+		_ = b.editMessageText(chatID, messageID, "Cancelled.", nil)
+		return ""
+	}
+	scope, valid := artistScopeFor(choice)
+	if !valid {
+		_ = b.editMessageText(chatID, messageID, "Unknown option.", nil)
+		return ""
+	}
+	_ = b.editMessageText(chatID, messageID, fmt.Sprintf("Selected: %s.", scope.label), nil)
+	go b.startArtistScope(sel, choice)
+	return ""
+}
+
+// startArtistScope runs the chosen scope now (admin) or defers it to the
+// sleeptime window (non-admin). Blocks on enumeration → call in a goroutine.
+func (b *TelegramBot) startArtistScope(sel *pendingArtistSel, section string) {
+	if b.isAdmin(sel.userID) {
+		b.runArtistRipScoped(sel.chatID, sel.userID, sel.username, sel.storefront, sel.artistID, section, sel.replyToID, sel.forceAAC, sel.forceAtmos, sel.forceFlac)
+		return
+	}
+	b.scheduleOrRun(&scheduledJob{
+		Kind:       "artist",
+		Section:    section,
+		ChatID:     sel.chatID,
+		UserID:     sel.userID,
+		Username:   sel.username,
+		ReplyToID:  sel.replyToID,
+		Link:       sel.link,
+		Storefront: sel.storefront,
+		ResourceID: sel.artistID,
+		ForceAAC:   sel.forceAAC,
+		ForceAtmos: sel.forceAtmos,
+		ForceFlac:  sel.forceFlac,
 	})
 }
 
@@ -6750,7 +6879,9 @@ Commands:
 /dl <apple-music-link> [flags]   download a song, album, artist, or playlist
 /check <apple-music-link>        inspect a link: track count + metadata, or a full artist breakdown
 /status or /queue                show active task and queue count
+/scheduled                       list rips deferred to the sleeptime window
 /stop_<task_id>                  cancel a running or queued download
+/cancel_<id>                     cancel a scheduled (deferred) rip
 /profile                         set your saved rip preferences (buttons)
 /help                            show this message
 
@@ -6790,7 +6921,9 @@ Rips lossless ALAC, Dolby Atmos, and AAC from Apple Music straight to your chat.
 | ` + "`/dl <link> [flags]`" + ` | Download a song, album, artist, or playlist |
 | ` + "`/check <link>`" + ` | Inspect a link: track count + metadata, or a full artist breakdown |
 | ` + "`/status`" + ` or ` + "`/queue`" + ` | Show the active task and queue |
+| ` + "`/scheduled`" + ` | List rips deferred to the sleeptime window |
 | ` + "`/stop_<task_id>`" + ` | Cancel a running or queued download |
+| ` + "`/cancel_<id>`" + ` | Cancel a scheduled (deferred) rip |
 | ` + "`/profile`" + ` | Set your saved rip preferences (all buttons) |
 | ` + "`/help`" + ` | Show this message |
 
