@@ -655,6 +655,11 @@ func (b *TelegramBot) dispatchPlaylistNormal(chatID, userID int64, playlistID st
 
 const artistCountAlbumCap = 50 // above this, /count skips the per-album scan
 
+// countTracklistCap bounds how many rows the collapsible tracklist renders so a
+// huge playlist can't blow past Telegram's message-size limit. Extra tracks fold
+// into an "…and N more" line.
+const countTracklistCap = 60
+
 // countStreamable counts tracks that are actually playable/rip-able: a track
 // with an empty PlayParams.ID is unavailable (region-locked, pulled, etc.).
 func countStreamable(tracks []ampapi.TrackRespData) int {
@@ -674,6 +679,207 @@ func orStorefront(sf string) string {
 	return sf
 }
 
+// regionBadge turns a 2-letter storefront code ("us", "jp") into a flag + code
+// ("🇺🇸 US"), composing the flag from Unicode regional-indicator symbols. Odd or
+// empty codes degrade to the upper-cased code (or "").
+func regionBadge(sf string) string {
+	sf = strings.ToLower(strings.TrimSpace(sf))
+	if len(sf) != 2 || sf[0] < 'a' || sf[0] > 'z' || sf[1] < 'a' || sf[1] > 'z' {
+		return strings.ToUpper(sf)
+	}
+	const base = 0x1F1E6 // 🇦
+	flag := string(rune(base+int(sf[0]-'a'))) + string(rune(base+int(sf[1]-'a')))
+	return flag + " " + strings.ToUpper(sf)
+}
+
+// qualityBadge maps Apple's album/song audioTraits to a friendly, ordered label
+// such as "Hi-Res Lossless · Dolby Atmos". Returns "" when no known trait is
+// present (so the caller can omit the line entirely).
+func qualityBadge(traits []string) string {
+	has := func(t string) bool {
+		for _, x := range traits {
+			if x == t {
+				return true
+			}
+		}
+		return false
+	}
+	var parts []string
+	switch {
+	case has("hi-res-lossless"):
+		parts = append(parts, "Hi-Res Lossless")
+	case has("lossless"):
+		parts = append(parts, "Lossless")
+	}
+	if has("atmos") || has("spatial") {
+		parts = append(parts, "Dolby Atmos")
+	}
+	if len(parts) == 0 && has("lossy-stereo") {
+		parts = append(parts, "AAC")
+	}
+	return strings.Join(parts, " · ")
+}
+
+// primaryGenre returns the most specific genre, skipping the catch-all "Music".
+func primaryGenre(genres []string) string {
+	for _, g := range genres {
+		if g != "" && g != "Music" {
+			return g
+		}
+	}
+	if len(genres) > 0 {
+		return genres[0]
+	}
+	return ""
+}
+
+// sumTrackDuration totals the runtime across a track list.
+func sumTrackDuration(tracks []ampapi.TrackRespData) time.Duration {
+	ms := 0
+	for _, t := range tracks {
+		ms += t.Attributes.DurationInMillis
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+// shortDuration renders a millisecond duration as "m:ss" (or "h:mm:ss"), the
+// compact form used inside tracklist rows.
+func shortDuration(ms int) string {
+	s := ms / 1000
+	if h := s / 3600; h > 0 {
+		return fmt.Sprintf("%d:%02d:%02d", h, (s%3600)/60, s%60)
+	}
+	return fmt.Sprintf("%d:%02d", s/60, s%60)
+}
+
+// countCard is the assembled metadata for an album- or playlist-style /count
+// reply. Empty fields are dropped from the render, so the same struct serves a
+// bare playlist (just name + tracks) and a fully-tagged album.
+type countCard struct {
+	emoji       string // 💿 album, 🎶 playlist
+	title       string
+	subtitle    string // artist or curator (may be "")
+	label       string
+	release     string
+	genre       string
+	quality     string
+	region      string
+	upc         string
+	copyright   string
+	streamable  int
+	totalTracks int
+	duration    time.Duration
+	tracks      []ampapi.TrackRespData
+}
+
+// richLines joins body lines with GFM hard breaks (two trailing spaces + a
+// newline) so Telegram's Rich renderer keeps them on separate lines instead of
+// soft-wrapping the paragraph into one run-on — the same trick the status
+// board's footer blockquote uses.
+func richLines(lines []string) string {
+	return strings.Join(lines, "  \n")
+}
+
+// render builds the Bot API 10.1 Rich-Markdown body and a plain-text fallback.
+// The tracklist lives in a collapsed <details> block (same construct the live
+// board and completion summary use) so even a 60-row table stays out of the way
+// until the user expands it.
+func (c countCard) render() (rich, plain string) {
+	var rb, pb strings.Builder
+
+	fmt.Fprintf(&rb, "## %s %s\n\n", c.emoji, escapeRichMD(c.title))
+	fmt.Fprintf(&pb, "%s %s\n", c.emoji, c.title)
+
+	var meta []string
+	if c.label != "" {
+		meta = append(meta, "🏷️ "+c.label)
+	}
+	if c.release != "" {
+		meta = append(meta, "📅 "+c.release)
+	}
+	if c.genre != "" {
+		meta = append(meta, "🎸 "+c.genre)
+	}
+
+	count := fmt.Sprintf("%d streamable track(s)", c.streamable)
+	if c.totalTracks > c.streamable {
+		count = fmt.Sprintf("%d of %d tracks streamable", c.streamable, c.totalTracks)
+	}
+	headline := "🔢 " + count
+	if c.duration > 0 {
+		headline += " · ⏱️ " + formatDuration(c.duration)
+	}
+
+	// Body lines, each its own visual line via hard breaks (rich) / newlines (plain).
+	var richBody, plainBody []string
+	if c.subtitle != "" {
+		richBody = append(richBody, "**"+escapeRichMD(c.subtitle)+"**")
+		plainBody = append(plainBody, c.subtitle)
+	}
+	if len(meta) > 0 {
+		richBody = append(richBody, escapeRichMD(strings.Join(meta, " · ")))
+		plainBody = append(plainBody, strings.Join(meta, " · "))
+	}
+	if c.quality != "" {
+		richBody = append(richBody, "🎧 "+escapeRichMD(c.quality))
+		plainBody = append(plainBody, "🎧 "+c.quality)
+	}
+	richBody = append(richBody, escapeRichMD(headline))
+	plainBody = append(plainBody, headline)
+	if c.region != "" {
+		richBody = append(richBody, "🌍 "+escapeRichMD(c.region))
+		plainBody = append(plainBody, "🌍 "+c.region)
+	}
+	rb.WriteString(richLines(richBody))
+	rb.WriteString("\n")
+	pb.WriteString(strings.Join(plainBody, "\n"))
+	pb.WriteString("\n")
+
+	if len(c.tracks) > 0 {
+		shown := c.tracks
+		extra := 0
+		if len(shown) > countTracklistCap {
+			extra = len(shown) - countTracklistCap
+			shown = shown[:countTracklistCap]
+		}
+		fmt.Fprintf(&rb, "\n<details>\n<summary>Tracklist · %d track(s)</summary>\n\n", len(c.tracks))
+		rb.WriteString("| # | Track | ⏱ |\n|--:|:------|--:|\n")
+		pb.WriteString("\nTracklist:\n")
+		for i, t := range shown {
+			num := t.Attributes.TrackNumber
+			if num == 0 {
+				num = i + 1
+			}
+			mark := ""
+			if t.Attributes.PlayParams.ID == "" {
+				mark = " ⚠️" // unavailable / not rip-able
+			}
+			dur := shortDuration(t.Attributes.DurationInMillis)
+			fmt.Fprintf(&rb, "| %d | %s%s | %s |\n", num, escapeRichMD(truncateStatusTitle(t.Attributes.Name, 48)), mark, dur)
+			fmt.Fprintf(&pb, "%d. %s%s — %s\n", num, t.Attributes.Name, mark, dur)
+		}
+		if extra > 0 {
+			fmt.Fprintf(&rb, "\n…and %d more\n", extra)
+			fmt.Fprintf(&pb, "…and %d more\n", extra)
+		}
+		rb.WriteString("\n</details>\n")
+	}
+
+	var foot []string
+	if c.upc != "" {
+		foot = append(foot, "🆔 "+c.upc)
+	}
+	if c.copyright != "" {
+		foot = append(foot, "©️ "+c.copyright)
+	}
+	if len(foot) > 0 {
+		fmt.Fprintf(&rb, "\n> %s\n", escapeRichMD(strings.Join(foot, " · ")))
+		fmt.Fprintf(&pb, "%s\n", strings.Join(foot, " · "))
+	}
+
+	return rb.String(), strings.TrimRight(pb.String(), "\n")
+}
+
 // handleCount replies with the number of streamable tracks behind a link. Runs
 // on its own goroutine (album/artist fetches are blocking HTTP) so it never
 // stalls the update loop.
@@ -684,14 +890,14 @@ func (b *TelegramBot) handleCount(chatID int64, link string, replyToID int) {
 		_ = b.sendMessageWithReply(chatID, "🎬 That's a music video — 1 rip-able item.", nil, replyToID)
 		return
 	}
-	if _, songID := checkUrlSong(link); songID != "" {
-		_ = b.sendMessageWithReply(chatID, "🎵 1 streamable track.", nil, replyToID)
+	if sf, songID := checkUrlSong(link); songID != "" {
+		b.countSong(chatID, orStorefront(sf), songID, sf, replyToID)
 		return
 	}
 	if sf, albumID := checkUrl(link); albumID != "" {
-		// A shared-song link is an album URL with ?i=<songID>; count it as one track.
-		if songIDFromURLParam(link) != "" {
-			_ = b.sendMessageWithReply(chatID, "🎵 1 streamable track.", nil, replyToID)
+		// A shared-song link is an album URL with ?i=<songID>; treat it as one song.
+		if songID := songIDFromURLParam(link); songID != "" {
+			b.countSong(chatID, orStorefront(sf), songID, sf, replyToID)
 			return
 		}
 		resp, err := ampapi.GetAlbumResp(orStorefront(sf), albumID, b.searchLanguage(), b.appleToken)
@@ -699,10 +905,26 @@ func (b *TelegramBot) handleCount(chatID int64, link string, replyToID int) {
 			_ = b.sendMessageWithReply(chatID, "Couldn't load that album.", nil, replyToID)
 			return
 		}
+		a := resp.Data[0].Attributes
 		tracks := resp.Data[0].Relationships.Tracks.Data
-		n := countStreamable(tracks)
-		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("💿 %q — %d streamable track(s)%s.",
-			resp.Data[0].Attributes.Name, n, unavailableNote(len(tracks)-n)), nil, replyToID)
+		card := countCard{
+			emoji:       "💿",
+			title:       a.Name,
+			subtitle:    a.ArtistName,
+			label:       a.RecordLabel,
+			release:     a.ReleaseDate,
+			genre:       primaryGenre(a.GenreNames),
+			quality:     qualityBadge(a.AudioTraits),
+			region:      regionBadge(orStorefront(sf)),
+			upc:         a.Upc,
+			copyright:   a.Copyright,
+			streamable:  countStreamable(tracks),
+			totalTracks: len(tracks),
+			duration:    sumTrackDuration(tracks),
+			tracks:      tracks,
+		}
+		rich, plain := card.render()
+		_, _ = b.sendRichMessage(chatID, rich, plain, nil, replyToID)
 		return
 	}
 	if sf, playlistID := checkUrlPlaylist(link); playlistID != "" {
@@ -711,10 +933,22 @@ func (b *TelegramBot) handleCount(chatID int64, link string, replyToID int) {
 			_ = b.sendMessageWithReply(chatID, "Couldn't load that playlist.", nil, replyToID)
 			return
 		}
+		a := resp.Data[0].Attributes
 		tracks := resp.Data[0].Relationships.Tracks.Data
-		n := countStreamable(tracks)
-		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("🎶 %q — %d streamable track(s)%s.",
-			resp.Data[0].Attributes.Name, n, unavailableNote(len(tracks)-n)), nil, replyToID)
+		card := countCard{
+			emoji:       "🎶",
+			title:       a.Name,
+			subtitle:    a.ArtistName,
+			genre:       primaryGenre(a.GenreNames),
+			quality:     qualityBadge(a.AudioTraits),
+			region:      regionBadge(orStorefront(sf)),
+			streamable:  countStreamable(tracks),
+			totalTracks: len(tracks),
+			duration:    sumTrackDuration(tracks),
+			tracks:      tracks,
+		}
+		rich, plain := card.render()
+		_, _ = b.sendRichMessage(chatID, rich, plain, nil, replyToID)
 		return
 	}
 	if _, stationID := checkUrlStation(link); stationID != "" {
@@ -722,7 +956,7 @@ func (b *TelegramBot) handleCount(chatID int64, link string, replyToID int) {
 		return
 	}
 	if sf, artistID := checkUrlArtist(link); artistID != "" {
-		b.countArtist(chatID, orStorefront(sf), artistID, replyToID)
+		b.countArtist(chatID, orStorefront(sf), artistID, sf, replyToID)
 		return
 	}
 	switch {
@@ -735,10 +969,67 @@ func (b *TelegramBot) handleCount(chatID int64, link string, replyToID int) {
 	}
 }
 
+// countSong renders a one-track card for a song link (a /song URL or an album
+// link carrying an ?i=<songID> param). Falls back to a one-line reply if the
+// song can't be loaded. sfCode is the link's storefront code for the region
+// badge ("" → configured default).
+func (b *TelegramBot) countSong(chatID int64, storefront, songID, sfCode string, replyToID int) {
+	resp, err := ampapi.GetSongResp(storefront, songID, b.searchLanguage(), b.appleToken)
+	if err != nil || resp == nil || len(resp.Data) == 0 {
+		_ = b.sendMessageWithReply(chatID, "🎵 1 streamable track.", nil, replyToID)
+		return
+	}
+	a := resp.Data[0].Attributes
+
+	var meta []string
+	if a.AlbumName != "" {
+		meta = append(meta, "💿 "+a.AlbumName)
+	}
+	if g := primaryGenre(a.GenreNames); g != "" {
+		meta = append(meta, "🎸 "+g)
+	}
+	if a.ReleaseDate != "" {
+		meta = append(meta, "📅 "+a.ReleaseDate)
+	}
+
+	headline := "🔢 1 streamable track"
+	if a.PlayParams.ID == "" {
+		headline = "🔢 1 track (unavailable)"
+	}
+	if a.DurationInMillis > 0 {
+		headline += " · ⏱️ " + shortDuration(a.DurationInMillis)
+	}
+
+	var richBody, plainBody []string
+	if a.ArtistName != "" {
+		richBody = append(richBody, "**"+escapeRichMD(a.ArtistName)+"**")
+		plainBody = append(plainBody, a.ArtistName)
+	}
+	if len(meta) > 0 {
+		richBody = append(richBody, escapeRichMD(strings.Join(meta, " · ")))
+		plainBody = append(plainBody, strings.Join(meta, " · "))
+	}
+	if q := qualityBadge(a.AudioTraits); q != "" {
+		richBody = append(richBody, "🎧 "+escapeRichMD(q))
+		plainBody = append(plainBody, "🎧 "+q)
+	}
+	richBody = append(richBody, escapeRichMD(headline))
+	plainBody = append(plainBody, headline)
+	if r := regionBadge(orStorefront(sfCode)); r != "" {
+		richBody = append(richBody, "🌍 "+escapeRichMD(r))
+		plainBody = append(plainBody, "🌍 "+r)
+	}
+
+	rich := fmt.Sprintf("## 🎵 %s\n\n%s\n", escapeRichMD(a.Name), richLines(richBody))
+	plain := "🎵 " + a.Name + "\n" + strings.Join(plainBody, "\n")
+	_, _ = b.sendRichMessage(chatID, rich, plain, nil, replyToID)
+}
+
 // countArtist sums streamable tracks across an artist's albums. For artists with
 // more albums than artistCountAlbumCap it bails with the album count rather than
-// firing dozens of sequential album fetches.
-func (b *TelegramBot) countArtist(chatID int64, storefront, artistID string, replyToID int) {
+// firing dozens of sequential album fetches. sfCode is the link's storefront
+// code for the region badge.
+func (b *TelegramBot) countArtist(chatID int64, storefront, artistID, sfCode string, replyToID int) {
 	albums, _, err := apputils.FetchArtistAlbums(storefront, artistID, b.appleToken, 0, 0, b.searchLanguage())
 	if err != nil {
 		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Failed to load artist albums: %v", err), nil, replyToID)
@@ -748,14 +1039,31 @@ func (b *TelegramBot) countArtist(chatID int64, storefront, artistID string, rep
 		_ = b.sendMessageWithReply(chatID, "No albums found for this artist.", nil, replyToID)
 		return
 	}
+
+	artistName := "This artist"
+	if albums[0].Artist != "" {
+		artistName = albums[0].Artist
+	}
+	region := regionBadge(orStorefront(sfCode))
+
 	if len(albums) > artistCountAlbumCap {
-		_ = b.sendMessageWithReply(chatID, fmt.Sprintf(
-			"👤 This artist has %d albums — too many to tally track-by-track. Send an album or playlist link for an exact count.",
-			len(albums)), nil, replyToID)
+		var richBody, plainBody []string
+		richBody = append(richBody, fmt.Sprintf("💿 %d albums", len(albums)))
+		plainBody = append(plainBody, fmt.Sprintf("💿 %d albums", len(albums)))
+		if region != "" {
+			richBody = append(richBody, "🌍 "+escapeRichMD(region))
+			plainBody = append(plainBody, "🌍 "+region)
+		}
+		note := "Too many albums to tally track-by-track — send an album or playlist link for an exact count."
+		rich := fmt.Sprintf("## 👤 %s\n\n%s\n\n> %s\n", escapeRichMD(artistName), richLines(richBody), escapeRichMD(note))
+		plain := "👤 " + artistName + "\n" + strings.Join(plainBody, "\n") + "\n" + note
+		_, _ = b.sendRichMessage(chatID, rich, plain, nil, replyToID)
 		return
 	}
+
 	_ = b.sendMessageWithReply(chatID, fmt.Sprintf("🔎 Counting streamable tracks across %d album(s)…", len(albums)), nil, replyToID)
 	total := 0
+	var dur time.Duration
 	for _, alb := range albums {
 		if alb.ID == "" {
 			continue
@@ -764,14 +1072,23 @@ func (b *TelegramBot) countArtist(chatID int64, storefront, artistID string, rep
 		if err != nil || resp == nil || len(resp.Data) == 0 {
 			continue
 		}
-		total += countStreamable(resp.Data[0].Relationships.Tracks.Data)
+		tracks := resp.Data[0].Relationships.Tracks.Data
+		total += countStreamable(tracks)
+		dur += sumTrackDuration(tracks)
 	}
-	_ = b.sendMessageWithReply(chatID, fmt.Sprintf("👤 %d streamable track(s) across %d album(s).", total, len(albums)), nil, replyToID)
-}
 
-func unavailableNote(unavailable int) string {
-	if unavailable <= 0 {
-		return ""
+	headline := fmt.Sprintf("💿 %d album(s) · 🔢 %d streamable track(s)", len(albums), total)
+	if dur > 0 {
+		headline += " · ⏱️ " + formatDuration(dur)
 	}
-	return fmt.Sprintf(" (%d unavailable)", unavailable)
+	var richBody, plainBody []string
+	richBody = append(richBody, escapeRichMD(headline))
+	plainBody = append(plainBody, headline)
+	if region != "" {
+		richBody = append(richBody, "🌍 "+escapeRichMD(region))
+		plainBody = append(plainBody, "🌍 "+region)
+	}
+	rich := fmt.Sprintf("## 👤 %s\n\n%s\n", escapeRichMD(artistName), richLines(richBody))
+	plain := "👤 " + artistName + "\n" + strings.Join(plainBody, "\n")
+	_, _ = b.sendRichMessage(chatID, rich, plain, nil, replyToID)
 }
