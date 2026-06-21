@@ -1216,6 +1216,7 @@ func ripStation(albumId string, token string, storefront string, ctx context.Con
 		if !isInArray(selected, i) {
 			continue
 		}
+		rs.checkpointFlush(ctx, wg.Wait)
 		trackIdx := i - 1
 		wg.Add(1)
 		sem <- struct{}{}
@@ -1623,6 +1624,11 @@ func ripAlbum(albumId string, token string, storefront string, urlArg_i string, 
 		if !isInArray(selected, i) {
 			continue
 		}
+		// If the rip has piled up more than the flush threshold on disk, drain the
+		// in-flight tracks, zip+upload them to Gofile, and delete them before
+		// launching more — so a huge album/discography never has to fit entirely on
+		// disk at once. No-op until the threshold is crossed.
+		rs.checkpointFlush(ctx, wg.Wait)
 		trackIdx := i - 1
 		wg.Add(1)
 		sem <- struct{}{}
@@ -1874,6 +1880,7 @@ func ripPlaylist(playlistId string, token string, storefront string, forceAAC bo
 		if !isInArray(selected, i) {
 			continue
 		}
+		rs.checkpointFlush(ctx, wg.Wait)
 		trackIdx := i - 1
 		wg.Add(1)
 		sem <- struct{}{}

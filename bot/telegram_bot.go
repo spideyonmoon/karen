@@ -36,6 +36,7 @@ const (
 	pendingTTL                   = 10 * time.Minute
 	defaultTelegramFormat        = "alac"
 	defaultTelegramDownloadMaxGB = 3
+	defaultRipFlushThresholdGB   = 20
 	defaultTelegramTimeoutSecs   = 3600
 	// downloadPurgeInterval is how often the background routine wipes the local
 	// download cache folders. This is a hard time-based purge (separate from the
@@ -480,6 +481,22 @@ func telegramDownloadMaxBytes() int64 {
 	gb := Config.TelegramDownloadMaxGB
 	if gb <= 0 {
 		gb = defaultTelegramDownloadMaxGB
+	}
+	return int64(gb) * 1024 * 1024 * 1024
+}
+
+// ripFlushThresholdBytes returns the on-disk size at which an in-progress rip is
+// paused to zip+upload the accumulated tracks to Gofile and reclaim disk before
+// continuing. An unset value (0) falls back to the 20 GB default; a negative value
+// disables mid-rip flushing entirely (the whole rip lands on disk before delivery,
+// the historical behavior).
+func ripFlushThresholdBytes() int64 {
+	gb := Config.RipFlushThresholdGB
+	if gb < 0 {
+		return -1
+	}
+	if gb == 0 {
+		gb = defaultRipFlushThresholdGB
 	}
 	return int64(gb) * 1024 * 1024 * 1024
 }
@@ -2502,6 +2519,16 @@ func (b *TelegramBot) runDownload(req *downloadRequest) {
 	rs.setProgressFactory(progressFactory)
 	defer rs.setProgressFactory(nil)
 
+	// Mid-rip Gofile flush: for multi-track rips, once accumulated files cross the
+	// configured threshold (default 20 GB) the launch loops pause, zip+upload that
+	// chunk to Gofile, and delete it to reclaim disk before continuing. Single
+	// tracks / MVs / artwork never accumulate enough to matter, so leave it off.
+	if rs != nil && !single {
+		rs.setFlush(ripFlushThresholdBytes(), func(ctx context.Context, paths []string, part int) error {
+			return b.flushChunkToGofile(chatID, paths, replyToID, part, status, ctx)
+		})
+	}
+
 	status.Update("Downloading", 0, 0)
 	err = fn(rctx)
 	// Download phase done (success or not): free the head slot so the scheduler can
@@ -2518,9 +2545,19 @@ func (b *TelegramBot) runDownload(req *downloadRequest) {
 
 	rs.setProgressFactory(nil)
 
-	paths := rs.snapshotPaths()
+	// remainderPaths is the tail not already delivered by a mid-rip flush. With no
+	// flushing it is every downloaded file, identical to before.
+	paths := rs.remainderPaths()
+	flushed := rs.flushedSomething()
 	ctr := rs.ctr()
 	if len(paths) == 0 {
+		// If chunks were already flushed to Gofile, an empty remainder means the rip
+		// fully delivered in parts — report success, not "no files".
+		if flushed {
+			status.UpdateSync(fmt.Sprintf("✅ Delivered in %d part(s) to Gofile.", rs.flushSeq), 0, 0)
+			status.Stop()
+			return
+		}
 		if summary := rs.failureSummary(); summary != "" {
 			status.UpdateSync("No files were downloaded: "+summary, 0, 0)
 			return
@@ -2530,6 +2567,15 @@ func (b *TelegramBot) runDownload(req *downloadRequest) {
 			return
 		}
 		status.UpdateSync("No files were downloaded.", 0, 0)
+		return
+	}
+
+	// Once any chunk has been flushed mid-rip, the whole (huge) rip is delivered via
+	// Gofile for consistency — force the leftover remainder to a Gofile ZIP too,
+	// regardless of the user's originally chosen transfer mode.
+	if flushed {
+		status.UpdateSync(fmt.Sprintf("Uploading final part %d to Gofile…", rs.flushSeq+1), 0, 0)
+		b.deliverGofileZip(chatID, paths, replyToID, false, status, rctx)
 		return
 	}
 
@@ -2964,6 +3010,37 @@ func (b *TelegramBot) deliverGofileZip(chatID int64, paths []string, replyToID i
 	defer os.Remove(zipPath)
 
 	b.deliverGofileZipFromPath(chatID, zipPath, displayName, replyToID, status, ctx)
+}
+
+// flushChunkToGofile zips a mid-rip chunk and uploads it to Gofile as a numbered
+// "Part N", posting the link, but WITHOUT stopping the status board (the rip is
+// still running). It is the callback registered on RipState; checkpointFlush calls
+// it once the on-disk accumulation crosses the flush threshold, then deletes the
+// chunk's source files. Reuses createZipFromPaths + UploadToGofileAs.
+func (b *TelegramBot) flushChunkToGofile(chatID int64, paths []string, replyToID, part int, status *DownloadStatus, ctx context.Context) error {
+	if ctx != nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
+	thresholdGB := Config.RipFlushThresholdGB
+	if thresholdGB <= 0 {
+		thresholdGB = defaultRipFlushThresholdGB
+	}
+	if status != nil {
+		status.UpdateSync(fmt.Sprintf("Reached ~%d GB — uploading part %d to Gofile to free disk…", thresholdGB, part), 0, 0)
+	}
+	zipPath, base, err := createZipFromPaths(paths)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(zipPath)
+
+	name := strings.TrimSuffix(base, ".zip") + fmt.Sprintf(" (Part %d).zip", part)
+	link, err := apputils.UploadToGofileAs(ctx, zipPath, Config.GofileToken, name)
+	if err != nil {
+		return err
+	}
+	_ = b.sendMessageWithReply(chatID, fmt.Sprintf("📦 Part %d: %s\nDownload Link: %s", part, name, link), nil, replyToID)
+	return nil
 }
 
 // deliverGofileZipFromPath uploads a pre-created ZIP file to Gofile and sends the link.

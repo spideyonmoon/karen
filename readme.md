@@ -169,6 +169,12 @@ After `/dl`, the bot presents an inline keyboard (unless a headless flag is used
 - **Telegram ZIP** — MTProto upload up to 2GB
 - **Gofile ZIP** — fallback for oversized packages
 
+Very large rips (full discographies, hundred-track playlists) are flushed in parts:
+once the files on disk pass `rip-flush-threshold-gb` (default 20GB) mid-rip, that
+chunk is zipped, uploaded to Gofile as a numbered `… (Part N).zip` link, and deleted
+to free disk before the rip continues — so the bot never has to fit the whole rip on
+the VPS at once.
+
 ### Inline search
 
 ```
@@ -194,6 +200,7 @@ After `/dl`, the bot presents an inline keyboard (unless a headless flag is used
 | `telegram-api-id`           | MTProto API ID from my.telegram.org                          |
 | `telegram-api-hash`         | MTProto API hash from my.telegram.org                        |
 | `gofile-token`              | Gofile API token for fallback delivery                       |
+| `rip-flush-threshold-gb`    | Mid-rip disk cap (GB): once exceeded, the chunk is zipped to Gofile and deleted; continues in parts. `0`=default 20, negative=disable |
 | `song-file-format`          | Output filename template (e.g. `"{SongNumer}. {SongName}"`)  |
 | `album-folder-format`       | Album folder name template                                   |
 

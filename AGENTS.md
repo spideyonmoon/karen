@@ -50,6 +50,7 @@ cp .env.example .env
   1. Telegram Bot API — single tracks <50MB
   2. MTProto (`gotd/td`) — ZIP up to 2GB; session in `mtproto-session.json`
   3. Gofile — fallback for oversized packages
+- **Mid-rip Gofile flush** — for huge rips (discographies, big playlists) the track-launch loops in `main.go` (`ripAlbum`/`ripPlaylist`/`ripStation`) call `rs.checkpointFlush(ctx, wg.Wait)`: once accumulated files exceed `rip-flush-threshold-gb` (default 20, env `RIP_FLUSH_THRESHOLD_GB`, negative disables), it drains in-flight tracks, zips+uploads the chunk to Gofile as `… (Part N).zip`, and deletes the source files to free disk. Plumbing lives on `RipState` (`ripstate.go`); the callback is `flushChunkToGofile` in `telegram_bot.go`. Once any chunk flushes, the remainder is forced to Gofile too. Requires `task-concurrency` (per-rip `RipState`); off on the CLI/single-track path.
 - Bot API (long-polling `getUpdates`) for receiving messages; MTProto only for file uploads
 
 ## State & persistence (`bot/state/`)

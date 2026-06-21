@@ -66,6 +66,7 @@ telegram-max-file-mb: 50          # Max file size to send
 telegram-download-folder: ""      # Optional override for downloads
 telegram-cache-file: ""           # Optional cache file for Telegram file_id reuse
 telegram-download-max-gb: 3        # Cleanup threshold for Telegram download folder
+rip-flush-threshold-gb: 20         # Mid-rip: once accumulated files exceed this, zip+Gofile that chunk and free disk (0=default 20, negative=disable)
 telegram-request-timeout-seconds: 3600 # Telegram API request timeout, including large uploads
 # MTProto settings (required for direct Telegram upload of files >50MB, up to 2GB)
 telegram-api-id: 0            # Get from https://my.telegram.org/apps

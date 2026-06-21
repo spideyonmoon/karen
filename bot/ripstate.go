@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -76,6 +79,23 @@ type RipState struct {
 
 	// progressFactory builds the per-track progress callback for the status board.
 	progressFactory func(track *task.Track) apputils.ProgressFunc
+
+	// --- mid-rip Gofile flush ("checkpoint") -------------------------------
+	// When a rip's not-yet-delivered files on disk exceed flushThreshold bytes,
+	// the launch loop drains in-flight tracks and calls flush() to zip+upload that
+	// chunk to Gofile, then deletes the source files to reclaim disk before
+	// continuing. This bounds peak disk use for huge rips (full discographies,
+	// hundred-track playlists) that would otherwise have to land entirely on disk
+	// before the single final ZIP. flush is nil and flushThreshold <= 0 on the
+	// CLI / single-track / disabled paths, where checkpointFlush is a no-op.
+	flushMu        sync.Mutex
+	flushThreshold int64
+	flush          func(ctx context.Context, paths []string, part int) error
+	flushSeq       int        // chunks flushed so far (→ "Part N")
+	flushStart     int        // index into paths of the first not-yet-flushed file
+	measuredIdx    int        // paths[:measuredIdx] already summed into pendingBytes
+	pendingBytes   int64      // on-disk size of paths[flushStart:measuredIdx]
+	flushedAny     atomic.Bool
 }
 
 func newRipState() *RipState {
@@ -382,6 +402,168 @@ func (rs *RipState) snapshotPaths() []string {
 	rs.pathsMu.Lock()
 	defer rs.pathsMu.Unlock()
 	return append([]string{}, rs.paths...)
+}
+
+// --- mid-rip Gofile flush --------------------------------------------------
+
+// setFlush enables mid-rip flushing: once accumulated on-disk bytes cross
+// threshold, the launch loops call checkpointFlush, which drains in-flight tracks
+// and invokes fn to deliver that chunk. A threshold <= 0 or nil fn leaves flushing
+// disabled. Set once by runDownload before the download begins; never called on a
+// nil receiver (CLI / single-track paths simply never enable it).
+func (rs *RipState) setFlush(threshold int64, fn func(ctx context.Context, paths []string, part int) error) {
+	if rs == nil {
+		return
+	}
+	rs.flushMu.Lock()
+	rs.flushThreshold = threshold
+	rs.flush = fn
+	rs.flushMu.Unlock()
+}
+
+// flushedSomething reports whether at least one chunk was flushed mid-rip. When
+// true, runDownload forces the leftover remainder to Gofile too (the whole huge
+// rip arrives as a series of Gofile links). False on a nil receiver.
+func (rs *RipState) flushedSomething() bool {
+	if rs == nil {
+		return false
+	}
+	return rs.flushedAny.Load()
+}
+
+// remainderPaths returns the files not yet delivered by a mid-rip flush — i.e. the
+// tail accumulated since the last checkpoint. With no flushing it is every path, so
+// behavior is identical to snapshotPaths. A nil receiver falls back to the package
+// globals (CLI / flag-off), where flushing never runs.
+func (rs *RipState) remainderPaths() []string {
+	if rs == nil {
+		lastPathsMu.Lock()
+		defer lastPathsMu.Unlock()
+		return append([]string{}, lastDownloadedPaths...)
+	}
+	// Lock order is always flushMu → pathsMu; never hold both here.
+	rs.flushMu.Lock()
+	start := rs.flushStart
+	rs.flushMu.Unlock()
+	rs.pathsMu.Lock()
+	defer rs.pathsMu.Unlock()
+	if start < 0 || start > len(rs.paths) {
+		start = 0
+	}
+	return append([]string{}, rs.paths[start:]...)
+}
+
+// checkpointFlush is called at the top of each track-launch loop iteration. It is
+// cheap on the common path: it sums only the files added since the last call into a
+// running total and returns once that total is below the threshold. When the
+// threshold is crossed it calls drain (the loop's wg.Wait) so every in-flight track
+// finishes — guaranteeing no half-written file is zipped — then zips+uploads the
+// chunk via the injected flush callback, deletes those source files to reclaim
+// disk, and advances the cursor so the files are neither re-delivered nor
+// re-counted. No-op when flushing is disabled, on a nil receiver, or after ctx is
+// cancelled. On flush failure the files are kept (they roll into the final
+// delivery) and pendingBytes is reset so the next threshold's worth retries.
+func (rs *RipState) checkpointFlush(ctx context.Context, drain func()) {
+	if rs == nil {
+		return
+	}
+	rs.flushMu.Lock()
+	if rs.flush == nil || rs.flushThreshold <= 0 {
+		rs.flushMu.Unlock()
+		return
+	}
+	if ctx != nil && ctx.Err() != nil {
+		rs.flushMu.Unlock()
+		return
+	}
+
+	rs.measurePendingLocked()
+	if rs.pendingBytes < rs.flushThreshold {
+		rs.flushMu.Unlock()
+		return
+	}
+
+	// Over threshold: let in-flight downloads finish, then re-measure the files
+	// that completed during the drain so the chunk captures them too.
+	if drain != nil {
+		rs.flushMu.Unlock()
+		drain()
+		rs.flushMu.Lock()
+		// flush may have been cleared concurrently (defensive).
+		if rs.flush == nil {
+			rs.flushMu.Unlock()
+			return
+		}
+		rs.measurePendingLocked()
+	}
+
+	rs.pathsMu.Lock()
+	chunk := append([]string{}, rs.paths[rs.flushStart:]...)
+	chunkEnd := len(rs.paths)
+	rs.pathsMu.Unlock()
+
+	if len(chunk) == 0 {
+		rs.pendingBytes = 0
+		rs.flushMu.Unlock()
+		return
+	}
+
+	part := rs.flushSeq + 1
+	fn := rs.flush
+	rs.flushMu.Unlock()
+
+	err := fn(ctx, chunk, part)
+
+	rs.flushMu.Lock()
+	if err != nil {
+		fmt.Printf("mid-rip flush (part %d) failed, keeping files for final delivery: %v\n", part, err)
+		rs.pendingBytes = 0
+		rs.flushMu.Unlock()
+		return
+	}
+	// Delivered: drop the source files to reclaim disk, then advance cursors.
+	removeFlushedFiles(chunk)
+	rs.flushSeq = part
+	rs.flushStart = chunkEnd
+	rs.measuredIdx = chunkEnd
+	rs.pendingBytes = 0
+	rs.flushedAny.Store(true)
+	rs.flushMu.Unlock()
+}
+
+// measurePendingLocked sums the on-disk size of paths added since the last
+// measurement into pendingBytes, advancing measuredIdx. Caller holds flushMu.
+func (rs *RipState) measurePendingLocked() {
+	rs.pathsMu.Lock()
+	defer rs.pathsMu.Unlock()
+	if rs.measuredIdx < rs.flushStart {
+		rs.measuredIdx = rs.flushStart
+	}
+	for ; rs.measuredIdx < len(rs.paths); rs.measuredIdx++ {
+		if info, err := os.Stat(rs.paths[rs.measuredIdx]); err == nil && !info.IsDir() {
+			rs.pendingBytes += info.Size()
+		}
+	}
+}
+
+// removeFlushedFiles deletes the source files of a delivered chunk and prunes any
+// album directories left empty, reclaiming the disk the whole feature exists for.
+// Best-effort: failures are ignored (the periodic cache cleanup is the backstop).
+func removeFlushedFiles(paths []string) {
+	dirs := make(map[string]struct{})
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		if err := os.Remove(p); err == nil {
+			dirs[filepath.Dir(p)] = struct{}{}
+		}
+	}
+	for d := range dirs {
+		// os.Remove only succeeds on an already-empty dir, so this never deletes a
+		// folder that still holds undelivered files.
+		_ = os.Remove(d)
+	}
 }
 
 // --- downloaded meta ------------------------------------------------------
