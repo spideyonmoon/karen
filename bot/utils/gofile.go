@@ -19,9 +19,20 @@ type gofileResponse struct {
 }
 
 func UploadToGofile(ctx context.Context, filePath, token string) (string, error) {
+	return UploadToGofileAs(ctx, filePath, token, "")
+}
+
+// UploadToGofileAs uploads filePath to Gofile but presents it under uploadName,
+// so the link shows a human-friendly filename instead of the on-disk name (e.g. a
+// temp "amdl-1234567.zip"). An empty uploadName falls back to the file's basename.
+func UploadToGofileAs(ctx context.Context, filePath, token, uploadName string) (string, error) {
+	if uploadName == "" {
+		uploadName = filepath.Base(filePath)
+	}
+
 	// Try guest upload first
 	guestURL := "https://upload-ap-sgp.gofile.io/uploadFile"
-	downloadPage, err := uploadToGofileEndpoint(ctx, filePath, guestURL, "")
+	downloadPage, err := uploadToGofileEndpoint(ctx, filePath, guestURL, "", uploadName)
 	if err == nil {
 		return downloadPage, nil
 	}
@@ -29,7 +40,7 @@ func UploadToGofile(ctx context.Context, filePath, token string) (string, error)
 	// If guest upload fails and token is available, try authenticated upload
 	if token != "" {
 		authURL := "https://upload-ap-sgp.gofile.io/contents/uploadfile"
-		downloadPage, errAuth := uploadToGofileEndpoint(ctx, filePath, authURL, token)
+		downloadPage, errAuth := uploadToGofileEndpoint(ctx, filePath, authURL, token, uploadName)
 		if errAuth == nil {
 			return downloadPage, nil
 		}
@@ -39,7 +50,7 @@ func UploadToGofile(ctx context.Context, filePath, token string) (string, error)
 	return "", fmt.Errorf("gofile guest upload failed and no token provided: %w", err)
 }
 
-func uploadToGofileEndpoint(ctx context.Context, filePath, serverURL, token string) (string, error) {
+func uploadToGofileEndpoint(ctx context.Context, filePath, serverURL, token, uploadName string) (string, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return "", fmt.Errorf("failed to open file: %w", err)
@@ -54,7 +65,7 @@ func uploadToGofileEndpoint(ctx context.Context, filePath, serverURL, token stri
 	go func() {
 		defer pw.Close()
 		err := func() error {
-			part, err := writer.CreateFormFile("file", filepath.Base(filePath))
+			part, err := writer.CreateFormFile("file", uploadName)
 			if err != nil {
 				return fmt.Errorf("failed to create form file: %w", err)
 			}

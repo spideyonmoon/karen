@@ -2975,7 +2975,7 @@ func (b *TelegramBot) deliverGofileZipFromPath(chatID int64, zipPath string, dis
 		return
 	}
 	status.UpdateSync("Uploading to Gofile...", 0, 0)
-	downloadLink, err := apputils.UploadToGofile(ctx, zipPath, Config.GofileToken)
+	downloadLink, err := apputils.UploadToGofileAs(ctx, zipPath, Config.GofileToken, displayName)
 	if err != nil {
 		b.reportDeliveryFailure(chatID, replyToID, status, err)
 		return
