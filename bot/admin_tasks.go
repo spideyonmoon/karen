@@ -76,6 +76,22 @@ type UserPrefs struct {
 	UpdatedAtUnix  int64  `json:"updated_at_unix"`
 }
 
+// UserStats is a single user's lifetime usage tally, kept alongside (but separate
+// from) their UserPrefs so that tapping "Reset" in /profile wipes preferences
+// without erasing the usage history. Every field is a monotonic counter that only
+// ever grows; zero values mean "never did that yet". Keyed by Telegram user ID,
+// persisted in telegram-state.json and swept into the daily admin backup.
+type UserStats struct {
+	TotalCommands int64 `json:"total_commands"` // every recognized command issued
+	AlbumRips     int64 `json:"album_rips"`     // /dl album links
+	ArtistRips    int64 `json:"artist_rips"`    // /dl artist links (any scope)
+	PlaylistRips  int64 `json:"playlist_rips"`  // /dl playlist links
+	SongRips      int64 `json:"song_rips"`      // /dl single-song links
+	Cancels       int64 `json:"cancels"`        // /stop_* + /cancel_* they issued
+	FirstSeenUnix int64 `json:"first_seen_unix"`
+	LastSeenUnix  int64 `json:"last_seen_unix"`
+}
+
 // telegramStateFile is the IMPORTANT, DM-backed-up state: the admin lock and
 // every user's saved /profile. ScheduledJobs is retained only for one-time
 // backward-compat reading of pre-split telegram-state.json files (it is no
@@ -85,6 +101,7 @@ type telegramStateFile struct {
 	AdminLock        bool                 `json:"admin_lock"`
 	ScheduledJobs    []*scheduledJob      `json:"scheduled_jobs,omitempty"`
 	UserPrefs        map[int64]*UserPrefs `json:"user_prefs"`
+	UserStats        map[int64]*UserStats `json:"user_stats,omitempty"`
 	BlockedUserIDs   []int64              `json:"blocked_user_ids,omitempty"`
 	BlockedUsernames []string             `json:"blocked_usernames,omitempty"`
 }
@@ -98,6 +115,7 @@ func (b *TelegramBot) stateFilePayloadLocked() telegramStateFile {
 		Version:   1,
 		AdminLock: b.adminLock,
 		UserPrefs: b.userPrefs,
+		UserStats: b.userStats,
 	}
 	for id := range b.blockedUserIDs {
 		payload.BlockedUserIDs = append(payload.BlockedUserIDs, id)
@@ -124,6 +142,7 @@ func (b *TelegramBot) loadState() {
 	b.adminLock = false
 	b.scheduledJobs = nil
 	b.userPrefs = make(map[int64]*UserPrefs)
+	b.userStats = make(map[int64]*UserStats)
 	b.blockedUserIDs = make(map[int64]bool)
 	b.blockedUsernames = make(map[string]bool)
 	if b.stateFile == "" {
@@ -143,6 +162,9 @@ func (b *TelegramBot) loadState() {
 	b.scheduledJobs = payload.ScheduledJobs
 	if payload.UserPrefs != nil {
 		b.userPrefs = payload.UserPrefs
+	}
+	if payload.UserStats != nil {
+		b.userStats = payload.UserStats
 	}
 	for _, id := range payload.BlockedUserIDs {
 		if id != 0 {
@@ -271,6 +293,42 @@ func (b *TelegramBot) setPrefs(userID int64, mutate func(*UserPrefs)) {
 	}
 	mutate(p)
 	p.UpdatedAtUnix = time.Now().Unix()
+	b.saveStateLocked()
+}
+
+// getStats returns a copy of userID's lifetime usage tally, or a zero-value
+// UserStats (all counters 0) when the user has never been seen. A copy is returned
+// so callers can read it without holding stateMu.
+func (b *TelegramBot) getStats(userID int64) UserStats {
+	b.stateMu.Lock()
+	defer b.stateMu.Unlock()
+	if s, ok := b.userStats[userID]; ok && s != nil {
+		return *s
+	}
+	return UserStats{}
+}
+
+// bumpStats mutates userID's usage tally under stateMu via the supplied callback,
+// stamps LastSeenUnix (and FirstSeenUnix on the row's first creation), and persists
+// the state file. The row is created on first use. A zero userID or nil mutate is a
+// no-op. CALLER MUST NOT hold stateMu or queueMu (this takes stateMu, the leaf lock).
+func (b *TelegramBot) bumpStats(userID int64, mutate func(*UserStats)) {
+	if userID == 0 || mutate == nil {
+		return
+	}
+	now := time.Now().Unix()
+	b.stateMu.Lock()
+	defer b.stateMu.Unlock()
+	if b.userStats == nil {
+		b.userStats = make(map[int64]*UserStats)
+	}
+	s := b.userStats[userID]
+	if s == nil {
+		s = &UserStats{FirstSeenUnix: now}
+		b.userStats[userID] = s
+	}
+	mutate(s)
+	s.LastSeenUnix = now
 	b.saveStateLocked()
 }
 
@@ -610,6 +668,7 @@ func (b *TelegramBot) cancelScheduledJob(chatID, userID int64, jobID string, rep
 	b.scheduledJobs = append(b.scheduledJobs[:idx], b.scheduledJobs[idx+1:]...)
 	b.saveScheduleLocked()
 	b.stateMu.Unlock()
+	b.bumpStats(userID, func(s *UserStats) { s.Cancels++ })
 	_ = b.sendMessageWithReply(chatID, fmt.Sprintf("❌ Cancelled scheduled task %s.", jobID), nil, replyToID)
 }
 

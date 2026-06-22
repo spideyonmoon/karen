@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // =============================================================================
@@ -67,7 +68,7 @@ func profileKey(chatID int64, messageID int) string {
 // they can operate its buttons.
 func (b *TelegramBot) handleProfileCommand(chatID int64, userID int64, replyToID int) {
 	prefs := b.getPrefs(userID)
-	rich, plain := b.renderProfile("root", prefs)
+	rich, plain := b.renderProfile("root", prefs, b.getStats(userID))
 	markup := b.profileMarkup("root", prefs)
 	res, err := b.sendRichMessage(chatID, rich, plain, markup, replyToID)
 	if err != nil || res.messageID == 0 {
@@ -128,13 +129,13 @@ func (b *TelegramBot) handleProfileCallback(cb *CallbackQuery, data string, clic
 		delete(b.profileOwners, profileKey(chatID, messageID))
 		b.profileMu.Unlock()
 		prefs := b.getPrefs(clickerID)
-		rich, plain := b.renderProfile("done", prefs)
+		rich, plain := b.renderProfile("done", prefs, b.getStats(clickerID))
 		_, _ = b.editMessageRich(chatID, messageID, rich, plain, nil)
 		return ""
 	}
 
 	prefs := b.getPrefs(clickerID)
-	rich, plain := b.renderProfile(panel, prefs)
+	rich, plain := b.renderProfile(panel, prefs, b.getStats(clickerID))
 	markup := b.profileMarkup(panel, prefs)
 	_, _ = b.editMessageRich(chatID, messageID, rich, plain, markup)
 	return ""
@@ -235,8 +236,9 @@ func togglePtr(b *bool) *bool {
 // Rendering
 // =============================================================================
 
-// renderProfile builds the rich Markdown and plain-text fallback for a panel.
-func (b *TelegramBot) renderProfile(panel string, p UserPrefs) (rich, plain string) {
+// renderProfile builds the rich Markdown and plain-text fallback for a panel. The
+// root card also carries the user's lifetime usage box (stats); sub-panels ignore it.
+func (b *TelegramBot) renderProfile(panel string, p UserPrefs, stats UserStats) (rich, plain string) {
 	var rb, pb strings.Builder
 	switch panel {
 	case "done":
@@ -261,9 +263,11 @@ func (b *TelegramBot) renderProfile(panel string, p UserPrefs) (rich, plain stri
 		rb.WriteString("# ⚙︎ Your rip profile\n")
 		rb.WriteString("Tap a category to change it. Unset values follow the bot defaults.\n")
 		rb.WriteString(profileCompactRich(p))
+		rb.WriteString(usageBoxRich(stats))
 		pb.WriteString("⚙︎ Your rip profile\n")
 		pb.WriteString("Tap a category to change it. Unset values follow the bot defaults.\n")
 		pb.WriteString(profileCompactPlain(p))
+		pb.WriteString(usageBoxPlain(stats))
 		return rb.String(), pb.String()
 	}
 }
@@ -314,6 +318,45 @@ func profileCompactPlain(p UserPrefs) string {
 		fmt.Fprintf(&b, "%s  %s\n", g.icon, g.line)
 	}
 	return b.String()
+}
+
+// usageBoxRich renders the user's lifetime usage tally as a compact table appended
+// under the root profile card. A brand-new user (all zeroes) still gets the box so
+// the layout is stable; FirstSeenUnix is 0 until their first command lands.
+func usageBoxRich(s UserStats) string {
+	var b strings.Builder
+	b.WriteString("\n## 📊 Your usage\n")
+	b.WriteString("| Activity | Count |\n|:---------|------:|\n")
+	fmt.Fprintf(&b, "| Commands | %d |\n", s.TotalCommands)
+	fmt.Fprintf(&b, "| Album rips | %d |\n", s.AlbumRips)
+	fmt.Fprintf(&b, "| Artist rips | %d |\n", s.ArtistRips)
+	fmt.Fprintf(&b, "| Playlist rips | %d |\n", s.PlaylistRips)
+	fmt.Fprintf(&b, "| Song rips | %d |\n", s.SongRips)
+	fmt.Fprintf(&b, "| Cancels | %d |\n", s.Cancels)
+	if s.FirstSeenUnix > 0 {
+		fmt.Fprintf(&b, "\n_First seen %s_\n", escapeRichMD(usageDate(s.FirstSeenUnix)))
+	}
+	return b.String()
+}
+
+func usageBoxPlain(s UserStats) string {
+	var b strings.Builder
+	b.WriteString("\n📊 Your usage\n")
+	fmt.Fprintf(&b, "Commands: %d\n", s.TotalCommands)
+	fmt.Fprintf(&b, "Album rips: %d\n", s.AlbumRips)
+	fmt.Fprintf(&b, "Artist rips: %d\n", s.ArtistRips)
+	fmt.Fprintf(&b, "Playlist rips: %d\n", s.PlaylistRips)
+	fmt.Fprintf(&b, "Song rips: %d\n", s.SongRips)
+	fmt.Fprintf(&b, "Cancels: %d\n", s.Cancels)
+	if s.FirstSeenUnix > 0 {
+		fmt.Fprintf(&b, "First seen %s\n", usageDate(s.FirstSeenUnix))
+	}
+	return b.String()
+}
+
+// usageDate formats a unix timestamp as a short Dhaka-local date for the usage box.
+func usageDate(unix int64) string {
+	return time.Unix(unix, 0).In(dhakaZone).Format("Jan 2, 2006")
 }
 
 type profileGroup struct {

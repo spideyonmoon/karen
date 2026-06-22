@@ -182,6 +182,7 @@ type TelegramBot struct {
 	adminLock     bool                 // true => only admins may use the bot (persisted)
 	scheduledJobs []*scheduledJob      // pending sleeptime rips (persisted)
 	userPrefs     map[int64]*UserPrefs // saved per-user rip profiles (persisted, keyed by user ID)
+	userStats     map[int64]*UserStats // per-user lifetime usage tally (persisted, keyed by user ID)
 
 	// Per-user bans (admin /unauth <id>): a user is blocked if their ID is in
 	// blockedUserIDs OR their (lowercased) @username is in blockedUsernames. Both
@@ -1522,6 +1523,9 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, username string,
 		_ = b.sendMessageWithReply(chatID, "The bot is currently restricted to admins.", nil, replyToID)
 		return
 	}
+	// Tally every command the user is allowed to run (incl. /stop_*, /cancel_*).
+	// Rip-type and cancel counters below add to this on top of the command count.
+	b.bumpStats(userID, func(s *UserStats) { s.TotalCommands++ })
 	if strings.HasPrefix(cmd, "stop_") {
 		taskID := strings.TrimPrefix(cmd, "stop_")
 		b.cancelTask(chatID, userID, taskID, replyToID)
@@ -1683,6 +1687,7 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, username string,
 			}
 		}
 		if songID != "" {
+			b.bumpStats(userID, func(s *UserStats) { s.SongRips++ })
 			if headlessMode != "" {
 				format := b.resolveFormat(chatID, forceFlac)
 				if forceNoCache || !b.trySendCachedTrack(chatID, replyToID, songID, format) {
@@ -1706,6 +1711,7 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, username string,
 
 		_, albumID := checkUrl(link)
 		if albumID != "" {
+			b.bumpStats(userID, func(s *UserStats) { s.AlbumRips++ })
 			if headlessMode != "" {
 				b.enqueueAlbumDownload(chatID, albumID, replyToID, 0, headlessMode, forceAAC, forceAtmos, forceFlac, forceNoCache, userID, "")
 			} else {
@@ -1716,6 +1722,7 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, username string,
 
 		playlistStorefront, playlistID := checkUrlPlaylist(link)
 		if playlistID != "" {
+			b.bumpStats(userID, func(s *UserStats) { s.PlaylistRips++ })
 			if b.isAdmin(userID) {
 				// Admins bypass the >100-track sleeptime gate entirely.
 				b.dispatchPlaylistNormal(chatID, userID, playlistID, replyToID, headlessMode, forceAAC, forceAtmos, forceFlac, forceNoCache)
@@ -1739,6 +1746,7 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, username string,
 
 		artistStorefront, artistID := checkUrlArtist(link)
 		if artistID != "" {
+			b.bumpStats(userID, func(s *UserStats) { s.ArtistRips++ })
 			sel := &pendingArtistSel{
 				chatID:     chatID,
 				userID:     userID,
@@ -6899,6 +6907,7 @@ func (b *TelegramBot) cancelTask(chatID int64, issuerID int64, taskID string, re
 			b.activeReq.cancel()
 		}
 		b.queueMu.Unlock()
+		b.bumpStats(issuerID, func(s *UserStats) { s.Cancels++ })
 		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("⛔ Task %s stopped.", taskID), nil, replyToID)
 		return
 	}
@@ -6914,6 +6923,7 @@ func (b *TelegramBot) cancelTask(chatID int64, issuerID int64, taskID string, re
 			b.schedBorrowReq.cancel()
 		}
 		b.queueMu.Unlock()
+		b.bumpStats(issuerID, func(s *UserStats) { s.Cancels++ })
 		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("⛔ Task %s stopped.", taskID), nil, replyToID)
 		return
 	}
@@ -6931,6 +6941,7 @@ func (b *TelegramBot) cancelTask(chatID int64, issuerID int64, taskID string, re
 			req.cancel()
 		}
 		b.queueMu.Unlock()
+		b.bumpStats(issuerID, func(s *UserStats) { s.Cancels++ })
 		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("⛔ Task %s stopped.", taskID), nil, replyToID)
 		return
 	}
@@ -6971,6 +6982,7 @@ drain:
 	b.queueMu.Unlock()
 	switch {
 	case found:
+		b.bumpStats(issuerID, func(s *UserStats) { s.Cancels++ })
 		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("⛔ Queued task %s stopped.", taskID), nil, replyToID)
 	case denied:
 		_ = b.sendMessageWithReply(chatID, notYours, nil, replyToID)
