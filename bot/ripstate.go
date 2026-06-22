@@ -90,7 +90,7 @@ type RipState struct {
 	// CLI / single-track / disabled paths, where checkpointFlush is a no-op.
 	flushMu        sync.Mutex
 	flushThreshold int64
-	flush          func(ctx context.Context, paths []string, part int) error
+	flush          func(ctx context.Context, paths []string, part int, label string) error
 	flushSeq       int        // chunks flushed so far (→ "Part N")
 	flushStart     int        // index into paths of the first not-yet-flushed file
 	measuredIdx    int        // paths[:measuredIdx] already summed into pendingBytes
@@ -411,7 +411,7 @@ func (rs *RipState) snapshotPaths() []string {
 // and invokes fn to deliver that chunk. A threshold <= 0 or nil fn leaves flushing
 // disabled. Set once by runDownload before the download begins; never called on a
 // nil receiver (CLI / single-track paths simply never enable it).
-func (rs *RipState) setFlush(threshold int64, fn func(ctx context.Context, paths []string, part int) error) {
+func (rs *RipState) setFlush(threshold int64, fn func(ctx context.Context, paths []string, part int, label string) error) {
 	if rs == nil {
 		return
 	}
@@ -512,7 +512,9 @@ func (rs *RipState) checkpointFlush(ctx context.Context, drain func()) {
 	fn := rs.flush
 	rs.flushMu.Unlock()
 
-	err := fn(ctx, chunk, part)
+	// Empty label → flushChunkToGofile uses its "Part N" naming (the byte-threshold
+	// valve). Release-boundary flushes pass an album name instead.
+	err := fn(ctx, chunk, part, "")
 
 	rs.flushMu.Lock()
 	if err != nil {
@@ -529,6 +531,60 @@ func (rs *RipState) checkpointFlush(ctx context.Context, drain func()) {
 	rs.pendingBytes = 0
 	rs.flushedAny.Store(true)
 	rs.flushMu.Unlock()
+}
+
+// flushReleaseBoundary delivers everything accumulated since the last checkpoint as
+// one labeled chunk, regardless of the byte threshold — used to ship each artist
+// release as its own ZIP the moment its rip finishes. The caller must ensure the
+// release's tracks are already on disk (ripAlbum returns synchronously), so unlike
+// checkpointFlush there is no in-flight drain. It shares flushStart with the 20 GB
+// valve, so the two never double-deliver a file; if the valve already flushed part
+// of this release mid-rip, only the tail since then is shipped here. No-op when
+// flushing was never enabled, the receiver is nil, ctx is cancelled, or nothing new
+// accumulated. On flush failure the files are kept (they roll into the final
+// remainder delivery) and the error is returned for logging.
+func (rs *RipState) flushReleaseBoundary(ctx context.Context, label string) error {
+	if rs == nil {
+		return nil
+	}
+	rs.flushMu.Lock()
+	if rs.flush == nil {
+		rs.flushMu.Unlock()
+		return nil
+	}
+	if ctx != nil && ctx.Err() != nil {
+		rs.flushMu.Unlock()
+		return ctx.Err()
+	}
+	rs.pathsMu.Lock()
+	start := rs.flushStart
+	if start < 0 || start > len(rs.paths) {
+		start = 0
+	}
+	chunk := append([]string{}, rs.paths[start:]...)
+	chunkEnd := len(rs.paths)
+	rs.pathsMu.Unlock()
+	if len(chunk) == 0 {
+		rs.flushMu.Unlock()
+		return nil
+	}
+	part := rs.flushSeq + 1
+	fn := rs.flush
+	rs.flushMu.Unlock()
+
+	if err := fn(ctx, chunk, part, label); err != nil {
+		return err
+	}
+
+	rs.flushMu.Lock()
+	removeFlushedFiles(chunk)
+	rs.flushSeq = part
+	rs.flushStart = chunkEnd
+	rs.measuredIdx = chunkEnd
+	rs.pendingBytes = 0
+	rs.flushedAny.Store(true)
+	rs.flushMu.Unlock()
+	return nil
 }
 
 // measurePendingLocked sums the on-disk size of paths added since the last

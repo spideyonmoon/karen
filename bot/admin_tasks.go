@@ -310,6 +310,13 @@ const (
 	sleepWindowEndMin   = 6 * 60    // 06:00
 )
 
+// scheduledReleaseStagger spaces out the dispatch of jobs that all come due in the
+// same tick (e.g. everything queued for the 02:30 window). Without it, N jobs fire
+// their "🌙 Sleeptime reached" message + enqueue in the same instant — a guaranteed
+// FloodWait once N grows. The rips themselves still run via the normal serialized
+// queue; this only trickles out the releases.
+const scheduledReleaseStagger = 5 * time.Second
+
 // inSleepWindow reports whether t (converted to Dhaka local) is within
 // [02:30, 06:00).
 func inSleepWindow(t time.Time) bool {
@@ -367,7 +374,10 @@ func (b *TelegramBot) releaseDueJobs() {
 		b.saveScheduleLocked()
 	}
 	b.stateMu.Unlock()
-	for _, j := range due {
+	for i, j := range due {
+		if i > 0 {
+			time.Sleep(scheduledReleaseStagger) // trickle releases to dodge FloodWait
+		}
 		b.releaseJob(j)
 	}
 }
@@ -606,8 +616,9 @@ func artistScopeFor(key string) (artistScope, bool) {
 
 // runArtistRipScoped enumerates one section of an artist's catalog (the whole
 // discography, full albums, singles/EPs, or music videos) and enqueues it as
-// Gofile delivery. Album sections honor the user's ArtistZip profile pref
-// (per-release N links vs one combined ZIP); music videos are queued per item.
+// Gofile delivery. Album sections always go out as ONE job (a single queue slot);
+// the user's ArtistZip pref picks per-release ZIPs (default) vs one combined ZIP.
+// Music videos are queued per item.
 //
 // Blocks on network (section enumeration) — call in a goroutine from the update
 // loop.
@@ -635,12 +646,12 @@ func (b *TelegramBot) runArtistRipScoped(chatID, userID int64, username, storefr
 		return
 	}
 
-	combined := userID != 0 && b.getPrefs(userID).ArtistZip == "combined"
-	if combined {
-		b.runArtistRipCombined(chatID, userID, username, storefront, artistID, items, replyToID, forceAAC, forceAtmos, forceFlac, scope.label)
-	} else {
-		b.runArtistRipPerRelease(chatID, userID, username, items, replyToID, forceAAC, forceAtmos, forceFlac, scope.label)
-	}
+	// Always ONE job (one queue slot / board row / /stop) — never a per-release queue
+	// fan-out, which was the source of the 02:30 flood + silent drops. The user's
+	// ArtistZip pref now only picks the delivery shape: "combined" = one ZIP for the
+	// whole discography; anything else (the default) = one ZIP per release.
+	perRelease := !(userID != 0 && b.getPrefs(userID).ArtistZip == "combined")
+	b.runArtistRip(chatID, userID, username, storefront, artistID, items, replyToID, forceAAC, forceAtmos, forceFlac, scope.label, perRelease)
 }
 
 // runArtistMusicVideos queues each of an artist's music videos as a direct
@@ -657,32 +668,25 @@ func (b *TelegramBot) runArtistMusicVideos(chatID, userID int64, storefront stri
 	_ = b.sendMessageWithReply(chatID, fmt.Sprintf("📺 Queued %d music video(s) (Gofile).", queued), nil, replyToID)
 }
 
-// runArtistRipPerRelease is the default: one queue slot per release.
-func (b *TelegramBot) runArtistRipPerRelease(chatID, userID int64, username string, albums []ampapi.ArtistSectionItem, replyToID int, forceAAC, forceAtmos, forceFlac bool, label string) {
-	queued := 0
-	for _, alb := range albums {
-		if alb.ID == "" {
-			continue
-		}
-		if !b.enqueueAlbumDownloadChecked(chatID, alb.ID, replyToID, transferModeGofileZip, forceAAC, forceAtmos, forceFlac, userID, username) {
-			_ = b.sendMessageWithReply(chatID, fmt.Sprintf(
-				"⚠️ Download queue is full — queued %d of %d release(s). Re-send later for the rest.",
-				queued, len(albums)), nil, replyToID)
-			return
-		}
-		queued++
-	}
-	_ = b.sendMessageWithReply(chatID, fmt.Sprintf("📀 Queued %d release(s) from %s (Gofile ZIP).", queued, label), nil, replyToID)
-}
-
-// runArtistRipCombined enqueues one download request that iterates every release
-// sequentially. All tracks accumulate in the same RipState, so delivery creates
-// a single combined ZIP uploaded to Gofile.
-func (b *TelegramBot) runArtistRipCombined(chatID, userID int64, username, storefront, artistID string, albums []ampapi.ArtistSectionItem, replyToID int, forceAAC, forceAtmos, forceFlac bool, label string) {
+// runArtistRip enqueues ONE download job that rips an artist's releases sequentially.
+// It is always a single queue slot / board row / /stop — never a per-release fan-out.
+// perRelease picks the delivery shape:
+//   - true  : ship each release as its own Gofile ZIP (one link per album) the moment
+//             its rip finishes, reclaiming that release's disk before the next.
+//   - false : accumulate every release and deliver one combined Gofile ZIP at the end.
+//
+// The 20 GB byte-threshold valve stays active underneath either way (runDownload
+// enables it for every multi-track rip), composing through the shared flush cursor:
+// whatever unit would exceed the threshold (a single release when per-release, or the
+// whole discography when combined) is flushed in "Part N" chunks mid-rip so disk never
+// spikes. If task-concurrency is off (rs == nil) flushing is unavailable, so
+// per-release degrades to one final combined ZIP.
+func (b *TelegramBot) runArtistRip(chatID, userID int64, username, storefront, artistID string, albums []ampapi.ArtistSectionItem, replyToID int, forceAAC, forceAtmos, forceFlac bool, label string, perRelease bool) {
 	format := b.resolveFormat(chatID, forceFlac)
 	ok := b.enqueueDownloadWithAfter(chatID, userID, username, replyToID, 0, false, format, transferModeGofileZip, "artist:"+artistID, false, func(ctx context.Context) error {
+		rs := ripStateFrom(ctx)
 		if forceAtmos {
-			if rs := ripStateFrom(ctx); rs != nil {
+			if rs != nil {
 				rs.Atmos = true
 			} else {
 				dl_atmos = true
@@ -696,34 +700,29 @@ func (b *TelegramBot) runArtistRipCombined(chatID, userID int64, username, store
 				continue
 			}
 			if err := ripAlbum(alb.ID, b.appleToken, storefront, "", forceAAC, ctx); err != nil {
-				fmt.Printf("Artist combined rip: release %d/%d (%s) failed: %v\n", i+1, len(albums), alb.ID, err)
+				fmt.Printf("Artist rip: release %d/%d (%s) failed: %v\n", i+1, len(albums), alb.ID, err)
+			}
+			if perRelease {
+				// Ship this release as its own ZIP and reclaim its disk before the next.
+				relName := alb.Name
+				if relName == "" {
+					relName = fmt.Sprintf("Release %d", i+1)
+				}
+				if err := rs.flushReleaseBoundary(ctx, relName); err != nil {
+					fmt.Printf("Artist rip: delivering release %q failed, folding into final delivery: %v\n", relName, err)
+				}
 			}
 		}
 		return nil
 	}, nil)
-	if ok {
-		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("📀 Queued %s (%d releases → combined ZIP).", label, len(albums)), nil, replyToID)
+	if !ok {
+		return
 	}
-}
-
-// enqueueAlbumDownloadChecked mirrors enqueueAlbumDownload but returns whether
-// the album was accepted onto the queue (false == queue full), so the artist
-// fan-out can stop cleanly instead of silently dropping albums.
-func (b *TelegramBot) enqueueAlbumDownloadChecked(chatID int64, albumID string, replyToID int, transferMode string, forceAAC, forceAtmos, forceFlac bool, userID int64, username string) bool {
-	if albumID == "" {
-		return true
+	if perRelease {
+		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("📀 Queued %s (%d releases → one Gofile ZIP per album).", label, len(albums)), nil, replyToID)
+	} else {
+		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("📀 Queued %s (%d releases → one combined Gofile ZIP).", label, len(albums)), nil, replyToID)
 	}
-	format := b.resolveFormat(chatID, forceFlac)
-	return b.enqueueDownloadWithAfter(chatID, userID, username, replyToID, 0, false, format, transferMode, albumID, false, func(ctx context.Context) error {
-		if forceAtmos {
-			if rs := ripStateFrom(ctx); rs != nil {
-				rs.Atmos = true
-			} else {
-				dl_atmos = true
-			}
-		}
-		return ripAlbum(albumID, b.appleToken, Config.Storefront, "", forceAAC, ctx)
-	}, nil)
 }
 
 // playlistSleeptimeThreshold is the track count above which a non-admin's

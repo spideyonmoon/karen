@@ -32,7 +32,7 @@ import (
 
 const (
 	defaultSearchLimit           = 8
-	defaultQueueSize             = 20
+	defaultQueueSize             = 200
 	pendingTTL                   = 10 * time.Minute
 	defaultTelegramFormat        = "alac"
 	defaultTelegramDownloadMaxGB = 3
@@ -2653,8 +2653,8 @@ func (b *TelegramBot) runDownload(req *downloadRequest) {
 	// chunk to Gofile, and delete it to reclaim disk before continuing. Single
 	// tracks / MVs / artwork never accumulate enough to matter, so leave it off.
 	if rs != nil && !single {
-		rs.setFlush(ripFlushThresholdBytes(), func(ctx context.Context, paths []string, part int) error {
-			return b.flushChunkToGofile(chatID, paths, replyToID, part, status, ctx)
+		rs.setFlush(ripFlushThresholdBytes(), func(ctx context.Context, paths []string, part int, label string) error {
+			return b.flushChunkToGofile(chatID, paths, replyToID, part, label, status, ctx)
 		})
 	}
 
@@ -3027,7 +3027,7 @@ func (b *TelegramBot) deliverTelegramZip(chatID int64, paths []string, replyToID
 	}
 	zipPath, displayName, err := createZipFromPaths(paths)
 	if err != nil {
-		status.UpdateSync(fmt.Sprintf("Failed to create ZIP: %v", err), 0, 0)
+		b.reportDeliveryFailure(chatID, replyToID, status, err)
 		return
 	}
 	defer os.Remove(zipPath)
@@ -3133,7 +3133,7 @@ func (b *TelegramBot) deliverGofileZip(chatID int64, paths []string, replyToID i
 	}
 	zipPath, displayName, err := createZipFromPaths(paths)
 	if err != nil {
-		status.UpdateSync(fmt.Sprintf("Failed to create ZIP: %v", err), 0, 0)
+		b.reportDeliveryFailure(chatID, replyToID, status, err)
 		return
 	}
 	defer os.Remove(zipPath)
@@ -3141,21 +3141,30 @@ func (b *TelegramBot) deliverGofileZip(chatID int64, paths []string, replyToID i
 	b.deliverGofileZipFromPath(chatID, zipPath, displayName, replyToID, status, ctx)
 }
 
-// flushChunkToGofile zips a mid-rip chunk and uploads it to Gofile as a numbered
-// "Part N", posting the link, but WITHOUT stopping the status board (the rip is
-// still running). It is the callback registered on RipState; checkpointFlush calls
-// it once the on-disk accumulation crosses the flush threshold, then deletes the
-// chunk's source files. Reuses createZipFromPaths + UploadToGofileAs.
-func (b *TelegramBot) flushChunkToGofile(chatID int64, paths []string, replyToID, part int, status *DownloadStatus, ctx context.Context) error {
+// flushChunkToGofile zips an accumulated chunk and uploads it to Gofile WITHOUT
+// stopping the status board (the rip is still running). It is the callback
+// registered on RipState. Two callers, distinguished by label:
+//   - label == "" : the 20 GB byte-threshold valve (checkpointFlush) — the ZIP is
+//     named "<album> (Part N).zip" and announced as a disk-freeing part.
+//   - label != "" : an artist release boundary (flushReleaseBoundary) — the ZIP is
+//     named after the release ("<label>.zip") so each album arrives as its own link.
+//
+// Either way it deletes the chunk's source files afterward (via the caller) and
+// reuses createZipFromPaths + UploadToGofileAs.
+func (b *TelegramBot) flushChunkToGofile(chatID int64, paths []string, replyToID, part int, label string, status *DownloadStatus, ctx context.Context) error {
 	if ctx != nil && ctx.Err() != nil {
 		return ctx.Err()
 	}
-	thresholdGB := Config.RipFlushThresholdGB
-	if thresholdGB <= 0 {
-		thresholdGB = defaultRipFlushThresholdGB
-	}
 	if status != nil {
-		status.UpdateSync(fmt.Sprintf("Reached ~%d GB — uploading part %d to Gofile to free disk…", thresholdGB, part), 0, 0)
+		if label != "" {
+			status.UpdateSync(fmt.Sprintf("Uploading %s to Gofile…", label), 0, 0)
+		} else {
+			thresholdGB := Config.RipFlushThresholdGB
+			if thresholdGB <= 0 {
+				thresholdGB = defaultRipFlushThresholdGB
+			}
+			status.UpdateSync(fmt.Sprintf("Reached ~%d GB — uploading part %d to Gofile to free disk…", thresholdGB, part), 0, 0)
+		}
 	}
 	zipPath, base, err := createZipFromPaths(paths)
 	if err != nil {
@@ -3164,11 +3173,16 @@ func (b *TelegramBot) flushChunkToGofile(chatID int64, paths []string, replyToID
 	defer os.Remove(zipPath)
 
 	name := strings.TrimSuffix(base, ".zip") + fmt.Sprintf(" (Part %d).zip", part)
+	announce := fmt.Sprintf("📦 Part %d: %s", part, name)
+	if label != "" {
+		name = forbiddenNames.ReplaceAllString(label, "_") + ".zip"
+		announce = "📦 " + label
+	}
 	link, err := apputils.UploadToGofileAs(ctx, zipPath, Config.GofileToken, name)
 	if err != nil {
 		return err
 	}
-	_ = b.sendMessageWithReply(chatID, fmt.Sprintf("📦 Part %d: %s\nDownload Link: %s", part, name, link), nil, replyToID)
+	_ = b.sendMessageWithReply(chatID, fmt.Sprintf("%s\nDownload Link: %s", announce, link), nil, replyToID)
 	return nil
 }
 
@@ -3591,12 +3605,36 @@ func scanDownloadFolder(root string, cacheFile string) (int64, []downloadFileEnt
 	return totalSize, entries, nil
 }
 
+// zipBuildSem serializes ZIP creation to a single concurrent build. With
+// task-concurrency on, deliveries run detached, so two huge rips could otherwise
+// build multi-GB ZIPs at the same time and spike disk usage hard enough to fill the
+// container fs (the most likely cause of the 02:30 stall + the host dying). One at a
+// time keeps the peak temp footprint to a single ZIP.
+var zipBuildSem = make(chan struct{}, 1)
+
+// zipTempDir returns a directory on the roomy /downloads bind mount for the temp ZIP,
+// so a multi-GB build lands on the same large filesystem as the source files instead
+// of the container overlay's /tmp (a small overlay that fills and kills the build).
+// Empty string falls back to the OS temp dir, which os.CreateTemp handles.
+func zipTempDir() string {
+	if Config.AlacSaveFolder == "" {
+		return ""
+	}
+	dir := filepath.Dir(Config.AlacSaveFolder)
+	if dir == "." || dir == "" {
+		return ""
+	}
+	return dir
+}
+
 func createZipFromPaths(paths []string) (string, string, error) {
 	if len(paths) == 0 {
 		return "", "", fmt.Errorf("no files to zip")
 	}
+	zipBuildSem <- struct{}{}
+	defer func() { <-zipBuildSem }()
 	displayName := zipDisplayName(paths)
-	tmp, err := os.CreateTemp("", "amdl-*.zip")
+	tmp, err := os.CreateTemp(zipTempDir(), "amdl-*.zip")
 	if err != nil {
 		return "", "", err
 	}
@@ -3629,7 +3667,10 @@ func createZipFromPaths(paths []string) (string, string, error) {
 			}
 		}
 		header.Name = filepath.ToSlash(relName)
-		header.Method = zip.Deflate
+		// Store (no compression): the payload is already-compressed lossless/lossy
+		// audio, so Deflate burns minutes of CPU for ~0% gain — that was the "stuck on
+		// Zipping" stall. Store just bundles, near-instantly.
+		header.Method = zip.Store
 		writer, err := zipWriter.CreateHeader(header)
 		if err != nil {
 			return fail(err)
@@ -5551,7 +5592,9 @@ func pickSampleRate(target float64) int {
 }
 
 func makeTempFlacPath() (string, error) {
-	tmp, err := os.CreateTemp("", "amdl-*.flac")
+	// Onto /downloads (see zipTempDir): a transcoded FLAC can be large, so keep it off
+	// the small container overlay /tmp.
+	tmp, err := os.CreateTemp(zipTempDir(), "amdl-*.flac")
 	if err != nil {
 		return "", err
 	}
