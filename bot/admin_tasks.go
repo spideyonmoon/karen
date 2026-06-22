@@ -81,10 +81,31 @@ type UserPrefs struct {
 // backward-compat reading of pre-split telegram-state.json files (it is no
 // longer written here — see scheduleStateFile).
 type telegramStateFile struct {
-	Version       int                  `json:"version"`
-	AdminLock     bool                 `json:"admin_lock"`
-	ScheduledJobs []*scheduledJob      `json:"scheduled_jobs,omitempty"`
-	UserPrefs     map[int64]*UserPrefs `json:"user_prefs"`
+	Version          int                  `json:"version"`
+	AdminLock        bool                 `json:"admin_lock"`
+	ScheduledJobs    []*scheduledJob      `json:"scheduled_jobs,omitempty"`
+	UserPrefs        map[int64]*UserPrefs `json:"user_prefs"`
+	BlockedUserIDs   []int64              `json:"blocked_user_ids,omitempty"`
+	BlockedUsernames []string             `json:"blocked_usernames,omitempty"`
+}
+
+// stateFilePayloadLocked snapshots the persistable state (admin lock, profiles,
+// per-user bans) into a serializable struct. Caller must hold stateMu. Shared by
+// saveStateLocked and the daily backup so all three stay in sync. The block sets
+// are stored as sorted-free slices; key order is irrelevant on reload.
+func (b *TelegramBot) stateFilePayloadLocked() telegramStateFile {
+	payload := telegramStateFile{
+		Version:   1,
+		AdminLock: b.adminLock,
+		UserPrefs: b.userPrefs,
+	}
+	for id := range b.blockedUserIDs {
+		payload.BlockedUserIDs = append(payload.BlockedUserIDs, id)
+	}
+	for name := range b.blockedUsernames {
+		payload.BlockedUsernames = append(payload.BlockedUsernames, name)
+	}
+	return payload
 }
 
 // scheduleStateFile is the ephemeral sleeptime-rip queue, kept in its own file
@@ -103,6 +124,8 @@ func (b *TelegramBot) loadState() {
 	b.adminLock = false
 	b.scheduledJobs = nil
 	b.userPrefs = make(map[int64]*UserPrefs)
+	b.blockedUserIDs = make(map[int64]bool)
+	b.blockedUsernames = make(map[string]bool)
 	if b.stateFile == "" {
 		return
 	}
@@ -121,6 +144,16 @@ func (b *TelegramBot) loadState() {
 	if payload.UserPrefs != nil {
 		b.userPrefs = payload.UserPrefs
 	}
+	for _, id := range payload.BlockedUserIDs {
+		if id != 0 {
+			b.blockedUserIDs[id] = true
+		}
+	}
+	for _, name := range payload.BlockedUsernames {
+		if name = strings.ToLower(strings.TrimSpace(name)); name != "" {
+			b.blockedUsernames[name] = true
+		}
+	}
 }
 
 // saveStateLocked persists current state. Caller must hold stateMu. Mirrors
@@ -133,12 +166,8 @@ func (b *TelegramBot) saveStateLocked() {
 	if dir != "." && dir != "" {
 		_ = os.MkdirAll(dir, 0755)
 	}
-	payload := telegramStateFile{
-		Version:   1,
-		AdminLock: b.adminLock,
-		UserPrefs: b.userPrefs,
-		// ScheduledJobs intentionally omitted — it now lives in telegram-schedule.json.
-	}
+	// ScheduledJobs intentionally omitted — it now lives in telegram-schedule.json.
+	payload := b.stateFilePayloadLocked()
 	data, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
 		return
@@ -280,6 +309,89 @@ func (b *TelegramBot) setAdminLock(on bool) {
 	b.adminLock = on
 	b.saveStateLocked()
 	b.stateMu.Unlock()
+}
+
+// isBlockedUser reports whether a user has been banned via /unauth <id>. A user
+// matches by numeric ID OR by (case-insensitive) @username, so an admin can ban
+// someone they only know by handle. Admins are never blocked — this is the safety
+// net that stops an admin locking themselves out by username.
+func (b *TelegramBot) isBlockedUser(userID int64, username string) bool {
+	if b.isAdmin(userID) {
+		return false
+	}
+	b.stateMu.Lock()
+	defer b.stateMu.Unlock()
+	if userID != 0 && b.blockedUserIDs[userID] {
+		return true
+	}
+	if username != "" && b.blockedUsernames[strings.ToLower(username)] {
+		return true
+	}
+	return false
+}
+
+// setUserBlocked bans (blocked=true) or unbans a user by ID and/or username, then
+// persists. Unbanning also clears the in-session "already notified" flag so a
+// re-banned user gets a fresh notice. Either id or username may be zero/empty.
+func (b *TelegramBot) setUserBlocked(id int64, username string, blocked bool) {
+	username = strings.ToLower(strings.TrimSpace(username))
+	b.stateMu.Lock()
+	if blocked {
+		if id != 0 {
+			b.blockedUserIDs[id] = true
+		}
+		if username != "" {
+			b.blockedUsernames[username] = true
+		}
+	} else {
+		if id != 0 {
+			delete(b.blockedUserIDs, id)
+			delete(b.blockNotified, id)
+		}
+		if username != "" {
+			delete(b.blockedUsernames, username)
+		}
+	}
+	b.saveStateLocked()
+	b.stateMu.Unlock()
+}
+
+// markBlockNotified records that a banned user has been told they lost access and
+// reports whether this was the first time. Used to send the notice once, then stay
+// silent. Keyed by user ID; username-only bans get notified once their ID is seen.
+func (b *TelegramBot) markBlockNotified(userID int64) bool {
+	if userID == 0 {
+		return false
+	}
+	b.stateMu.Lock()
+	defer b.stateMu.Unlock()
+	if b.blockNotified[userID] {
+		return false
+	}
+	b.blockNotified[userID] = true
+	return true
+}
+
+// parseUserRef interprets an /auth|/unauth argument as either a numeric Telegram
+// user ID or an @username. A leading "@" is optional; usernames are lowercased for
+// case-insensitive matching. Returns (0, "") for empty/garbage input.
+func parseUserRef(s string) (id int64, username string) {
+	s = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(s), "@"))
+	if s == "" {
+		return 0, ""
+	}
+	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return n, ""
+	}
+	return 0, strings.ToLower(s)
+}
+
+// formatUserRef renders a user reference for confirmation messages.
+func formatUserRef(id int64, username string) string {
+	if username != "" {
+		return "@" + username
+	}
+	return "user " + strconv.FormatInt(id, 10)
 }
 
 // adminPurge wipes the local download caches on demand. It refuses while a
@@ -542,12 +654,9 @@ func (b *TelegramBot) startBackupRoutine() {
 // a JSON document to every configured admin's DM. Errors are logged, never fatal.
 func (b *TelegramBot) performBackup() {
 	b.stateMu.Lock()
-	payload := telegramStateFile{
-		Version:   1,
-		AdminLock: b.adminLock,
-		UserPrefs: b.userPrefs,
-	}
+	payload := b.stateFilePayloadLocked()
 	profileCount := len(b.userPrefs)
+	blockedCount := len(b.blockedUserIDs) + len(b.blockedUsernames)
 	locked := b.adminLock
 	data, err := json.MarshalIndent(payload, "", "  ")
 	b.stateMu.Unlock()
@@ -572,7 +681,7 @@ func (b *TelegramBot) performBackup() {
 	if locked {
 		lockState = "on"
 	}
-	header := fmt.Sprintf("🗄️ Daily backup — %d profile(s), admin-lock %s.", profileCount, lockState)
+	header := fmt.Sprintf("🗄️ Daily backup — %d profile(s), %d banned, admin-lock %s.", profileCount, blockedCount, lockState)
 
 	for adminID := range b.admins {
 		_ = b.sendMessageWithReply(adminID, header, nil, 0)

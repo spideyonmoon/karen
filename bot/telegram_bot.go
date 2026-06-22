@@ -183,10 +183,23 @@ type TelegramBot struct {
 	scheduledJobs []*scheduledJob      // pending sleeptime rips (persisted)
 	userPrefs     map[int64]*UserPrefs // saved per-user rip profiles (persisted, keyed by user ID)
 
+	// Per-user bans (admin /unauth <id>): a user is blocked if their ID is in
+	// blockedUserIDs OR their (lowercased) @username is in blockedUsernames. Both
+	// are persisted + backed up. Admins are never blocked. blockNotified is in-
+	// session only — it ensures a banned user gets the "no access" notice once,
+	// then silence. All three are guarded by stateMu.
+	blockedUserIDs   map[int64]bool
+	blockedUsernames map[string]bool
+	blockNotified    map[int64]bool
+
 	// profileOwners tracks who opened each live /profile panel ("chatID:messageID"
 	// → userID) so only that user may operate its buttons. Guarded by profileMu.
 	profileMu     sync.Mutex
 	profileOwners map[string]int64
+
+	// bootTime is when this process started; used for the bot-uptime line in /sys.
+	// Immutable after construction (no lock needed).
+	bootTime time.Time
 }
 
 type PendingSelection struct {
@@ -590,6 +603,10 @@ func newTelegramBot(token, appleToken string) *TelegramBot {
 		admins:           admins,
 		stateFile:        stateFile,
 		scheduleFile:     scheduleFile,
+		blockedUserIDs:   make(map[int64]bool),
+		blockedUsernames: make(map[string]bool),
+		blockNotified:    make(map[int64]bool),
+		bootTime:         time.Now(),
 	}
 	bot.loadCache()
 	bot.loadState()
@@ -1328,6 +1345,19 @@ func (b *TelegramBot) handleMessage(msg *Message) {
 	if !b.isAllowedChat(msg.Chat.ID) {
 		return // Silently ignore non-allowed groups to avoid spamming
 	}
+	userID := int64(0)
+	username := ""
+	if msg.From != nil {
+		userID = msg.From.ID
+		username = msg.From.Username
+	}
+	// Per-user ban (/unauth <id>): tell them once, then go silent.
+	if b.isBlockedUser(userID, username) {
+		if b.markBlockNotified(userID) {
+			_ = b.sendMessageWithReply(msg.Chat.ID, "🚫 You no longer have access to this bot.", nil, msg.MessageID)
+		}
+		return
+	}
 	text := strings.TrimSpace(msg.Text)
 	if cmd, mention, args, ok := parseCommand(text); ok {
 		// In a group, "/help@OtherBot" is addressed to a different bot — ignore it.
@@ -1335,12 +1365,6 @@ func (b *TelegramBot) handleMessage(msg *Message) {
 		// our username (b.username == ""), skip the check and stay responsive.
 		if mention != "" && b.username != "" && mention != b.username {
 			return
-		}
-		userID := int64(0)
-		username := ""
-		if msg.From != nil {
-			userID = msg.From.ID
-			username = msg.From.Username
 		}
 		b.handleCommand(msg.Chat.ID, userID, username, cmd, args, msg.MessageID)
 		return
@@ -1359,6 +1383,11 @@ func (b *TelegramBot) handleCallback(cb *CallbackQuery) {
 	if cb.From != nil {
 		clickerID = cb.From.ID
 		username = cb.From.Username
+	}
+	// Per-user ban (/unauth <id>): reject the tap with a toast.
+	if b.isBlockedUser(clickerID, username) {
+		_ = b.answerCallbackAlert(cb.ID, "🚫 You no longer have access to this bot.")
+		return
 	}
 	// Lockdown also blocks non-admins from completing in-flight button flows
 	// (delivery-mode picker, paging, selection).
@@ -1754,19 +1783,52 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, username string,
 		if !b.isAdmin(userID) {
 			return // don't reveal the command to non-admins
 		}
-		b.setAdminLock(true)
-		_ = b.sendMessageWithReply(chatID, "🔒 Bot restricted to admins. Use /unauth to reopen.", nil, replyToID)
+		// No arg → global lockdown (existing behavior). With an id → restore one
+		// banned user's access.
+		if len(args) == 0 {
+			b.setAdminLock(true)
+			_ = b.sendMessageWithReply(chatID, "🔒 Bot restricted to admins. Use /unauth to reopen.", nil, replyToID)
+			return
+		}
+		id, uname := parseUserRef(args[0])
+		if id == 0 && uname == "" {
+			_ = b.sendMessageWithReply(chatID, "Usage: /auth <telegram-id | @username> — restores a banned user's access.", nil, replyToID)
+			return
+		}
+		b.setUserBlocked(id, uname, false)
+		_ = b.sendMessageWithReply(chatID, "✅ Access restored for "+formatUserRef(id, uname)+".", nil, replyToID)
 	case "unauth":
 		if !b.isAdmin(userID) {
 			return
 		}
-		b.setAdminLock(false)
-		_ = b.sendMessageWithReply(chatID, "🔓 Bot reopened to all allowed users.", nil, replyToID)
+		// No arg → reopen the bot (existing behavior). With an id → revoke one
+		// user's access.
+		if len(args) == 0 {
+			b.setAdminLock(false)
+			_ = b.sendMessageWithReply(chatID, "🔓 Bot reopened to all allowed users.", nil, replyToID)
+			return
+		}
+		id, uname := parseUserRef(args[0])
+		if id == 0 && uname == "" {
+			_ = b.sendMessageWithReply(chatID, "Usage: /unauth <telegram-id | @username> — revokes a user's access.", nil, replyToID)
+			return
+		}
+		if b.isAdmin(id) {
+			_ = b.sendMessageWithReply(chatID, "Can't revoke an admin's access.", nil, replyToID)
+			return
+		}
+		b.setUserBlocked(id, uname, true)
+		_ = b.sendMessageWithReply(chatID, "🚫 Access revoked for "+formatUserRef(id, uname)+". They'll be told once, then ignored.", nil, replyToID)
 	case "purge":
 		if !b.isAdmin(userID) {
 			return
 		}
 		b.adminPurge(chatID, replyToID)
+	case "sys":
+		if !b.isAdmin(userID) {
+			return // hidden admin command
+		}
+		go b.handleSysStatus(chatID, replyToID)
 	default:
 		// Silently ignore unknown commands
 	}
