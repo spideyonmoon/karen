@@ -193,6 +193,13 @@ type TelegramBot struct {
 	blockedUsernames map[string]bool
 	blockNotified    map[int64]bool
 
+	// Donors (admin /p <id>): a user is a donor if their ID is in donorUserIDs
+	// OR their (lowercased) @username is in donorUsernames. Both are persisted +
+	// backed up. Donor perks: ⭐ badge, own-DM access, higher task/heavy-job caps,
+	// and a one-slot bump up the scheduled-rip queue. Guarded by stateMu.
+	donorUserIDs   map[int64]bool
+	donorUsernames map[string]bool
+
 	// profileOwners tracks who opened each live /profile panel ("chatID:messageID"
 	// → userID) so only that user may operate its buttons. Guarded by profileMu.
 	profileMu     sync.Mutex
@@ -1339,18 +1346,21 @@ func (b *TelegramBot) handleMessage(msg *Message) {
 	if msg.Text == "" {
 		return
 	}
-	if msg.Chat.Type == "private" {
-		_ = b.sendMessage(msg.Chat.ID, "This bot only operates in specific groups.", nil)
-		return
-	}
-	if !b.isAllowedChat(msg.Chat.ID) {
-		return // Silently ignore non-allowed groups to avoid spamming
-	}
 	userID := int64(0)
 	username := ""
 	if msg.From != nil {
 		userID = msg.From.ID
 		username = msg.From.Username
+	}
+	if msg.Chat.Type == "private" {
+		// DMs are open only to admins and donors; everyone else is told it's
+		// group-only. (In a private chat Chat.ID equals the user's own ID.)
+		if !b.isAdmin(userID) && !b.isUserDonor(userID, username) {
+			_ = b.sendMessage(msg.Chat.ID, "This bot only operates in specific groups.", nil)
+			return
+		}
+	} else if !b.isAllowedChat(msg.Chat.ID) {
+		return // Silently ignore non-allowed groups to avoid spamming
 	}
 	// Per-user ban (/unauth <id>): tell them once, then go silent.
 	if b.isBlockedUser(userID, username) {
@@ -1376,14 +1386,20 @@ func (b *TelegramBot) handleCallback(cb *CallbackQuery) {
 	if cb == nil || cb.Message == nil {
 		return
 	}
-	if !b.isAllowedChat(cb.Message.Chat.ID) {
-		return
-	}
 	clickerID := int64(0)
 	username := ""
 	if cb.From != nil {
 		clickerID = cb.From.ID
 		username = cb.From.Username
+	}
+	if cb.Message.Chat.Type == "private" {
+		// Donor/admin DM panels: allow their button taps even though the DM chat
+		// isn't in the allowed-chat list.
+		if !b.isAdmin(clickerID) && !b.isUserDonor(clickerID, username) {
+			return
+		}
+	} else if !b.isAllowedChat(cb.Message.Chat.ID) {
+		return
 	}
 	// Per-user ban (/unauth <id>): reject the tap with a toast.
 	if b.isBlockedUser(clickerID, username) {
@@ -1588,8 +1604,12 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, username string,
 		b.queueMu.Lock()
 		count := b.userTaskCount[userID]
 		b.queueMu.Unlock()
-		if count >= 3 {
-			_ = b.sendMessageWithReply(chatID, "You have reached the maximum number of pending tasks (3). Please wait for them to finish.", nil, replyToID)
+		maxTasks := 3
+		if b.isUserDonor(userID, username) {
+			maxTasks = 5 // donor perk: higher concurrent-task ceiling
+		}
+		if count >= maxTasks {
+			_ = b.sendMessageWithReply(chatID, fmt.Sprintf("You have reached the maximum number of pending tasks (%d). Please wait for them to finish.", maxTasks), nil, replyToID)
 			return
 		}
 		if len(args) == 0 {
@@ -1827,6 +1847,38 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, username string,
 		}
 		b.setUserBlocked(id, uname, true)
 		_ = b.sendMessageWithReply(chatID, "🚫 Access revoked for "+formatUserRef(id, uname)+". They'll be told once, then ignored.", nil, replyToID)
+	case "p":
+		// Promote a user to donor (admin-only). Mirrors /auth's id|@username parsing.
+		if !b.isAdmin(userID) {
+			return // hidden admin command
+		}
+		if len(args) == 0 {
+			_ = b.sendMessageWithReply(chatID, "Usage: /p <telegram-id | @username> — grants donor perks.", nil, replyToID)
+			return
+		}
+		id, uname := parseUserRef(args[0])
+		if id == 0 && uname == "" {
+			_ = b.sendMessageWithReply(chatID, "Usage: /p <telegram-id | @username> — grants donor perks.", nil, replyToID)
+			return
+		}
+		b.setUserDonor(id, uname, true)
+		_ = b.sendMessageWithReply(chatID, "⭐ Donor perks granted to "+formatUserRef(id, uname)+".", nil, replyToID)
+	case "d":
+		// Demote a donor back to a regular user (admin-only).
+		if !b.isAdmin(userID) {
+			return // hidden admin command
+		}
+		if len(args) == 0 {
+			_ = b.sendMessageWithReply(chatID, "Usage: /d <telegram-id | @username> — removes donor perks.", nil, replyToID)
+			return
+		}
+		id, uname := parseUserRef(args[0])
+		if id == 0 && uname == "" {
+			_ = b.sendMessageWithReply(chatID, "Usage: /d <telegram-id | @username> — removes donor perks.", nil, replyToID)
+			return
+		}
+		b.setUserDonor(id, uname, false)
+		_ = b.sendMessageWithReply(chatID, "Donor perks removed from "+formatUserRef(id, uname)+".", nil, replyToID)
 	case "purge":
 		if !b.isAdmin(userID) {
 			return
@@ -5287,9 +5339,13 @@ func (s *DownloadStatus) formatProgressRich(phase string, done, total int64, per
 	if title == "" {
 		title = "Untitled"
 	}
-	user := "@" + s.username
+	star := ""
+	if s.bot != nil {
+		star = s.bot.donorStar(s.userID, s.username)
+	}
+	user := star + "@" + s.username
 	if s.username == "" {
-		user = fmt.Sprintf("ID:%d", s.userID)
+		user = star + fmt.Sprintf("ID:%d", s.userID)
 	}
 
 	// Status line: phase + finished/total counter, mirroring formatHeader's
@@ -5414,9 +5470,13 @@ func (s *DownloadStatus) formatHeader(phase string, snap progressSnapshot) strin
 	}
 	title = truncateStatusTitle(title, 56)
 
-	user := "@" + s.username
+	star := ""
+	if s.bot != nil {
+		star = s.bot.donorStar(s.userID, s.username)
+	}
+	user := star + "@" + s.username
 	if s.username == "" {
-		user = fmt.Sprintf("ID:%d", s.userID)
+		user = star + fmt.Sprintf("ID:%d", s.userID)
 	}
 
 	// Status line = phase plus the finished/total track counter. The upload phase

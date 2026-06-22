@@ -68,7 +68,7 @@ func profileKey(chatID int64, messageID int) string {
 // they can operate its buttons.
 func (b *TelegramBot) handleProfileCommand(chatID int64, userID int64, replyToID int) {
 	prefs := b.getPrefs(userID)
-	rich, plain := b.renderProfile("root", prefs, b.getStats(userID))
+	rich, plain := b.renderProfile("root", prefs, b.getStats(userID), b.isUserDonor(userID, ""))
 	markup := b.profileMarkup("root", prefs)
 	res, err := b.sendRichMessage(chatID, rich, plain, markup, replyToID)
 	if err != nil || res.messageID == 0 {
@@ -129,13 +129,13 @@ func (b *TelegramBot) handleProfileCallback(cb *CallbackQuery, data string, clic
 		delete(b.profileOwners, profileKey(chatID, messageID))
 		b.profileMu.Unlock()
 		prefs := b.getPrefs(clickerID)
-		rich, plain := b.renderProfile("done", prefs, b.getStats(clickerID))
+		rich, plain := b.renderProfile("done", prefs, b.getStats(clickerID), b.isUserDonor(clickerID, ""))
 		_, _ = b.editMessageRich(chatID, messageID, rich, plain, nil)
 		return ""
 	}
 
 	prefs := b.getPrefs(clickerID)
-	rich, plain := b.renderProfile(panel, prefs, b.getStats(clickerID))
+	rich, plain := b.renderProfile(panel, prefs, b.getStats(clickerID), b.isUserDonor(clickerID, ""))
 	markup := b.profileMarkup(panel, prefs)
 	_, _ = b.editMessageRich(chatID, messageID, rich, plain, markup)
 	return ""
@@ -238,7 +238,7 @@ func togglePtr(b *bool) *bool {
 
 // renderProfile builds the rich Markdown and plain-text fallback for a panel. The
 // root card also carries the user's lifetime usage box (stats); sub-panels ignore it.
-func (b *TelegramBot) renderProfile(panel string, p UserPrefs, stats UserStats) (rich, plain string) {
+func (b *TelegramBot) renderProfile(panel string, p UserPrefs, stats UserStats, donor bool) (rich, plain string) {
 	var rb, pb strings.Builder
 	switch panel {
 	case "done":
@@ -262,10 +262,16 @@ func (b *TelegramBot) renderProfile(panel string, p UserPrefs, stats UserStats) 
 	default: // root
 		rb.WriteString("# ⚙︎ Your rip profile\n")
 		rb.WriteString("Tap a category to change it. Unset values follow the bot defaults.\n")
+		if donor {
+			rb.WriteString("\n⭐ **Donor** — thanks for supporting!\n")
+		}
 		rb.WriteString(profileCompactRich(p))
 		rb.WriteString(usageBoxRich(stats))
 		pb.WriteString("⚙︎ Your rip profile\n")
 		pb.WriteString("Tap a category to change it. Unset values follow the bot defaults.\n")
+		if donor {
+			pb.WriteString("\n⭐ Donor — thanks for supporting!\n")
+		}
 		pb.WriteString(profileCompactPlain(p))
 		pb.WriteString(usageBoxPlain(stats))
 		return rb.String(), pb.String()

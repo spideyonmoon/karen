@@ -104,6 +104,8 @@ type telegramStateFile struct {
 	UserStats        map[int64]*UserStats `json:"user_stats,omitempty"`
 	BlockedUserIDs   []int64              `json:"blocked_user_ids,omitempty"`
 	BlockedUsernames []string             `json:"blocked_usernames,omitempty"`
+	DonorUserIDs     []int64              `json:"donor_user_ids,omitempty"`
+	DonorUsernames   []string             `json:"donor_usernames,omitempty"`
 }
 
 // stateFilePayloadLocked snapshots the persistable state (admin lock, profiles,
@@ -122,6 +124,12 @@ func (b *TelegramBot) stateFilePayloadLocked() telegramStateFile {
 	}
 	for name := range b.blockedUsernames {
 		payload.BlockedUsernames = append(payload.BlockedUsernames, name)
+	}
+	for id := range b.donorUserIDs {
+		payload.DonorUserIDs = append(payload.DonorUserIDs, id)
+	}
+	for name := range b.donorUsernames {
+		payload.DonorUsernames = append(payload.DonorUsernames, name)
 	}
 	return payload
 }
@@ -145,6 +153,8 @@ func (b *TelegramBot) loadState() {
 	b.userStats = make(map[int64]*UserStats)
 	b.blockedUserIDs = make(map[int64]bool)
 	b.blockedUsernames = make(map[string]bool)
+	b.donorUserIDs = make(map[int64]bool)
+	b.donorUsernames = make(map[string]bool)
 	if b.stateFile == "" {
 		return
 	}
@@ -174,6 +184,16 @@ func (b *TelegramBot) loadState() {
 	for _, name := range payload.BlockedUsernames {
 		if name = strings.ToLower(strings.TrimSpace(name)); name != "" {
 			b.blockedUsernames[name] = true
+		}
+	}
+	for _, id := range payload.DonorUserIDs {
+		if id != 0 {
+			b.donorUserIDs[id] = true
+		}
+	}
+	for _, name := range payload.DonorUsernames {
+		if name = strings.ToLower(strings.TrimSpace(name)); name != "" {
+			b.donorUsernames[name] = true
 		}
 	}
 }
@@ -430,6 +450,71 @@ func (b *TelegramBot) markBlockNotified(userID int64) bool {
 	return true
 }
 
+// isUserDonor reports whether a user has been granted donor perks via /p <id>. A
+// user matches by numeric ID OR by (case-insensitive) @username, mirroring the ban
+// system so an admin can promote someone they only know by handle. Admins are not
+// implicitly donors — they already bypass the limits donors are exempted from, and
+// the ⭐ badge is reserved for actual supporters.
+func (b *TelegramBot) isUserDonor(userID int64, username string) bool {
+	b.stateMu.Lock()
+	defer b.stateMu.Unlock()
+	if userID != 0 && b.donorUserIDs[userID] {
+		return true
+	}
+	if username != "" && b.donorUsernames[strings.ToLower(username)] {
+		return true
+	}
+	return false
+}
+
+// setUserDonor grants (donor=true) or revokes donor perks by ID and/or username,
+// then persists. Either id or username may be zero/empty.
+func (b *TelegramBot) setUserDonor(id int64, username string, donor bool) {
+	username = strings.ToLower(strings.TrimSpace(username))
+	b.stateMu.Lock()
+	if donor {
+		if id != 0 {
+			b.donorUserIDs[id] = true
+		}
+		if username != "" {
+			b.donorUsernames[username] = true
+		}
+	} else {
+		if id != 0 {
+			delete(b.donorUserIDs, id)
+		}
+		if username != "" {
+			delete(b.donorUsernames, username)
+		}
+	}
+	b.saveStateLocked()
+	b.stateMu.Unlock()
+}
+
+// donorStar returns a "⭐ " prefix for a donor (matched by ID or username), or ""
+// otherwise — used to badge a donor wherever their ID/handle is shown.
+func (b *TelegramBot) donorStar(userID int64, username string) string {
+	if b.isUserDonor(userID, username) {
+		return "⭐ "
+	}
+	return ""
+}
+
+// countPendingScheduled returns how many of a user's scheduled (not-yet-released)
+// jobs match the given kind ("artist" | "playlist"). Used to enforce the per-user
+// heavy-job caps. Takes stateMu — a leaf lock, never call while holding queueMu.
+func (b *TelegramBot) countPendingScheduled(userID int64, kind string) int {
+	b.stateMu.Lock()
+	defer b.stateMu.Unlock()
+	n := 0
+	for _, j := range b.scheduledJobs {
+		if j.UserID == userID && j.Kind == kind {
+			n++
+		}
+	}
+	return n
+}
+
 // parseUserRef interprets an /auth|/unauth argument as either a numeric Telegram
 // user ID or an @username. A leading "@" is optional; usernames are lowercased for
 // case-insensitive matching. Returns (0, "") for empty/garbage input.
@@ -565,10 +650,19 @@ func (b *TelegramBot) releaseJob(j *scheduledJob) {
 	}
 }
 
-// scheduleJob persists a future job.
-func (b *TelegramBot) scheduleJob(j *scheduledJob) {
+// scheduleJob persists a future job. Donor jobs are bumped one slot up the queue
+// (inserted just before the current tail) instead of appended dead-last as plain
+// FIFO would — a modest priority perk over regular users' scheduled rips. Both the
+// /scheduled board and the window-release order follow slice order, so the bump
+// applies to display and dispatch alike.
+func (b *TelegramBot) scheduleJob(j *scheduledJob, donor bool) {
 	b.stateMu.Lock()
-	b.scheduledJobs = append(b.scheduledJobs, j)
+	if donor && len(b.scheduledJobs) > 0 {
+		i := len(b.scheduledJobs) - 1
+		b.scheduledJobs = append(b.scheduledJobs[:i], append([]*scheduledJob{j}, b.scheduledJobs[i:]...)...)
+	} else {
+		b.scheduledJobs = append(b.scheduledJobs, j)
+	}
 	b.saveScheduleLocked()
 	b.stateMu.Unlock()
 }
@@ -579,6 +673,28 @@ func (b *TelegramBot) scheduleJob(j *scheduledJob) {
 // on the update loop should invoke it in a goroutine.
 func (b *TelegramBot) scheduleOrRun(j *scheduledJob) {
 	now := time.Now()
+
+	// Per-user heavy-job cap: how many rips of this kind a user may have waiting in
+	// the scheduled queue at once. Donors get a higher ceiling. Discography (artist)
+	// and huge playlists are tracked separately. Admins never reach here (they
+	// bypass scheduling entirely), so this only ever gates non-admins.
+	donor := b.isUserDonor(j.UserID, j.Username)
+	limit, capLabel := 1, "discography"
+	if j.Kind == "playlist" {
+		limit, capLabel = 2, "huge playlist"
+		if donor {
+			limit = 3
+		}
+	} else if donor { // "artist" discography
+		limit = 2
+	}
+	if j.UserID != 0 && b.countPendingScheduled(j.UserID, j.Kind) >= limit {
+		_ = b.sendMessageWithReply(j.ChatID, fmt.Sprintf(
+			"You already have %d %s rip(s) scheduled — the max for your tier. Cancel one with /scheduled or wait for it to run.",
+			limit, capLabel), nil, j.ReplyToID)
+		return
+	}
+
 	if inSleepWindow(now) {
 		b.releaseJob(j)
 		return
@@ -586,7 +702,7 @@ func (b *TelegramBot) scheduleOrRun(j *scheduledJob) {
 	j.ID = generateTaskID()
 	j.ReleaseAtUnix = nextWindowStart(now).Unix()
 	j.CreatedAtUnix = now.Unix()
-	b.scheduleJob(j)
+	b.scheduleJob(j, donor)
 
 	label := "rip"
 	switch j.Kind {
@@ -629,9 +745,10 @@ func (b *TelegramBot) handleScheduledBoard(chatID int64, replyToID int) {
 	rb.WriteString("## 🌙 Scheduled tasks\n\n")
 	pb.WriteString("🌙 Scheduled tasks — start ~2:30 AM Dhaka\n")
 	for i, j := range jobs {
-		who := "@" + j.Username
+		star := b.donorStar(j.UserID, j.Username)
+		who := star + "@" + j.Username
 		if j.Username == "" {
-			who = fmt.Sprintf("user %d", j.UserID)
+			who = star + fmt.Sprintf("user %d", j.UserID)
 		}
 		// Link sits in a code span (literal, not expanded); the command escapes its
 		// underscore so the Rich renderer keeps it as a tappable /cancel_<id>.
@@ -716,6 +833,7 @@ func (b *TelegramBot) performBackup() {
 	payload := b.stateFilePayloadLocked()
 	profileCount := len(b.userPrefs)
 	blockedCount := len(b.blockedUserIDs) + len(b.blockedUsernames)
+	donorCount := len(b.donorUserIDs) + len(b.donorUsernames)
 	locked := b.adminLock
 	data, err := json.MarshalIndent(payload, "", "  ")
 	b.stateMu.Unlock()
@@ -740,7 +858,7 @@ func (b *TelegramBot) performBackup() {
 	if locked {
 		lockState = "on"
 	}
-	header := fmt.Sprintf("🗄️ Daily backup — %d profile(s), %d banned, admin-lock %s.", profileCount, blockedCount, lockState)
+	header := fmt.Sprintf("🗄️ Daily backup — %d profile(s), %d banned, %d donor(s), admin-lock %s.", profileCount, blockedCount, donorCount, lockState)
 
 	for adminID := range b.admins {
 		_ = b.sendMessageWithReply(adminID, header, nil, 0)
