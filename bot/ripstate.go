@@ -54,6 +54,13 @@ type RipState struct {
 	pathsMu sync.Mutex
 	paths   []string
 
+	// held tracks the files this rip has registered in the global in-use registry
+	// (inUseFiles) and not yet released, so releaseAllHeld can drop exactly this
+	// rip's outstanding refs — including for failed/cancelled rips — without
+	// double-decrementing paths a mid-rip flush already released. Guarded by heldMu.
+	heldMu sync.Mutex
+	held   map[string]int
+
 	metaMu sync.Mutex
 	meta   map[string]AudioMeta
 
@@ -102,6 +109,134 @@ func newRipState() *RipState {
 	return &RipState{
 		okDict: make(map[string][]int),
 		meta:   make(map[string]AudioMeta),
+		held:   make(map[string]int),
+	}
+}
+
+// inUseFiles is a process-global reference count of source files that an active
+// rip has downloaded and still needs on disk for delivery. It exists because the
+// download folder is content-keyed (…/<artist>/<album>), so concurrent rips of the
+// same album — and a rip's own trailing cleanup firing while a *different* rip is
+// still uploading — would otherwise delete files out from under an in-flight
+// upload (observed as "open …: no such file or directory" mid-delivery). Every
+// deleter (cleanupDownloadsIfNeeded, the mid-rip flush, the periodic purge, the
+// --no-cache re-rip) consults this before unlinking, and skips anything still held.
+var inUseFiles = struct {
+	mu  sync.Mutex
+	ref map[string]int
+}{ref: make(map[string]int)}
+
+// inUseKey normalizes a path so the same file registered via differently-formed
+// paths (relative vs absolute) maps to one ref entry.
+func inUseKey(p string) string {
+	if abs, err := filepath.Abs(p); err == nil {
+		return filepath.Clean(abs)
+	}
+	return filepath.Clean(p)
+}
+
+func retainInUse(p string) {
+	if p == "" {
+		return
+	}
+	k := inUseKey(p)
+	inUseFiles.mu.Lock()
+	inUseFiles.ref[k]++
+	inUseFiles.mu.Unlock()
+}
+
+// releaseInUse drops one global ref on p and returns the remaining count.
+func releaseInUse(p string) int {
+	if p == "" {
+		return 0
+	}
+	k := inUseKey(p)
+	inUseFiles.mu.Lock()
+	defer inUseFiles.mu.Unlock()
+	if inUseFiles.ref[k] > 0 {
+		inUseFiles.ref[k]--
+		if inUseFiles.ref[k] == 0 {
+			delete(inUseFiles.ref, k)
+			return 0
+		}
+		return inUseFiles.ref[k]
+	}
+	return 0
+}
+
+// isInUse reports whether any active rip still needs p on disk.
+func isInUse(p string) bool {
+	if p == "" {
+		return false
+	}
+	k := inUseKey(p)
+	inUseFiles.mu.Lock()
+	defer inUseFiles.mu.Unlock()
+	return inUseFiles.ref[k] > 0
+}
+
+// anyInUse reports whether any file at all is currently held by an active rip.
+func anyInUse() bool {
+	inUseFiles.mu.Lock()
+	defer inUseFiles.mu.Unlock()
+	return len(inUseFiles.ref) > 0
+}
+
+// retain registers p as in-use by this rip (one global ref + one per-rip held ref).
+// No-op on a nil receiver (CLI / serial path, where there is no concurrent deleter).
+func (rs *RipState) retain(p string) {
+	if rs == nil || p == "" {
+		return
+	}
+	rs.heldMu.Lock()
+	if rs.held == nil {
+		rs.held = make(map[string]int)
+	}
+	rs.held[p]++
+	rs.heldMu.Unlock()
+	retainInUse(p)
+}
+
+// releaseHeld drops one ref this rip holds on p (if it holds any) and reports the
+// global remaining count plus whether this rip actually held it. Used by the
+// mid-rip flush to decide if a delivered file can be unlinked yet.
+func (rs *RipState) releaseHeld(p string) (remaining int, held bool) {
+	if rs == nil || p == "" {
+		return 0, false
+	}
+	rs.heldMu.Lock()
+	if rs.held[p] > 0 {
+		rs.held[p]--
+		if rs.held[p] == 0 {
+			delete(rs.held, p)
+		}
+		held = true
+	}
+	rs.heldMu.Unlock()
+	if held {
+		remaining = releaseInUse(p)
+	}
+	return
+}
+
+// releaseAllHeld drops every ref this rip still holds. Deferred by runDownload so a
+// rip's files become eligible for cleanup the moment its delivery finishes — and
+// not a moment sooner. Idempotent.
+func (rs *RipState) releaseAllHeld() {
+	if rs == nil {
+		return
+	}
+	rs.heldMu.Lock()
+	paths := make([]string, 0, len(rs.held))
+	for p, n := range rs.held {
+		for i := 0; i < n; i++ {
+			paths = append(paths, p)
+		}
+	}
+	rs.held = make(map[string]int)
+	rs.heldMu.Unlock()
+	for _, p := range paths {
+		releaseInUse(p)
 	}
 }
 
@@ -391,6 +526,8 @@ func (rs *RipState) addPath(p string) {
 	rs.pathsMu.Lock()
 	rs.paths = append(rs.paths, p)
 	rs.pathsMu.Unlock()
+	// Protect this file from every deleter until this rip finishes delivering it.
+	rs.retain(p)
 }
 
 func (rs *RipState) snapshotPaths() []string {
@@ -524,7 +661,7 @@ func (rs *RipState) checkpointFlush(ctx context.Context, drain func()) {
 		return
 	}
 	// Delivered: drop the source files to reclaim disk, then advance cursors.
-	removeFlushedFiles(chunk)
+	rs.removeFlushedFiles(chunk)
 	rs.flushSeq = part
 	rs.flushStart = chunkEnd
 	rs.measuredIdx = chunkEnd
@@ -577,7 +714,7 @@ func (rs *RipState) flushReleaseBoundary(ctx context.Context, label string) erro
 	}
 
 	rs.flushMu.Lock()
-	removeFlushedFiles(chunk)
+	rs.removeFlushedFiles(chunk)
 	rs.flushSeq = part
 	rs.flushStart = chunkEnd
 	rs.measuredIdx = chunkEnd
@@ -602,13 +739,27 @@ func (rs *RipState) measurePendingLocked() {
 	}
 }
 
-// removeFlushedFiles deletes the source files of a delivered chunk and prunes any
-// album directories left empty, reclaiming the disk the whole feature exists for.
-// Best-effort: failures are ignored (the periodic cache cleanup is the backstop).
-func removeFlushedFiles(paths []string) {
+// removeFlushedFiles deletes the source files of a chunk this rip just delivered
+// and prunes any album directories left empty, reclaiming the disk the whole
+// feature exists for. It releases this rip's in-use ref on each file first and
+// only unlinks once no *other* concurrent rip still needs the (shared, content-
+// keyed) file — otherwise a rip flushing its part would delete a file another rip
+// of the same album is still uploading. Best-effort: failures are ignored (the
+// periodic cache cleanup is the backstop).
+func (rs *RipState) removeFlushedFiles(paths []string) {
 	dirs := make(map[string]struct{})
 	for _, p := range paths {
 		if p == "" {
+			continue
+		}
+		remaining, held := rs.releaseHeld(p)
+		if held && remaining > 0 {
+			// Another active rip still needs this shared file; leave it for them.
+			continue
+		}
+		if isInUse(p) {
+			// Defensive: a path not tracked in this rip's held set but still held
+			// elsewhere (e.g. nil-receiver paths) must not be deleted.
 			continue
 		}
 		if err := os.Remove(p); err == nil {

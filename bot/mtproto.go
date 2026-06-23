@@ -135,15 +135,21 @@ const (
 // in flight = 62% of the 16 MB buffer) RE-INTRODUCED the teardown: dc_id=5 "engine
 // forcibly closed: context canceled" mid-upload (e.g. part 197), the same drop/resume
 // sawtooth. So 20 over-fills the send buffer and re-starves the keepalive write even at
-// 16 MB — the safe ceiling on this single connection is 16. Throughput at 16 stays
-// moderate (the displayed ~6-7 MB/s is itself suspect — known progress-board display
-// bug), but it is STABLE. gotd serializes RPC writes over the one connection, so the
-// single connection is protocol-saturated; only a multi-connection path (Pyrofork
-// sidecar or a Go client pool) lifts it further. DO NOT raise above 16 without a buffer
-// increase. Watch the zap log for "pong missed" / "engine forcibly closed".
+// 16 MB — on the old NZ→DC5 path the safe ceiling on this single connection was 16.
+//
+// 2026-06: the VPS moved to Singapore, where DC5 also lives, so the path RTT collapsed
+// from ~176ms to ~1-5ms. The (threads × partSize) ÷ RTT formula now yields a ceiling far
+// above what the single connection can do at ANY small thread count, so thread count is
+// no longer the throughput lever — the connection is protocol-saturated regardless. That
+// flips the trade-off: fewer threads = less data in flight = more send-buffer headroom
+// for the keepalive ping = less FLOOD_WAIT / teardown risk, at no throughput cost. Lowered
+// to 8 (4 MB in flight, the pre-buffer-bump safe floor) to maximize stability now that
+// speed no longer depends on it. gotd serializes RPC writes over the one connection; only
+// a multi-connection path (Pyrofork sidecar / Go client pool) lifts the ceiling further.
+// Watch the zap log for "pong missed" / "engine forcibly closed".
 const (
 	uploadPartSize = 512 * 1024
-	uploadThreads  = 16
+	uploadThreads  = 8
 )
 
 // awaitReady blocks until the supervisor has a live, authenticated client again and

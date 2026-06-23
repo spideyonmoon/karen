@@ -889,12 +889,14 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 		fmt.Println("Failed to check if track exists.")
 	}
 	// --no-cache: drop any cached copy so the checks below fall through to a fresh rip.
-	if rs.noCache() {
+	// Never unlink a copy another concurrent rip is currently delivering (content-keyed
+	// dirs are shared); in that rare case keep the cached file and reuse it instead.
+	if rs.noCache() && !isInUse(trackPath) {
 		if existsOriginal {
 			fmt.Println("--no-cache: removing existing track to re-rip fresh.")
 		}
 		_ = os.Remove(trackPath)
-		if considerConverted {
+		if considerConverted && !isInUse(convertedPath) {
 			_ = os.Remove(convertedPath)
 		}
 		existsOriginal = false

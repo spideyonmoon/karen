@@ -35,7 +35,7 @@ const (
 	defaultQueueSize             = 200
 	pendingTTL                   = 10 * time.Minute
 	defaultTelegramFormat        = "alac"
-	defaultTelegramDownloadMaxGB = 3
+	defaultTelegramDownloadMaxGB = 22
 	defaultRipFlushThresholdGB   = 20
 	defaultTelegramTimeoutSecs   = 3600
 	// downloadPurgeInterval is how often the background routine wipes the local

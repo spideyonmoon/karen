@@ -129,7 +129,7 @@ telegram-search-language: ""
 telegram-max-file-mb: 50
 telegram-download-folder: ""
 telegram-cache-file: ""
-telegram-download-max-gb: 3
+telegram-download-max-gb: 22
 rip-flush-threshold-gb: ${RIP_FLUSH_THRESHOLD_GB:-20}
 telegram-request-timeout-seconds: 3600
 telegram-api-id: ${TELEGRAM_API_ID:-0}
