@@ -247,6 +247,23 @@ type PendingTransfer struct {
 	// UserID is the Telegram user who initiated the download; only they may pick
 	// the transfer mode. Zero means "unknown owner" (legacy path) → unguarded.
 	UserID int64
+	// Bulk is set when this prompt resolves the delivery mode for a whole bulk /dl
+	// command at once. When non-empty, handleTransferMode enqueues every item with
+	// the chosen mode instead of the single AlbumID/SongID/… fields above.
+	Bulk []bulkItem
+}
+
+// bulkItem is one resolved link in a bulk /dl command. kind ∈ song|album|mv|station.
+type bulkItem struct {
+	kind       string
+	id         string
+	storefront string // only meaningful for music videos
+}
+
+// dlFlags bundles the one-off force-flags parsed from a /dl command so they can be
+// threaded through the bulk helpers without a long parameter list.
+type dlFlags struct {
+	aac, atmos, flac, noCache bool
 }
 
 type downloadRequest struct {
@@ -1647,7 +1664,7 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, username string,
 		forceArt := false
 		forceNoCache := false
 		headlessMode := "" // -tgu / -tgz / -go: skip delivery keyboard
-		var link string
+		var links []string
 		for _, arg := range args {
 			switch arg {
 			case "-aac", "aac":
@@ -1667,7 +1684,7 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, username string,
 			case "-go", "go":
 				headlessMode = transferModeGofileZip
 			default:
-				link = arg
+				links = append(links, arg)
 			}
 		}
 
@@ -1700,6 +1717,20 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, username string,
 				// "ask" / "" → keep the interactive transfer prompt.
 				}
 			}
+		}
+
+		// Bulk: two or more links in one command. Each becomes its own queue task,
+		// capped by the user's remaining quota and restricted to song/album/MV/station.
+		// A single link keeps the full per-type behavior below (playlist, artist, -art).
+		if len(links) > 1 {
+			b.handleBulkDl(chatID, userID, username, links, replyToID,
+				dlFlags{aac: forceAAC, atmos: forceAtmos, flac: forceFlac, noCache: forceNoCache},
+				forceArt, headlessMode)
+			return
+		}
+		var link string
+		if len(links) == 1 {
+			link = links[0]
 		}
 
 		// -art short-circuits everything else: grab only the cover + motion artwork
@@ -2062,6 +2093,16 @@ func (b *TelegramBot) handleTransferMode(chatID int64, messageID int, mode strin
 		mode = transferModeGofileZip
 	}
 
+	// Bulk /dl: this one prompt resolves the delivery mode for the whole batch.
+	if len(pending.Bulk) > 0 {
+		fl := dlFlags{aac: pending.ForceAAC, atmos: pending.ForceAtmos, flac: pending.ForceFlac, noCache: pending.NoCache}
+		for _, it := range pending.Bulk {
+			b.enqueueBulkItem(it, mode, fl, chatID, userID, username, replyToID)
+		}
+		_ = b.editMessageText(chatID, messageID, fmt.Sprintf("📦 Queuing %d link(s)…", len(pending.Bulk)), nil)
+		return ""
+	}
+
 	b.queueMu.Lock()
 	inProgress := b.inProgress
 	queueLen := len(b.downloadQueue)
@@ -2320,6 +2361,156 @@ func (b *TelegramBot) enqueueMvDownload(chatID int64, userID int64, storefront s
 	b.enqueueDownload(chatID, userID, "", replyToID, statusMessageID, true, "", transferMode, "", noCache, func(ctx context.Context) error {
 		return mvDownloader(ctx, mvID, saveDir, b.appleToken, storefront, nil, nil)
 	})
+}
+
+// enqueueBulkItem enqueues a single resolved bulk /dl item with an already-decided
+// delivery mode. It is the shared sink for both bulk paths — the headless path (mode
+// from a flag/profile) and the prompt path (mode from the one transfer keyboard) —
+// so they can never drift. Each item lands as its own queue task (statusMessageID 0,
+// so every task spawns its own board). Mirrors the per-type enqueue logic in
+// handleTransferMode and the headless single-link branches.
+func (b *TelegramBot) enqueueBulkItem(item bulkItem, mode string, fl dlFlags, chatID, userID int64, username string, replyToID int) {
+	switch item.kind {
+	case "song":
+		b.bumpStats(userID, func(s *UserStats) { s.SongRips++ })
+		format := b.resolveFormat(chatID, fl.flac)
+		if fl.noCache || !b.trySendCachedTrack(chatID, replyToID, item.id, format) {
+			songID, forceAAC, forceAtmos := item.id, fl.aac, fl.atmos
+			b.enqueueDownload(chatID, userID, username, replyToID, 0, true, format, mode, "", fl.noCache, func(ctx context.Context) error {
+				if forceAtmos {
+					if rs := ripStateFrom(ctx); rs != nil {
+						rs.Atmos = true
+					} else {
+						dl_atmos = true
+					}
+				}
+				return ripSong(songID, b.appleToken, Config.Storefront, forceAAC, ctx)
+			})
+		}
+	case "album":
+		b.bumpStats(userID, func(s *UserStats) { s.AlbumRips++ })
+		format := b.resolveFormat(chatID, fl.flac)
+		if mode == transferModeGofileZip && !fl.noCache && b.trySendCachedAlbumZip(chatID, item.id, replyToID, format) {
+			return
+		}
+		b.enqueueAlbumDownload(chatID, item.id, replyToID, 0, mode, fl.aac, fl.atmos, fl.flac, fl.noCache, userID, username)
+	case "station":
+		b.enqueueStationDownload(chatID, item.id, replyToID, 0, mode, fl.aac, fl.atmos, fl.flac, fl.noCache, userID, username)
+	case "mv":
+		mvMode := transferModeMv
+		if mode == transferModeGofileZip {
+			mvMode = transferModeMvGofile
+		}
+		b.enqueueMvDownload(chatID, userID, item.storefront, item.id, replyToID, 0, mvMode, fl.noCache)
+	}
+}
+
+// handleBulkDl handles a /dl command carrying two or more links. It classifies each
+// link (songs, albums, music videos, stations — playlists and artists fan out and are
+// skipped), clamps the batch to the user's remaining task quota, then either enqueues
+// every item headless (when a delivery target is already resolved via flag or profile)
+// or shows ONE transfer keyboard whose choice applies to the whole batch. Each accepted
+// item lands as its own queue task.
+func (b *TelegramBot) handleBulkDl(chatID, userID int64, username string, links []string, replyToID int, fl dlFlags, forceArt bool, headlessMode string) {
+	if forceArt {
+		_ = b.sendMessageWithReply(chatID, "🎨 -art isn't supported with bulk /dl. Send artwork links one at a time.", nil, replyToID)
+		return
+	}
+
+	b.queueMu.Lock()
+	count := b.userTaskCount[userID]
+	b.queueMu.Unlock()
+	maxTasks := 3
+	if b.isUserDonor(userID, username) {
+		maxTasks = 5 // donor perk: higher concurrent-task ceiling
+	}
+	remaining := maxTasks - count
+	if remaining < 0 {
+		remaining = 0
+	}
+
+	// Classify each link in order; the order matches the single-link dispatch
+	// (MV → song → album, with the "?i=" share-song fallback → station).
+	var eligible []bulkItem
+	skipped := 0
+	for _, raw := range links {
+		link := resolveAppleMusicURL(raw)
+		if st, mvID := checkUrlMv(link); mvID != "" {
+			eligible = append(eligible, bulkItem{kind: "mv", id: mvID, storefront: st})
+			continue
+		}
+		if _, songID := checkUrlSong(link); songID != "" {
+			eligible = append(eligible, bulkItem{kind: "song", id: songID})
+			continue
+		}
+		if _, albumID := checkUrl(link); albumID != "" {
+			if songID := songIDFromURLParam(link); songID != "" {
+				eligible = append(eligible, bulkItem{kind: "song", id: songID})
+			} else {
+				eligible = append(eligible, bulkItem{kind: "album", id: albumID})
+			}
+			continue
+		}
+		if _, stationID := checkUrlStation(link); stationID != "" {
+			eligible = append(eligible, bulkItem{kind: "station", id: stationID})
+			continue
+		}
+		skipped++ // playlist, artist, or unrecognized
+	}
+
+	if len(eligible) == 0 {
+		_ = b.sendMessageWithReply(chatID, "No bulk-eligible links found. Bulk /dl supports songs, albums, music videos, and stations — send playlists or artists one at a time.", nil, replyToID)
+		return
+	}
+	if remaining <= 0 {
+		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("You have reached the maximum number of pending tasks (%d). Please wait for them to finish.", maxTasks), nil, replyToID)
+		return
+	}
+
+	accepted := eligible
+	overflow := 0
+	if len(accepted) > remaining {
+		overflow = len(accepted) - remaining
+		accepted = accepted[:remaining]
+	}
+
+	// Resolve delivery: headless (flag/profile) enqueues now; otherwise one prompt
+	// for the whole batch, resolved in handleTransferMode via pending.Bulk.
+	if headlessMode != "" {
+		for _, it := range accepted {
+			b.enqueueBulkItem(it, headlessMode, fl, chatID, userID, username, replyToID)
+		}
+	} else {
+		mtprotoReady := b.mtproto != nil && b.mtproto.IsReady()
+		messageID, err := b.sendMessageWithReplyReturn(chatID, fmt.Sprintf("Choose transfer method for all %d link(s):", len(accepted)), buildTransferKeyboard(mtprotoReady), replyToID)
+		if err != nil {
+			return
+		}
+		b.transferMu.Lock()
+		b.pendingTransfers[chatID] = &PendingTransfer{
+			Bulk:             accepted,
+			ForceAAC:         fl.aac,
+			ForceAtmos:       fl.atmos,
+			ForceFlac:        fl.flac,
+			NoCache:          fl.noCache,
+			ReplyToMessageID: replyToID,
+			MessageID:        messageID,
+			CreatedAt:        time.Now(),
+			UserID:           userID,
+		}
+		b.transferMu.Unlock()
+	}
+
+	var notes []string
+	if overflow > 0 {
+		notes = append(notes, fmt.Sprintf("%d beyond your remaining quota (%d) — resend when a slot frees", overflow, remaining))
+	}
+	if skipped > 0 {
+		notes = append(notes, fmt.Sprintf("%d skipped (playlist/artist/unrecognized — send individually)", skipped))
+	}
+	if len(notes) > 0 {
+		_ = b.sendMessageWithReply(chatID, "📦 Bulk: "+strings.Join(notes, "; ")+".", nil, replyToID)
+	}
 }
 
 // pendingArtistSel is an open artist-scope selector prompt: everything needed to
@@ -7093,7 +7284,7 @@ drain:
 func botHelpText() string {
 	return strings.TrimSpace(`
 Commands:
-/dl <apple-music-link> [flags]   download a song, album, artist, or playlist
+/dl <link> [link …] [flags]      download song(s), album(s), artist, or playlist
 /check <apple-music-link>        inspect a link: track count + metadata, or a full artist breakdown
 /status or /queue                show active task and queue count
 /scheduled                       list rips deferred to the sleeptime window
@@ -7101,6 +7292,12 @@ Commands:
 /cancel_<id>                     cancel a scheduled (deferred) rip
 /profile                         set your saved rip preferences (buttons)
 /help                            show this message
+
+Bulk: pass several links (space- or line-separated) to queue them at once —
+up to 3 (regular) or 5 (donor), capped by your free task slots; extras are
+dropped. Bulk supports songs, albums, music videos, and stations — send
+playlists and artists one at a time. Flags apply to every link, and if no
+delivery target is set you're asked once for the whole batch.
 
 Delivery: playlists over 40 tracks are always delivered as a Gofile ZIP
 (sending dozens of individual files trips Telegram's rate limits). Very heavy
@@ -7135,7 +7332,7 @@ Rips lossless ALAC, Dolby Atmos, and AAC from Apple Music straight to your chat.
 
 | Command | What it does |
 |:--------|:-------------|
-| ` + "`/dl <link> [flags]`" + ` | Download a song, album, artist, or playlist |
+| ` + "`/dl <link> [link …] [flags]`" + ` | Download one or several songs/albums/MVs/stations (or a single artist/playlist) |
 | ` + "`/check <link>`" + ` | Inspect a link: track count + metadata, or a full artist breakdown |
 | ` + "`/status`" + ` or ` + "`/queue`" + ` | Show the active task and queue |
 | ` + "`/scheduled`" + ` | List rips deferred to the sleeptime window |
@@ -7144,6 +7341,8 @@ Rips lossless ALAC, Dolby Atmos, and AAC from Apple Music straight to your chat.
 | ` + "`/profile`" + ` | Set your saved rip preferences (all buttons) |
 | ` + "`/help`" + ` | Show this message |
 
+> **Bulk:** pass several links (space- or line-separated) to queue them at once — up to **3** (regular) or **5** (donor), capped by your free task slots. Bulk covers songs, albums, music videos, and stations; send playlists and artists one at a time. Flags apply to every link, and if no delivery target is set you're asked once for the whole batch.
+>
 > Playlists over **40 tracks** are always delivered as a Gofile ZIP (dozens of individual uploads trip Telegram's rate limits). Very heavy rips (full artist discographies, playlists over 100 tracks) also wait for the 2:30–6:00 AM Dhaka window.
 >
 > Default quality is ALAC. ` + "`-aac`/`-atmos`" + ` pick a different source codec; ` + "`-flac`" + ` re-encodes after download. If you combine codec flags, one wins.
@@ -7167,6 +7366,7 @@ Rips lossless ALAC, Dolby Atmos, and AAC from Apple Music straight to your chat.
 /dl https://music.apple.com/album/123456
 /dl https://music.apple.com/album/123456 -aac
 /dl https://music.apple.com/song/789012 -atmos -tgz
+/dl <album-link> <song-link> <mv-link> -go     (bulk: queue all three)
 ` + "```" + `
 `)
 }
