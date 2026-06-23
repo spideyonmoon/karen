@@ -42,38 +42,44 @@ func (b *TelegramBot) handleSysStatus(chatID int64, replyToID int) {
 		return
 	}
 
-	var sb strings.Builder
-	sb.WriteString("🖥 System Status\n\n")
+	// Each metric is rendered twice: a Bot API 10.1 Rich line (bold label · value,
+	// grouped under an H2 header) and a plain-text fallback. add() keeps the two in
+	// lockstep so the rich card and the fallback never drift.
+	var richBody, plainBody []string
+	add := func(rich, plain string) {
+		richBody = append(richBody, rich)
+		plainBody = append(plainBody, plain)
+	}
 
 	// Uptime: host (from /proc/uptime) and this bot process.
 	hostUp := readHostUptime()
 	botUp := time.Since(b.bootTime)
-	sb.WriteString("⏱ Uptime: host ")
+	hostStr := "n/a"
 	if hostUp > 0 {
-		sb.WriteString(formatUptime(hostUp))
-	} else {
-		sb.WriteString("n/a")
+		hostStr = formatUptime(hostUp)
 	}
-	sb.WriteString(" • bot " + formatUptime(botUp) + "\n")
+	uptimeVal := fmt.Sprintf("host %s · bot %s", hostStr, formatUptime(botUp))
+	add("**⏱ Uptime** · "+uptimeVal, "⏱ Uptime: "+uptimeVal)
 
 	// CPU: usage % over a short sample, core count, and load average.
 	cpuPct := sampleCPUUsage(400 * time.Millisecond)
-	cpuLine := fmt.Sprintf("🧮 CPU: %d cores", runtime.NumCPU())
+	cpuVal := fmt.Sprintf("%d cores", runtime.NumCPU())
 	if cpuPct >= 0 {
-		cpuLine = fmt.Sprintf("🧮 CPU: %.0f%% of %d cores", cpuPct, runtime.NumCPU())
+		cpuVal = fmt.Sprintf("%.0f%% of %d cores", cpuPct, runtime.NumCPU())
 	}
 	if load := readLoadAvg(); load != "" {
-		cpuLine += " • load " + load
+		cpuVal += " · load " + load
 	}
-	sb.WriteString(cpuLine + "\n")
+	add("**🧮 CPU** · "+escapeRichMD(cpuVal), "🧮 CPU: "+cpuVal)
 
 	// RAM.
 	if total, avail, ok := readMemInfo(); ok && total > 0 {
 		used := total - avail
-		sb.WriteString(fmt.Sprintf("🧠 RAM: %s / %s (%.0f%%)\n",
-			formatBytes(int64(used)), formatBytes(int64(total)), 100*float64(used)/float64(total)))
+		ramVal := fmt.Sprintf("%s / %s · %.0f%%",
+			formatBytes(int64(used)), formatBytes(int64(total)), 100*float64(used)/float64(total))
+		add("**🧠 RAM** · "+ramVal, "🧠 RAM: "+ramVal)
 	} else {
-		sb.WriteString("🧠 RAM: n/a\n")
+		add("**🧠 RAM** · n/a", "🧠 RAM: n/a")
 	}
 
 	// Disk: the downloads mount (where rips land) and the root fs.
@@ -83,13 +89,16 @@ func (b *TelegramBot) handleSysStatus(chatID int64, replyToID int) {
 	}
 	if total, free, ok := diskUsage(downloadsDir); ok && total > 0 {
 		used := total - free
-		sb.WriteString(fmt.Sprintf("💾 Disk (%s): %s / %s used (%.0f%%)\n",
-			downloadsDir, formatBytes(int64(used)), formatBytes(int64(total)), 100*float64(used)/float64(total)))
+		diskVal := fmt.Sprintf("%s / %s · %.0f%%",
+			formatBytes(int64(used)), formatBytes(int64(total)), 100*float64(used)/float64(total))
+		add(fmt.Sprintf("**💾 Disk** (%s) · %s", escapeRichMD(downloadsDir), diskVal),
+			fmt.Sprintf("💾 Disk (%s): %s", downloadsDir, diskVal))
 	}
 	if total, free, ok := diskUsage("/"); ok && total > 0 {
 		used := total - free
-		sb.WriteString(fmt.Sprintf("   Root (/): %s / %s used (%.0f%%)\n",
-			formatBytes(int64(used)), formatBytes(int64(total)), 100*float64(used)/float64(total)))
+		rootVal := fmt.Sprintf("%s / %s · %.0f%%",
+			formatBytes(int64(used)), formatBytes(int64(total)), 100*float64(used)/float64(total))
+		add("**💾 Root** (/) · "+rootVal, "💾 Root (/): "+rootVal)
 	}
 
 	// Bandwidth: cumulative UL/DL since tracking began, for the VPS quota. These
@@ -98,30 +107,54 @@ func (b *TelegramBot) handleSysStatus(chatID int64, replyToID int) {
 	// i.e. nearly all real traffic. The wrappers' FairPlay license/auth handshakes
 	// with Apple (kilobytes per track) go out their own netns and aren't counted,
 	// so this is a close floor on the billed total, not the exact host figure.
+	bwSince := ""
 	if b.bandwidth != nil {
 		down, up, since := b.bandwidth.totals()
-		sb.WriteString(fmt.Sprintf("📊 Bandwidth (bot): ↓ %s • ↑ %s (Σ %s)\n",
-			formatBytes(int64(down)), formatBytes(int64(up)), formatBytes(int64(down+up))))
-		sb.WriteString("   since " + since.In(dhakaZone).Format("2006-01-02") + " • excl. wrapper license traffic\n")
+		bwVal := fmt.Sprintf("↓ %s · ↑ %s · Σ %s",
+			formatBytes(int64(down)), formatBytes(int64(up)), formatBytes(int64(down+up)))
+		add("**📊 Bandwidth** · "+bwVal, "📊 Bandwidth (bot): "+bwVal)
+		bwSince = since.In(dhakaZone).Format("2006-01-02")
 	}
 
 	// Speed test (download + upload). Slowest part — done last.
 	down, up := runSpeedTest()
 	switch {
 	case down > 0 && up > 0:
-		sb.WriteString(fmt.Sprintf("🌐 Speed: ↓ %.1f Mbps • ↑ %.1f Mbps\n", down, up))
+		speedVal := fmt.Sprintf("↓ %.1f Mbps · ↑ %.1f Mbps", down, up)
+		add("**🌐 Speed** · "+speedVal, "🌐 Speed: "+speedVal)
 	case down > 0:
-		sb.WriteString(fmt.Sprintf("🌐 Speed: ↓ %.1f Mbps • ↑ n/a\n", down))
+		speedVal := fmt.Sprintf("↓ %.1f Mbps · ↑ n/a", down)
+		add("**🌐 Speed** · "+speedVal, "🌐 Speed: "+speedVal)
 	default:
-		sb.WriteString("🌐 Speed: n/a\n")
+		add("**🌐 Speed** · n/a", "🌐 Speed: n/a")
 	}
 
-	sb.WriteString("\n🕒 " + time.Now().In(dhakaZone).Format("2006-01-02 15:04") + " Dhaka")
+	now := time.Now().In(dhakaZone).Format("2006-01-02 15:04")
+	footer := "🕒 " + now + " Dhaka"
+	if bwSince != "" {
+		footer += " · bandwidth since " + bwSince + " · excl. wrapper license"
+	}
 
-	// Edit the placeholder into the final card; fall back to a plain send if the
-	// edit fails (e.g. the message was deleted).
-	if err := b.editMessageText(chatID, msgID, sb.String(), nil); err != nil {
-		_ = b.sendMessageWithReply(chatID, sb.String(), nil, replyToID)
+	// Rich card: H2 header, the metric lines as hard-broken body, a blockquote footer.
+	var rb strings.Builder
+	rb.WriteString("## 🖥 System Status\n\n")
+	rb.WriteString(richLines(richBody))
+	rb.WriteString("\n")
+	fmt.Fprintf(&rb, "\n> %s\n", escapeRichMD(footer))
+
+	// Plain fallback, close to the historical layout.
+	var pb strings.Builder
+	pb.WriteString("🖥 System Status\n\n")
+	pb.WriteString(strings.Join(plainBody, "\n"))
+	pb.WriteString("\n\n" + footer)
+
+	rich, plain := rb.String(), pb.String()
+
+	// Edit the placeholder into the final card (rich, with automatic plain fallback
+	// inside editMessageRich). If the edit itself fails — e.g. the placeholder was
+	// deleted — send a fresh card instead.
+	if _, err := b.editMessageRich(chatID, msgID, rich, plain, nil); err != nil {
+		_, _ = b.sendRichMessage(chatID, rich, plain, nil, replyToID)
 	}
 }
 
