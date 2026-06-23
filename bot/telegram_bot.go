@@ -6170,13 +6170,24 @@ func (b *TelegramBot) markRichUnsupported(method, desc string) {
 // malformed table (don't latch — that would be a bug we want surfaced).
 func looksLikeCapabilityError(desc string) bool {
 	d := strings.ToLower(desc)
+	// Content/parse rejections (a malformed table, a bad entity, an oversized
+	// payload) name "rich message" in their text too — but those are per-edit
+	// bugs to surface, NOT a signal the server lacks Rich Messages. Never latch
+	// on them, or a single bad board poisons rich for the whole process. This
+	// guard is why we no longer match a bare "rich message"/"rich_message"
+	// substring: it caught "can't parse rich message: …" and killed rich runwide.
+	if strings.Contains(d, "parse") ||
+		strings.Contains(d, "entit") ||
+		strings.Contains(d, "too long") ||
+		strings.Contains(d, "too many requests") {
+		return false
+	}
 	switch {
 	case strings.Contains(d, "method not found"),
-		strings.Contains(d, "not found: rich"),
 		strings.Contains(d, "unknown field"),
 		strings.Contains(d, "unsupported"),
-		strings.Contains(d, "rich_message"),
-		strings.Contains(d, "rich message"):
+		strings.Contains(d, `field "rich_message"`),
+		strings.Contains(d, "field rich_message"):
 		return true
 	}
 	return false
@@ -6243,6 +6254,18 @@ func (b *TelegramBot) editMessageRich(chatID int64, messageID int, markdown, pla
 	}
 	if desc != "" && looksLikeCapabilityError(desc) {
 		b.markRichUnsupported("editMessageText(rich)", desc)
+		return false, b.editMessageText(chatID, messageID, plainFallback, markup)
+	}
+	// Rate-limited: don't burn a second edit — let the caller keep the board and
+	// retry on the next flush tick.
+	if desc != "" && strings.Contains(strings.ToLower(desc), "too many requests") {
+		return false, fmt.Errorf("telegram editMessageText(rich) rate-limited: %s", b.sanitizeTelegramText(desc))
+	}
+	// Any other API-level rejection is content-level (a bad entity/markdown in
+	// THIS payload), not a capability loss. Degrade just this edit to plain so
+	// the board still updates, and keep the rich path live for every other board.
+	if desc != "" {
+		fmt.Printf("[rich] content rejection (%s); this edit fell back to plain (rich stays on)\n", b.sanitizeTelegramText(desc))
 		return false, b.editMessageText(chatID, messageID, plainFallback, markup)
 	}
 	if err != nil {

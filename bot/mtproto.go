@@ -271,10 +271,13 @@ func (f FloodWaitMiddleware) Handle(next tg.Invoker) telegram.InvokeFunc {
 			if waited, _ := tgerr.FloodWait(ctx, err); waited {
 				slept += time.Since(before)
 				if slept >= maxFloodWaitTotal {
-					fmt.Printf("FLOOD_WAIT exceeded cap (%s slept); aborting RPC so caller can fall back.\n", slept.Truncate(time.Second))
+					fmt.Printf("FLOOD_WAIT exceeded cap (%s slept) on %T; aborting RPC so caller can fall back.\n", slept.Truncate(time.Second), input)
 					return err
 				}
-				fmt.Println("FLOOD_WAIT encountered in MTProto client. Automatically slept and retrying...")
+				// Name the throttled RPC (%T → e.g. *tg.UploadSaveBigFilePartRequest
+				// vs *tg.MessagesSendMediaRequest) so we can tell upload-part floods
+				// from per-track delivery-send floods instead of guessing the fix.
+				fmt.Printf("FLOOD_WAIT on %T (≈%s slept so far); slept and retrying...\n", input, slept.Truncate(time.Second))
 				continue
 			}
 			return err
