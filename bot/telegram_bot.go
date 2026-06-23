@@ -208,6 +208,10 @@ type TelegramBot struct {
 	// bootTime is when this process started; used for the bot-uptime line in /sys.
 	// Immutable after construction (no lock needed).
 	bootTime time.Time
+
+	// bandwidth accumulates cumulative UL/DL bytes for the /sys quota line. It owns
+	// its own lock + persistence file; set once at construction (no lock needed).
+	bandwidth *bandwidthTracker
 }
 
 type PendingSelection struct {
@@ -588,9 +592,11 @@ func newTelegramBot(token, appleToken string) *TelegramBot {
 	stateDir := filepath.Dir(cacheFile)
 	stateFile := "telegram-state.json"
 	scheduleFile := "telegram-schedule.json"
+	bandwidthFile := "telegram-bandwidth.json"
 	if stateDir != "." && stateDir != "" {
 		stateFile = filepath.Join(stateDir, "telegram-state.json")
 		scheduleFile = filepath.Join(stateDir, "telegram-schedule.json")
+		bandwidthFile = filepath.Join(stateDir, "telegram-bandwidth.json")
 	}
 	queueSize := defaultQueueSize
 	if queueSize <= 0 {
@@ -624,6 +630,7 @@ func newTelegramBot(token, appleToken string) *TelegramBot {
 		blockedUsernames: make(map[string]bool),
 		blockNotified:    make(map[int64]bool),
 		bootTime:         time.Now(),
+		bandwidth:        newBandwidthTracker(bandwidthFile),
 	}
 	bot.loadCache()
 	bot.loadState()
@@ -632,6 +639,7 @@ func newTelegramBot(token, appleToken string) *TelegramBot {
 	bot.startPurgeRoutine()
 	bot.startScheduler()
 	bot.startBackupRoutine()
+	bot.bandwidth.start()
 	return bot
 }
 
@@ -658,6 +666,13 @@ func (b *TelegramBot) purgeDownloadCaches() {
 	b.queueMu.Unlock()
 	if busy {
 		fmt.Println("Scheduled download purge skipped: a transfer is in progress.")
+		return
+	}
+	// A detached/concurrent upload can still be reading downloaded files even when
+	// inProgress has cleared, so also skip while any rip holds files in use — the
+	// purge does a recursive RemoveAll and would wipe them out from under it.
+	if anyInUse() {
+		fmt.Println("Scheduled download purge skipped: files still in use by an active rip.")
 		return
 	}
 
@@ -2706,6 +2721,12 @@ func (b *TelegramBot) runDownload(req *downloadRequest) {
 			}
 		}
 		rctx = withRipState(req.ctx, rs)
+		// Release this rip's in-use file refs once delivery returns. Registered after
+		// the cleanupDownloadsIfNeeded defer above so LIFO order runs it FIRST: this
+		// rip drops its claims, then the trailing cleanup is free to reclaim the disk
+		// of files this rip just finished delivering — while files still held by other
+		// concurrent rips stay protected.
+		defer rs.releaseAllHeld()
 	} else {
 		lastDownloadedPaths = nil
 		downloadedMetaMu.Lock()
@@ -3693,6 +3714,16 @@ func (b *TelegramBot) cleanupDownloadsIfNeeded() {
 	for _, entry := range files {
 		if totalSize <= maxBytes {
 			break
+		}
+		// Never delete a file an active rip is still delivering. The download folder
+		// is content-keyed, so one rip's trailing cleanup runs while a *different*
+		// concurrent rip is still uploading the same/oldest files — deleting them
+		// here is what produced "open …: no such file or directory" mid-upload. A
+		// single album can exceed maxBytes (default 3 GB) on its own, so this guard
+		// can legitimately leave the folder over the cap until in-flight rips finish;
+		// the next cleanup reclaims the space once they release their files.
+		if isInUse(entry.path) {
+			continue
 		}
 		if err := os.Remove(entry.path); err != nil {
 			continue

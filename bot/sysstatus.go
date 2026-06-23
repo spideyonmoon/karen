@@ -92,6 +92,19 @@ func (b *TelegramBot) handleSysStatus(chatID int64, replyToID int) {
 			formatBytes(int64(used)), formatBytes(int64(total)), 100*float64(used)/float64(total)))
 	}
 
+	// Bandwidth: cumulative UL/DL since tracking began, for the VPS quota. These
+	// are accumulated across deploys (see bandwidth.go), unlike the raw counters.
+	// Scope is the bot container's own interface: media download + Telegram upload,
+	// i.e. nearly all real traffic. The wrappers' FairPlay license/auth handshakes
+	// with Apple (kilobytes per track) go out their own netns and aren't counted,
+	// so this is a close floor on the billed total, not the exact host figure.
+	if b.bandwidth != nil {
+		down, up, since := b.bandwidth.totals()
+		sb.WriteString(fmt.Sprintf("📊 Bandwidth (bot): ↓ %s • ↑ %s (Σ %s)\n",
+			formatBytes(int64(down)), formatBytes(int64(up)), formatBytes(int64(down+up))))
+		sb.WriteString("   since " + since.In(dhakaZone).Format("2006-01-02") + " • excl. wrapper license traffic\n")
+	}
+
 	// Speed test (download + upload). Slowest part — done last.
 	down, up := runSpeedTest()
 	switch {
