@@ -65,6 +65,7 @@ cp .env.example .env
 - `generate.sh` does `mkdir -p bot/state` (not `touch` a file) so Docker mounts a directory.
 - Paths derive from `cacheFile` (default `state/telegram-cache.json`) in `newTelegramBot`; `stateFile`/`scheduleFile` are siblings in the same dir.
 - **Daily backup:** `startBackupRoutine`/`performBackup` (`bot/admin_tasks.go`) DM every `ADMIN_IDS` a copy of the admin-lock + profiles + per-user bans + donors (a `karen-state-YYYY-MM-DD.json` document) once a day at **04:00 Dhaka**. The next fire time is computed from the wall clock, so frequent restarts don't spam backups. Worst-case data loss on a VPS wipe is one day. Schedule jobs are deliberately excluded from the backup.
+- **Restore is automatic.** On boot, if `telegram-state.json` is missing/empty but one or more `karen-state-*.json` backups sit in the state dir, `loadState` → `restoreFromBackupLocked` loads the newest (dates sort lexically) and promotes it to `telegram-state.json`. So a migration is just: drop the backup file in `bot/state/` before first boot. (Manual restore — renaming the backup to `telegram-state.json` yourself — still works and is equivalent.)
 - Legacy orphans: old `bot/telegram-cache.json` / `bot/telegram-state.json` host files (pre-dir-mount) are unused; harmless, can be `rm`'d on the VPS.
 
 ## Docker services
@@ -73,9 +74,12 @@ cp .env.example .env
 - Instance `N`: container `karen-wm-N`, port `8080+N` bound to `127.0.0.1`, volume `wm-data-N`.
 
 ## Wrapper-manager setup (handled by setup.sh)
-- `./setup.sh` builds the shared `karen-wrapper-manager:local` image, boots the wrappers, and logs in each account via the gRPC `Login` RPC (through `do-login.sh`, which reads `AMD=/tmp/AppleMusicDecrypt`).
+- `./setup.sh` builds the shared `karen-wrapper-manager:local` image + the `karen-login:local` login image, boots the wrappers, and logs in each account via the gRPC `Login` RPC (through `do-login.sh`).
+- **The login client is containerized (`login/`).** It used to run on the host (`pip install` + `python3 /tmp/AppleMusicDecrypt/tools/login.py`), which forced host assumptions that broke on a fresh VPS — Python ≥3.11 (stdlib `tomllib`), a pip new enough for `--break-system-packages`, ~13 host pip packages. Now `do-login.sh` does `docker run --rm -i --network <wm-net> -v .logins/<wm-n>.toml:/app/config.toml karen-login:local`, feeding creds on stdin. **The host needs only Docker + git — no Python.** The token is stored by the wrapper-manager in its own volume over gRPC; the login container is ephemeral.
+  - `setup.sh` points each `.logins/wm-N.toml` at the wrapper's **container DNS name** `karen-wm-N:808N` (not `127.0.0.1`) so the login container reaches it over the compose network. `do-login.sh` auto-detects that network from `docker inspect karen-wm-N`.
+  - Deps are pinned in `login/requirements.txt`; the image clones AppleMusicDecrypt at build time.
 - There is NO login CLI flag — the upstream `-L "id:pass"` shortcut was removed and now errors `flag provided but not defined: -L`. gRPC only.
-- 2FA is not handled (accounts in use have it disabled); `do-login.sh` feeds creds on a non-interactive stdin pipe.
+- 2FA is not handled (accounts in use have it disabled); creds are fed on a non-interactive stdin pipe.
 - Wrapper-manager needs `--privileged` (Frida hooks inside Android emulator).
 
 ## Required external binaries (bundled in Docker)
@@ -99,7 +103,7 @@ cp .env.example .env
   - **Thread experiment CONCLUDED (2026-06-19):** with the 16MB buffer, `uploadThreads = 16` (8 MB in flight) is the **stable ceiling** — clean log over a full 168 MB upload. `20` (10 MB in flight) RE-INTRODUCED the teardown (`dc_id=5 … forcibly closed` on part 197), so it was reverted to `16` (commit `6b64899`). gotd serializes RPC writes over ONE TCP connection, so it's **protocol-saturated at 16** — more threads re-starve the keepalive without buying speed. **Do NOT raise `uploadThreads` above 16** without a further buffer increase AND a re-test for `pong missed` / `forcibly closed`.
   - **To actually beat moderate throughput** (a reference Pyrofork bot hits 40-50 MB/s) you need a **multi-connection** upload path — Telegram parallel upload = separate TCP connections to the DC, which `WithThreads(n)` does NOT provide (it multiplexes one socket). Options: a Go-native connection pool, or a Pyrofork sidecar (`max_concurrent_transmissions`). **Decision still open** — operator is wary of running multiple MTProto clients on one bot account.
   - gotd v0.144.0 does NOT expose ping/pong timeout in `telegram.Options` (hardcoded in `mtproto/ping.go`), so the keepalive can't be relaxed without forking. Other levers: `ReconnectionBackoff` (shrinks dead time, exposed in Options), or make `uploadThreads` a config field (default 16) to tune per-VPS/per-DC. The gotd zap logger that surfaced this is wired in `mtproto.go` (`mtprotoLogger()`, Info level) — verbose but invaluable; keep or gate behind a debug flag.
-- **`mtproto-session.json` is NOT in a compose volume** — every `--build` deploy wipes it (it lives in the container layer at `/app/`, only `config.yaml`/`downloads`/`telegram-cache.json` are mounted), forcing a cold MTProto re-auth (`Generating new auth key`) on each deploy. Latent bug, not today's root cause. Fix: add a volume mount for it in `docker-compose.yml`.
+- ~~`mtproto-session.json` is NOT in a compose volume~~ **FIXED** — the session now lives in the bind-mounted state dir (`state/mtproto-session.json`). `newTelegramBot` passes the cache-file's dir (default `state/`) to `NewMTProtoClient` instead of `"."`, so it survives `--build` deploys. (Bot tokens re-auth non-interactively anyway, so this was always cosmetic — but it stops the `Generating new auth key` churn.)
 
 ## Build & deploy (read before touching a branch)
 - **Never build locally.** The only Go module is `bot/go.mod` (module `main`, Go 1.25.5); `wrapper-manager/` is NOT a Go module. Don't run `go build`/`go vet`/`gofmt` on the dev box — push and let GitHub compile.
@@ -108,6 +112,18 @@ cp .env.example .env
 - **Branch workflow:** do work on a feature branch (e.g. `UX`) → push → confirm "Build Check" is green on the GitHub Actions page → merge to `main` (PR or fast-forward) → the `main` push deploys. A feature branch can never reach prod until you deliberately merge it.
 - **Gotchas when committing here:** the shell mangles pasted multi-line `-m "$(cat <<EOF …)"` commit messages (indentation breaks the heredoc; wrapped lines make `git` see `-m` with no value). Use a single-line `-m`, or several `-m` flags each on ONE physical line.
 - **`gh` CLI is installed** (v2.94+) — use `gh run list`/`gh run watch` to check CI, `gh pr create`/`gh pr merge` to ship. Note `gh pr view --json` has no `merged` field; use `state,mergedAt,mergeCommit`.
+
+## Fresh-VPS migration (the whole point of bootstrap.sh + containerized login)
+Everything runs in containers, so the host only needs Docker + git — nothing else, on any distro. The flow:
+1. **Read access for the VPS** (repo is private): generate an SSH key on the box, add its pubkey as a repo **Deploy key** (read-only), point `~/.ssh/config` at it, and `ssh-keyscan github.com >> ~/.ssh/known_hosts` (the automated deploy fetches non-interactively).
+2. `git clone git@github.com:spideyonmoon/karen.git ~/karen` (must be `~/karen` — `deploy.yml` does `cd ~/karen`).
+3. `./bootstrap.sh` — installs Docker + git (idempotent; no Python).
+4. `cp .env.example .env && nano .env` — secrets + `APPLE_ID_n`/`APPLE_PASS_n` pairs.
+5. (optional) drop the latest `karen-state-*.json` into `bot/state/` → profiles/donors/bans auto-restore on first boot.
+6. `./setup.sh` — builds images (incl. `karen-login:local`), boots wrappers, logs in each account (containerized — **no host Python**), starts the bot.
+7. **Wire up CD:** add the Actions key's pubkey to `~/.ssh/authorized_keys`, and update GitHub repo secrets `VPS_HOST` (new IP) / `VPS_USER` / `VPS_SSH_KEY`. Push to `main` to confirm deploy works.
+
+Two key relationships not to conflate: **Actions→VPS** (secret `VPS_SSH_KEY`, pubkey in VPS `authorized_keys`) vs **VPS→GitHub** (deploy key on the repo, private key on the VPS — needed because the repo is private and the deploy fetches on the box).
 
 ## Branches
 - `main` — current development (post-wrapper-manager overhaul, "v2")

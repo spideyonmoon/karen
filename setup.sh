@@ -7,7 +7,6 @@ set -euo pipefail
 
 KAREN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$KAREN"
-AMD=/tmp/AppleMusicDecrypt
 
 if [[ ! -f .env ]]; then
   echo "ERROR: .env not found. Copy .env.example to .env and fill it in." >&2
@@ -45,13 +44,12 @@ while :; do
   [[ -n "${!id_var:-}" ]] && N=$next || break
 done
 
-# 2. Ensure the AppleMusicDecrypt login client + Python deps are present
-if [[ ! -d "$AMD" ]]; then
-  echo "Cloning AppleMusicDecrypt login client to $AMD ..."
-  git clone --depth 1 https://github.com/WorldObservationLog/AppleMusicDecrypt.git "$AMD"
-  pip3 install --break-system-packages creart grpcio 'protobuf>=6' pydantic \
-    prompt-toolkit m3u8 regex beautifulsoup4 lxml tenacity async-lru loguru six
-fi
+# 2. Build the containerized login client. This replaces the old host-side
+#    AppleMusicDecrypt clone + `pip install` — the login client now runs in a
+#    pinned python:3.11 image (see login/), so the HOST needs only Docker. No
+#    host Python, no pip flags, no Python-version assumptions.
+echo "Building login client image (karen-login:local) ..."
+docker build -t karen-login:local ./login
 
 # Compose must NOT auto-read our secrets .env for ${VAR} interpolation — a
 # password containing $ triggers "variable is not set" warnings and needless
@@ -79,7 +77,9 @@ for ((i = 1; i <= N; i++)); do
   fi
   echo "=== Login wrapper-manager-$i (port $port) ==="
   cp .logins/wm-1.toml.example ".logins/wm-${i}.toml"
-  sed -i "s|127.0.0.1:8081|127.0.0.1:${port}|" ".logins/wm-${i}.toml"
+  # Point the login client at the wrapper's container DNS name on the compose
+  # network (the login container can't reach the host's 127.0.0.1 ports).
+  sed -i "s|127.0.0.1:8081|karen-wm-${i}:${port}|" ".logins/wm-${i}.toml"
   ./do-login.sh "wm-${i}" "${!id_var}" "${!pass_var}"
 done
 

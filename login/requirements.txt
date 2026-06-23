@@ -1,0 +1,18 @@
+# Python deps for the AppleMusicDecrypt login client (tools/login.py).
+# Was an UNPINNED, host-side `pip install …` list in setup.sh that assumed a
+# modern host pip + Python >=3.11. Pinned here and installed inside a
+# python:3.11 image so the host needs no Python at all. Versions are the
+# known-good set that last logged in successfully.
+creart==0.3.0
+grpcio==1.81.1
+protobuf==7.35.1
+pydantic==2.13.4
+prompt-toolkit==3.0.52
+m3u8==6.0.0
+regex==2026.5.9
+beautifulsoup4==4.15.0
+lxml==6.1.1
+tenacity==9.1.4
+async-lru==2.3.0
+loguru==0.7.2
+six==1.17.0

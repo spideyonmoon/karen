@@ -476,11 +476,20 @@ func runTelegramBot(appleToken string) {
 		Config.AlacSaveFolder = Config.TelegramDownloadFolder
 	}
 
-	// Initialize MTProto client for direct Telegram uploads (>50MB, up to 2GB)
+	// Initialize MTProto client for direct Telegram uploads (>50MB, up to 2GB).
+	// Keep the session file in the bind-mounted state dir (same place as the cache,
+	// default "state/") so it survives a `--build` deploy — otherwise it lives in
+	// the container layer and every deploy forces a cold re-auth ("Generating new
+	// auth key"). Mirrors the cache-file default resolved in newTelegramBot.
 	var mtprotoClient *MTProtoClient
 	if Config.TelegramApiID != 0 && Config.TelegramApiHash != "" {
+		sessionDir := strings.TrimSpace(Config.TelegramCacheFile)
+		if sessionDir == "" {
+			sessionDir = "state/telegram-cache.json"
+		}
+		sessionDir = filepath.Dir(sessionDir)
 		var err error
-		mtprotoClient, err = NewMTProtoClient(Config.TelegramApiID, Config.TelegramApiHash, botToken, ".")
+		mtprotoClient, err = NewMTProtoClient(Config.TelegramApiID, Config.TelegramApiHash, botToken, sessionDir)
 		if err != nil {
 			fmt.Printf("Warning: MTProto init failed: %v\nFalling back to Gofile-only mode.\n", err)
 		}

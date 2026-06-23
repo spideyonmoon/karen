@@ -1,0 +1,8 @@
+# Shell scripts and Dockerfiles run on Linux (the VPS) and inside containers.
+# Force LF so a Windows checkout (core.autocrlf=true) can never commit CRLF —
+# CRLF breaks bash with "bad interpreter: /bin/bash^M" and confuses Docker.
+*.sh    text eol=lf
+*.bash  text eol=lf
+Dockerfile text eol=lf
+*.toml  text eol=lf
+generate.sh text eol=lf

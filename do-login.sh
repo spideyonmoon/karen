@@ -1,31 +1,29 @@
 #!/bin/bash
 # Usage: do-login.sh <wm-n> <email> <password>
-# Logs to <karen>/.logins/login-wm-n.log
-
+# Logs to <karen>/.logins/login-<wm-n>.log
+#
+# Runs the containerized AppleMusicDecrypt login client (image karen-login:local,
+# built by setup.sh from ./login) against wrapper-manager <wm-n>'s gRPC endpoint.
+# The host needs only Docker — no Python. The wrapper address is read from the
+# mounted .logins/<wm-n>.toml (setup.sh points it at the container DNS name
+# karen-<wm-n>:<port> over the compose network); Apple creds are fed on stdin.
 set -u
 WM=$1
 EMAIL=$2
 PASS=$3
-KAREN=~/karen
-AMD=/tmp/AppleMusicDecrypt
-WORK=$(mktemp -d)
+KAREN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG="$KAREN/.logins/login-$WM.log"
+TOML="$KAREN/.logins/$WM.toml"
 
-cp "$KAREN/.logins/$WM.toml" "$WORK/config.toml"
-ln -s "$AMD/src" "$WORK/src"
-ln -s "$AMD/tools" "$WORK/tools"
-ln -s "$AMD/assets" "$WORK/assets" 2>/dev/null || true
+# Discover the actual Docker network the wrapper container sits on, rather than
+# guessing "<project>_default" (compose derives it from the dir name). Fall back
+# to karen_default if inspection fails.
+NET="$(docker inspect "karen-$WM" --format '{{range $k,$_ := .NetworkSettings.Networks}}{{$k}}{{end}}' 2>/dev/null)"
+[ -z "$NET" ] && NET="karen_default"
 
-# If AMD has pyproject.toml-derived things, also link
-ln -s "$AMD/main.py" "$WORK/main.py" 2>/dev/null || true
-
-cd "$WORK"
-
-# Feed creds on stdin, then stop as soon as the login resolves. We watch the log
-# (which `tee` writes live) for the success/failure marker instead of blocking on
-# a fixed sleep — the old `sleep 600` held the pipe open for 10 min AFTER
-# `Login Success!`, stalling the whole setup. Hard cap ~120s as a fallback; on
-# timeout stdin closes and login.py exits on EOF.
+# Feed creds on stdin, then watch the live log for the success/failure marker
+# instead of blocking on a fixed sleep. Hard cap ~120s as a fallback; on timeout
+# stdin closes and login.py exits on EOF.
 : > "$LOG"
 {
   echo "$EMAIL"
@@ -34,6 +32,7 @@ cd "$WORK"
     grep -qE 'Login Success!|Login Failed|Login failed' "$LOG" 2>/dev/null && break
     sleep 1
   done
-} | python3 tools/login.py 2>&1 | tee "$LOG"
-
-rm -rf "$WORK"
+} | docker run --rm -i \
+      --network "$NET" \
+      -v "$TOML:/app/config.toml:ro" \
+      karen-login:local 2>&1 | tee "$LOG"

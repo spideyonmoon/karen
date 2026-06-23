@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -160,8 +161,15 @@ func (b *TelegramBot) loadState() {
 	}
 	data, err := os.ReadFile(b.stateFile)
 	if err != nil || len(data) == 0 {
-		// Missing or freshly-touched empty file → defaults (lock open, no jobs).
-		return
+		// No live state file yet. On a fresh box (a VPS migration), auto-restore from
+		// the newest daily backup if one was dropped in the state dir — the backups
+		// are named karen-state-YYYY-MM-DD.json and DM'd to admins. This removes the
+		// easy-to-miss manual rename to telegram-state.json. If none is found, fall
+		// back to defaults (lock open, no jobs).
+		data = b.restoreFromBackupLocked()
+		if len(data) == 0 {
+			return
+		}
 	}
 	var payload telegramStateFile
 	if err := json.Unmarshal(data, &payload); err != nil {
@@ -196,6 +204,35 @@ func (b *TelegramBot) loadState() {
 			b.donorUsernames[name] = true
 		}
 	}
+}
+
+// restoreFromBackupLocked looks in the state directory for daily-backup files
+// (karen-state-YYYY-MM-DD.json) and, if any exist, returns the bytes of the
+// newest one AND promotes it to the live state file so subsequent saves/backups
+// are normal. Returns nil when none are found. Caller must hold stateMu.
+//
+// The date suffix sorts lexicographically the same as chronologically, so the
+// last name after a plain sort is the most recent. The transient ".backup-…"
+// temp file the backup routine spills is excluded by the glob (it starts with a
+// dot, not "karen-state-").
+func (b *TelegramBot) restoreFromBackupLocked() []byte {
+	dir := filepath.Dir(b.stateFile)
+	matches, _ := filepath.Glob(filepath.Join(dir, "karen-state-*.json"))
+	if len(matches) == 0 {
+		return nil
+	}
+	sort.Strings(matches)
+	newest := matches[len(matches)-1]
+	data, err := os.ReadFile(newest)
+	if err != nil || len(data) == 0 {
+		return nil
+	}
+	if err := os.WriteFile(b.stateFile, data, 0644); err != nil {
+		fmt.Printf("state restore: read %s but could not promote it to %s: %v\n", filepath.Base(newest), filepath.Base(b.stateFile), err)
+	} else {
+		fmt.Printf("state restore: no live state — loaded newest backup %s\n", filepath.Base(newest))
+	}
+	return data
 }
 
 // saveStateLocked persists current state. Caller must hold stateMu. Mirrors
