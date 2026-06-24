@@ -28,6 +28,8 @@ import (
 	"main/utils/ampapi"
 	"main/utils/structs"
 	"main/utils/task"
+
+	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -98,6 +100,10 @@ type TelegramBot struct {
 	searchLimit  int
 	maxFileBytes int64
 	mtproto      *MTProtoClient
+	// pool is the optional multi-account upload engine (Phase 1). When ready, audio
+	// delivery uploads tracks in parallel across helper accounts to the dump channel
+	// and copies them to the user. nil/not-ready → the single-client mtproto path.
+	pool *Pool
 
 	// username is the bot's own @username (lowercased, no @), fetched via getMe at
 	// startup. Used to reject commands explicitly addressed to a different bot
@@ -520,6 +526,22 @@ func runTelegramBot(appleToken string) {
 
 	bot := newTelegramBot(botToken, appleToken)
 	bot.mtproto = mtprotoClient
+
+	// Phase 1: optional multi-account upload pool. Needs the main MTProto client,
+	// at least one helper token, and a dump channel. Any missing piece (or a helper
+	// that fails first auth) leaves bot.pool nil → uploads use the single-client
+	// path exactly as before, so a missing/broken pool can't break existing deploys.
+	if mtprotoClient != nil && len(Config.HelperBotTokens) > 0 && Config.DumpChannelID != 0 {
+		pool, perr := NewUploadPool(context.Background(), mtprotoClient, Config.TelegramApiID, Config.TelegramApiHash, Config.HelperBotTokens, Config.DumpChannelID)
+		if perr != nil {
+			fmt.Printf("Warning: upload pool init failed: %v\nFalling back to single-account uploads.\n", perr)
+		} else {
+			bot.pool = pool
+		}
+	} else if mtprotoClient != nil {
+		fmt.Println("Upload pool not configured — set helper-bot-tokens and dump-channel-id to parallelize uploads.")
+	}
+
 	bot.fetchUsername()
 	fmt.Println("Telegram bot started. Waiting for updates...")
 	bot.loop()
@@ -3155,6 +3177,22 @@ func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, re
 		}
 	}
 
+	// PHASE-MERGE: when the multi-account pool is ready, audio tracks upload in
+	// parallel across helper accounts to the dump channel and are copied to the
+	// user (DropAuthor). This is also the seam where a Phase-2 catalog HIT delivers
+	// straight from the dump and a MISS records the inline catalog row. The
+	// single-client group-upload path below is the fallback when the pool is absent.
+	if b.pool != nil && b.pool.Ready() && len(audioPaths) > 0 {
+		if b.deliverAudioViaPool(chatID, audioPaths, replyToID, format, status, ctx) {
+			sentAny = true
+		}
+		if sentAny {
+			status.Stop()
+			b.sendDeliverySummary(ctx, chatID, paths, format, replyToID)
+		}
+		return
+	}
+
 	// Chunk the audio tracks into groups of up to 10
 	const maxGroupSize = 10
 	for i := 0; i < len(audioPaths); i += maxGroupSize {
@@ -3284,6 +3322,156 @@ func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, re
 	}
 }
 
+// deliverAudioViaPool delivers audio tracks through the multi-account upload pool.
+// Phase A uploads every track to the dump channel concurrently (capped at the
+// helper count, least-loaded scheduling); Phase B copies each stored message to
+// the user in original track order with no "forwarded from" header. A per-track
+// upload OR copy failure falls back to a direct single-client MTProto upload and
+// then Gofile, so a degraded pool never silently drops a track. Returns true if at
+// least one track reached the user.
+func (b *TelegramBot) deliverAudioViaPool(chatID int64, audioPaths []string, replyToID int, format string, status *DownloadStatus, ctx context.Context) bool {
+	type dumped struct {
+		path    string
+		dumpID  int64
+		msgID   int
+		meta    AudioMeta
+		hasMeta bool
+		err     error
+	}
+	results := make([]dumped, len(audioPaths))
+
+	// Phase A: upload to the dump in parallel across helpers.
+	var g errgroup.Group
+	if n := b.pool.Size(); n > 0 {
+		g.SetLimit(n)
+	}
+	var done atomic.Int64
+	total := len(audioPaths)
+	for i, path := range audioPaths {
+		results[i].path = path
+		g.Go(func() error {
+			if ctx != nil && ctx.Err() != nil {
+				results[i].err = ctx.Err()
+				return nil
+			}
+			meta, hasMeta := getDownloadedMeta(ctx, path)
+			results[i].meta, results[i].hasMeta = meta, hasMeta
+			m := buildTrackMeta(path, format, meta, hasMeta)
+			dumpID, msgID, err := b.pool.uploadToDump(ctx, path, m, status)
+			results[i].dumpID, results[i].msgID, results[i].err = dumpID, msgID, err
+			n := done.Add(1)
+			if status != nil {
+				status.Update(fmt.Sprintf("Uploading %d/%d", n, total), 0, 0)
+			}
+			return nil
+		})
+	}
+	_ = g.Wait() // per-item errors are captured in results; g.Go never returns non-nil
+
+	// Phase B: deliver. Batch the successful dump uploads into as few forward RPCs
+	// as possible (track order) so the main account takes one send per ~90 tracks
+	// instead of one per track; anything that failed to upload — or whose batch
+	// chunk failed — falls back to a direct per-track upload.
+	sentAny := false
+	delivered := make([]bool, len(results))
+	var ids []int
+	var idxOf []int
+	var dumpID int64
+	for i := range results {
+		// PHASE-MERGE: record the inline catalog row for each successful own-upload
+		// here — catalog.IndexInline(ctx, r.dumpID, r.msgID, buildTrackMeta(...)) (Phase 2, D8).
+		if results[i].err == nil && results[i].msgID != 0 {
+			dumpID = results[i].dumpID
+			ids = append(ids, results[i].msgID)
+			idxOf = append(idxOf, i)
+		}
+	}
+	if len(ids) > 0 && (ctx == nil || ctx.Err() == nil) {
+		const fwdChunk = 90 // Telegram caps a single forward at 100 ids
+		for s := 0; s < len(ids); s += fwdChunk {
+			e := s + fwdChunk
+			if e > len(ids) {
+				e = len(ids)
+			}
+			if err := b.pool.DeliverManyFromDump(ctx, dumpID, ids[s:e], chatID); err != nil {
+				fmt.Printf("dump batch copy failed: %v; affected tracks fall back to direct upload\n", err)
+				continue // this chunk's tracks stay undelivered → per-track fallback below
+			}
+			for k := s; k < e; k++ {
+				delivered[idxOf[k]] = true
+			}
+			sentAny = true
+		}
+	}
+
+	// Per-track fallback for anything not delivered above.
+	for i := range results {
+		if ctx != nil && ctx.Err() != nil {
+			status.UpdateSync("Cancelled", 0, 0)
+			return sentAny
+		}
+		if delivered[i] {
+			continue
+		}
+		r := results[i]
+		if r.err != nil && !errors.Is(r.err, context.Canceled) {
+			fmt.Printf("dump upload failed for %s: %v; falling back to direct upload\n", filepath.Base(r.path), r.err)
+		}
+		if b.deliverSingleTrackFallback(chatID, r.path, replyToID, format, r.meta, r.hasMeta, status, ctx) {
+			sentAny = true
+		}
+	}
+	return sentAny
+}
+
+// deliverSingleTrackFallback sends one track directly to the user via the main
+// MTProto client, then Gofile, when the pool path failed for that track. Returns
+// true on success. Mirrors the per-item fallback in the single-client group path.
+func (b *TelegramBot) deliverSingleTrackFallback(chatID int64, path string, replyToID int, format string, meta AudioMeta, hasMeta bool, status *DownloadStatus, ctx context.Context) bool {
+	if ctx != nil && ctx.Err() != nil {
+		return false
+	}
+	title := filepath.Base(path)
+	performer := ""
+	durationSecs := 0
+	if hasMeta {
+		if meta.Title != "" {
+			title = meta.Title
+		}
+		performer = meta.Performer
+		if meta.DurationMillis > 0 {
+			durationSecs = int(meta.DurationMillis / 1000)
+		}
+	}
+	thumbPath := ""
+	if coverPath := findCoverFile(filepath.Dir(path)); coverPath != "" {
+		if tp, err := makeTelegramThumb(coverPath); err == nil {
+			thumbPath = tp
+			defer os.Remove(tp)
+		}
+	}
+	var sizeBytes int64
+	if info, err := os.Stat(path); err == nil {
+		sizeBytes = info.Size()
+	}
+	caption := formatTelegramCaption(sizeBytes, calcBitrateKbps(sizeBytes, meta.DurationMillis), format)
+
+	if b.mtproto != nil && b.mtproto.IsReady() {
+		if err := b.mtproto.UploadAndSendAudio(chatID, path, title, performer, durationSecs, caption, thumbPath, replyToID, status, ctx); err == nil {
+			return true
+		} else if ctx != nil && ctx.Err() != nil {
+			return false
+		} else {
+			fmt.Printf("direct MTProto upload failed for %s: %v; trying Gofile\n", filepath.Base(path), err)
+		}
+	}
+	if link, gerr := apputils.UploadToGofile(ctx, path, Config.GofileToken); gerr == nil {
+		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("File: %s\nDownload Link: %s", filepath.Base(path), link), nil, replyToID)
+		return true
+	}
+	return false
+}
+
 // deliverTelegramIndividualFallback sends tracks via Bot API (limited to maxFileBytes) or Gofile.
 func (b *TelegramBot) deliverTelegramIndividualFallback(chatID int64, paths []string, replyToID int, format string, status *DownloadStatus, ctx context.Context) {
 	sentAny := false
@@ -3387,6 +3575,31 @@ func (b *TelegramBot) deliverTelegramZip(chatID int64, paths []string, replyToID
 
 	if ctx != nil && ctx.Err() != nil {
 		status.UpdateSync("Cancelled", 0, 0)
+		return
+	}
+
+	// PHASE-MERGE: route the album zip through a helper account (kind=album_zip)
+	// so the main bot account isn't the one taking the large-upload FLOOD_WAIT hit;
+	// the main bot only does the lightweight DropAuthor copy to the user. The inline
+	// catalog row for the zip artifact is recorded at the marked seam (Phase 2).
+	if b.pool != nil && b.pool.Ready() {
+		m := albumZipMeta(albumID, format, displayName)
+		if dumpID, msgID, uerr := b.pool.uploadToDump(ctx, zipPath, m, status); uerr == nil {
+			if derr := b.pool.DeliverFromDump(ctx, dumpID, msgID, chatID); derr == nil {
+				status.Stop()
+				b.sendDeliverySummary(ctx, chatID, paths, format, replyToID)
+				return
+			} else {
+				fmt.Printf("dump zip copy failed: %v; falling back to Gofile\n", derr)
+			}
+		} else if ctx != nil && ctx.Err() != nil {
+			status.UpdateSync("Cancelled", 0, 0)
+			return
+		} else {
+			fmt.Printf("dump zip upload failed: %v; falling back\n", uerr)
+		}
+		// Pool path failed (and not cancelled) → fall through to Gofile.
+		b.deliverGofileZipFromPath(chatID, zipPath, displayName, replyToID, status, ctx)
 		return
 	}
 

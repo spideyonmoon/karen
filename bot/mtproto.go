@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gotd/td/bin"
+	"github.com/gotd/td/session"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/uploader"
 	"github.com/gotd/td/tg"
@@ -55,14 +56,14 @@ func cryptoRandID() int64 {
 // and guarded by stateMu so readers never touch a torn-down client.
 type MTProtoClient struct {
 	// Immutable after construction.
-	apiID       int
-	apiHash     string
-	botToken    string
-	sessionPath string
-	storage     *FileSessionStorage
-	logger      *zap.Logger
-	parentCtx   context.Context
-	cancel      context.CancelFunc
+	apiID     int
+	apiHash   string
+	botToken  string
+	label     string // "main" or "helper-N" — for log lines
+	storage   telegram.SessionStorage
+	logger    *zap.Logger
+	parentCtx context.Context
+	cancel    context.CancelFunc
 
 	// Guarded by stateMu, rebuilt each connection cycle.
 	stateMu sync.RWMutex
@@ -299,33 +300,48 @@ func (p *UploadProgress) Chunk(ctx context.Context, state uploader.ProgressState
 	return nil
 }
 
-// NewMTProtoClient creates and authenticates a new MTProto client using the bot token.
-// It blocks until the first authentication completes (or initially fails), then keeps
-// the connection alive via a supervisor goroutine that reconnects on disconnect.
+// NewMTProtoClient creates and authenticates the MAIN MTProto client using the
+// bot token, persisting its session to disk under sessionDir (so a `--build`
+// deploy doesn't force a cold re-auth). It blocks until the first authentication
+// completes (or initially fails), then keeps the connection alive via a
+// supervisor goroutine that reconnects on disconnect.
 func NewMTProtoClient(apiID int, apiHash string, botToken string, sessionDir string) (*MTProtoClient, error) {
+	sessionPath := filepath.Join(sessionDir, "mtproto-session.json")
+	return newMTProtoClient(apiID, apiHash, botToken, &FileSessionStorage{Path: sessionPath}, "main")
+}
+
+// NewHelperMTProtoClient creates and authenticates a HELPER MTProto client (Phase
+// 1 upload pool). Helpers re-auth from their bot token on every boot, so their
+// session lives only in memory (D2) — no per-helper session files. label is used
+// for log lines (e.g. "helper-1").
+func NewHelperMTProtoClient(apiID int, apiHash string, botToken string, label string) (*MTProtoClient, error) {
+	return newMTProtoClient(apiID, apiHash, botToken, &session.StorageMemory{}, label)
+}
+
+// newMTProtoClient is the shared constructor for both the main and helper clients.
+// It blocks until the first authentication completes (or initially fails).
+func newMTProtoClient(apiID int, apiHash string, botToken string, storage telegram.SessionStorage, label string) (*MTProtoClient, error) {
 	if apiID == 0 || apiHash == "" {
 		return nil, fmt.Errorf("telegram-api-id and telegram-api-hash must be set for MTProto uploads")
 	}
 
 	parentCtx, cancel := context.WithCancel(context.Background())
 
-	sessionPath := filepath.Join(sessionDir, "mtproto-session.json")
-
 	m := &MTProtoClient{
-		apiID:       apiID,
-		apiHash:     apiHash,
-		botToken:    botToken,
-		sessionPath: sessionPath,
-		storage:     &FileSessionStorage{Path: sessionPath},
-		logger:      mtprotoLogger(),
-		parentCtx:   parentCtx,
-		cancel:      cancel,
-		peers:       make(map[int64]tg.InputPeerClass),
-		uploadGate:  make(chan struct{}, 1),
+		apiID:      apiID,
+		apiHash:    apiHash,
+		botToken:   botToken,
+		label:      label,
+		storage:    storage,
+		logger:     mtprotoLogger(),
+		parentCtx:  parentCtx,
+		cancel:     cancel,
+		peers:      make(map[int64]tg.InputPeerClass),
+		uploadGate: make(chan struct{}, 1),
 	}
 
 	// firstResult delivers the outcome of the FIRST connection cycle only, so
-	// NewMTProtoClient keeps its original contract: block until first auth.
+	// the constructor keeps its contract: block until first auth.
 	firstResult := make(chan error, 1)
 	go m.supervise(firstResult)
 
@@ -375,7 +391,7 @@ func (m *MTProtoClient) supervise(firstResult chan error) {
 			m.ready = true
 			m.stateMu.Unlock()
 
-			fmt.Println("MTProto client authenticated successfully (2GB upload limit)")
+			fmt.Printf("MTProto client [%s] authenticated successfully (2GB upload limit)\n", m.label)
 			if first {
 				first = false
 				firstResult <- nil
@@ -405,7 +421,7 @@ func (m *MTProtoClient) supervise(firstResult chan error) {
 			return
 		}
 
-		fmt.Printf("MTProto disconnected (%v); reconnecting in %s\n", runErr, backoff)
+		fmt.Printf("MTProto [%s] disconnected (%v); reconnecting in %s\n", m.label, runErr, backoff)
 		select {
 		case <-time.After(backoff):
 		case <-m.parentCtx.Done():
@@ -986,6 +1002,244 @@ func (m *MTProtoClient) uploadAndSendVideoOnce(
 	}
 
 	return nil
+}
+
+// --- Phase 1: dump-channel upload + copy primitives ---
+//
+// These let the multi-account upload Pool (pool.go) reuse this client's tuned
+// uploader, FloodWait middleware, reconnect supervisor, and peer-resolution cache
+// instead of reimplementing STEAL.md §3/§4/§6. They differ from the user-facing
+// UploadAndSend* methods in two ways: they return the new dump MESSAGE ID (the
+// durable handle, with the dump channel id), and delivery is a DropAuthor copy
+// (DeliverFromDump) rather than a fresh upload per recipient.
+
+// newChannelMsgID extracts the id of a freshly created channel message from an
+// RPC's returned updates (MessagesSendMedia → UpdateNewChannelMessage).
+func newChannelMsgID(u tg.UpdatesClass) (int, bool) {
+	var ups []tg.UpdateClass
+	switch v := u.(type) {
+	case *tg.Updates:
+		ups = v.Updates
+	case *tg.UpdatesCombined:
+		ups = v.Updates
+	default:
+		return 0, false
+	}
+	for _, up := range ups {
+		switch upd := up.(type) {
+		case *tg.UpdateNewChannelMessage:
+			if msg, ok := upd.Message.(*tg.Message); ok {
+				return msg.ID, true
+			}
+		case *tg.UpdateNewMessage:
+			if msg, ok := upd.Message.(*tg.Message); ok {
+				return msg.ID, true
+			}
+		case *tg.UpdateMessageID:
+			return upd.ID, true
+		}
+	}
+	return 0, false
+}
+
+// withRPCRetry runs a non-upload RPC (e.g. a forward/copy) against a live client,
+// awaiting reconnects and retrying transient teardowns. Unlike withUploadRetry it
+// does NOT hold the single-upload gate, so copies don't queue behind uploads.
+func (m *MTProtoClient) withRPCRetry(ctx context.Context, op string, fn func(api *tg.Client) error) error {
+	for attempt := 1; attempt <= uploadMaxAttempts; attempt++ {
+		api, ok := m.awaitReady(ctx, uploadReadyWait)
+		if !ok {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("MTProto client not ready")
+		}
+		err := fn(api)
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return err
+		}
+		if !isTransientConnErr(err) {
+			return err
+		}
+		fmt.Printf("MTProto %s hit transient connection error (attempt %d/%d): %v; waiting for reconnect...\n", op, attempt, uploadMaxAttempts, err)
+	}
+	return fmt.Errorf("MTProto %s: exceeded %d attempts", op, uploadMaxAttempts)
+}
+
+// UploadAudioToDump uploads one audio file to the dump channel with the canonical
+// caption + audio attributes and returns the new dump message id. Silent so the
+// dump's admins aren't pinged. Rides out reconnects and reuses the shared upload
+// gate + FloodWait middleware. The RandomID is fixed across retries so a resend
+// after a mid-upload teardown is deduplicated by Telegram rather than duplicated.
+func (m *MTProtoClient) UploadAudioToDump(ctx context.Context, dumpChatID int64, filePath, title, performer string, durationSecs int, caption, thumbPath string, status *DownloadStatus) (int, error) {
+	rnd := cryptoRandID()
+	var msgID int
+	err := m.withUploadRetry(ctx, "dump audio upload", func(api *tg.Client) error {
+		id, e := m.uploadDocToDumpOnce(api, dumpChatID, filePath, caption, rnd, mimeForAudioExt(filepath.Ext(filePath)), audioAttrs(filePath, title, performer, durationSecs), thumbPath, status, ctx)
+		if e != nil {
+			return e
+		}
+		msgID = id
+		return nil
+	})
+	return msgID, err
+}
+
+// UploadDocumentToDump uploads one file to the dump channel as a plain document
+// (e.g. an album ZIP) with the canonical caption, returning the dump message id.
+func (m *MTProtoClient) UploadDocumentToDump(ctx context.Context, dumpChatID int64, filePath, displayName, caption string, status *DownloadStatus) (int, error) {
+	rnd := cryptoRandID()
+	attrs := []tg.DocumentAttributeClass{&tg.DocumentAttributeFilename{FileName: displayName}}
+	var msgID int
+	err := m.withUploadRetry(ctx, "dump document upload", func(api *tg.Client) error {
+		id, e := m.uploadDocToDumpOnce(api, dumpChatID, filePath, caption, rnd, mimeForDocExt(filepath.Ext(filePath)), attrs, "", status, ctx)
+		if e != nil {
+			return e
+		}
+		msgID = id
+		return nil
+	})
+	return msgID, err
+}
+
+// audioAttrs builds the document attributes for an audio upload.
+func audioAttrs(filePath, title, performer string, durationSecs int) []tg.DocumentAttributeClass {
+	return []tg.DocumentAttributeClass{
+		&tg.DocumentAttributeAudio{Title: title, Performer: performer, Duration: durationSecs},
+		&tg.DocumentAttributeFilename{FileName: filepath.Base(filePath)},
+	}
+}
+
+// uploadDocToDumpOnce performs one upload+send-to-dump attempt and returns the new
+// message id. Shared by the audio and document dump uploaders.
+func (m *MTProtoClient) uploadDocToDumpOnce(api *tg.Client, dumpChatID int64, filePath, caption string, rnd int64, mimeType string, attrs []tg.DocumentAttributeClass, thumbPath string, status *DownloadStatus, ctx context.Context) (int, error) {
+	u := uploader.NewUploader(api).WithPartSize(uploadPartSize).WithThreads(uploadThreads)
+	if status != nil {
+		u = u.WithProgress(&UploadProgress{status: status, phase: "Uploading"})
+		status.Update("Uploading", 0, 0)
+	}
+	docFile, err := u.FromPath(ctx, filePath)
+	if err != nil {
+		return 0, fmt.Errorf("failed to upload to dump via MTProto: %w", err)
+	}
+
+	var thumb tg.InputFileClass
+	if thumbPath != "" {
+		if tf, terr := uploader.NewUploader(api).WithPartSize(uploadPartSize).FromPath(ctx, thumbPath); terr != nil {
+			fmt.Printf("Warning: failed to upload dump thumbnail: %v\n", terr)
+		} else {
+			thumb = tf
+		}
+	}
+
+	media := &tg.InputMediaUploadedDocument{
+		File:       docFile,
+		MimeType:   mimeType,
+		Attributes: attrs,
+	}
+	if thumb != nil {
+		media.Thumb = thumb
+		media.Flags.Set(2) // bit 2 = thumb flag in InputMediaUploadedDocument
+	}
+
+	peer, err := m.resolveInputPeer(ctx, dumpChatID)
+	if err != nil {
+		return 0, fmt.Errorf("failed to resolve dump peer %d: %w", dumpChatID, err)
+	}
+
+	req := &tg.MessagesSendMediaRequest{
+		Peer:     peer,
+		Media:    media,
+		Message:  caption,
+		RandomID: rnd,
+		Silent:   true,
+	}
+	req.SetFlags()
+
+	updates, err := api.MessagesSendMedia(ctx, req)
+	if waited, _ := tgerr.FloodWait(ctx, err); waited {
+		fmt.Println("FLOOD_WAIT sending to dump, retrying...")
+		updates, err = api.MessagesSendMedia(ctx, req)
+	}
+	if err != nil {
+		return 0, fmt.Errorf("failed to send to dump via MTProto: %w", err)
+	}
+	if id, ok := newChannelMsgID(updates); ok {
+		return id, nil
+	}
+	return 0, fmt.Errorf("dump upload succeeded but no message id in updates")
+}
+
+// DeliverFromDump copies an already-stored dump message to a recipient with NO
+// "Forwarded from" header (DropAuthor) and no caption (DropMediaCaptions) so the
+// internal #karenidx tag line never reaches the user — the audio's title/performer
+// attributes still render in Telegram's player. This is what a catalog HIT calls,
+// and what the MISS path calls after UploadToDump. Must be invoked on the MAIN bot
+// client (the account the user talks to). Returns an error if the source message
+// was deleted from the dump, so the caller can fall back to the next row / a rip.
+func (m *MTProtoClient) DeliverFromDump(ctx context.Context, dumpChatID int64, msgID int, recipientID int64) error {
+	fromPeer, err := m.resolveInputPeer(ctx, dumpChatID)
+	if err != nil {
+		return fmt.Errorf("failed to resolve dump peer %d: %w", dumpChatID, err)
+	}
+	toPeer, err := m.resolveInputPeer(ctx, recipientID)
+	if err != nil {
+		return fmt.Errorf("failed to resolve recipient %d: %w", recipientID, err)
+	}
+	rnd := cryptoRandID()
+	req := &tg.MessagesForwardMessagesRequest{
+		FromPeer:          fromPeer,
+		ToPeer:            toPeer,
+		ID:                []int{msgID},
+		RandomID:          []int64{rnd},
+		DropAuthor:        true,
+		DropMediaCaptions: true,
+	}
+	req.SetFlags()
+	return m.withRPCRetry(ctx, "dump copy", func(api *tg.Client) error {
+		_, err := api.MessagesForwardMessages(ctx, req)
+		return err
+	})
+}
+
+// DeliverManyFromDump copies several dump messages (all from the SAME dump channel)
+// to a recipient in ONE forward RPC with DropAuthor — far less send pressure on the
+// main account than a copy per track, which matters for big albums. Messages are
+// delivered in msgIDs order. Telegram caps a single forward at 100 ids; the caller
+// must chunk beyond that.
+func (m *MTProtoClient) DeliverManyFromDump(ctx context.Context, dumpChatID int64, msgIDs []int, recipientID int64) error {
+	if len(msgIDs) == 0 {
+		return nil
+	}
+	fromPeer, err := m.resolveInputPeer(ctx, dumpChatID)
+	if err != nil {
+		return fmt.Errorf("failed to resolve dump peer %d: %w", dumpChatID, err)
+	}
+	toPeer, err := m.resolveInputPeer(ctx, recipientID)
+	if err != nil {
+		return fmt.Errorf("failed to resolve recipient %d: %w", recipientID, err)
+	}
+	ids := append([]int(nil), msgIDs...)
+	rnd := make([]int64, len(ids))
+	for i := range rnd {
+		rnd[i] = cryptoRandID()
+	}
+	req := &tg.MessagesForwardMessagesRequest{
+		FromPeer:          fromPeer,
+		ToPeer:            toPeer,
+		ID:                ids,
+		RandomID:          rnd,
+		DropAuthor:        true,
+		DropMediaCaptions: true,
+	}
+	req.SetFlags()
+	return m.withRPCRetry(ctx, "dump copy batch", func(api *tg.Client) error {
+		_, err := api.MessagesForwardMessages(ctx, req)
+		return err
+	})
 }
 
 // mimeForAudioExt returns the MIME type for common audio file extensions.

@@ -68,8 +68,23 @@ csv_to_yaml_array() {
   echo "[$out]"
 }
 
+# Like csv_to_yaml_array but quotes each item — for string values (e.g. bot
+# tokens like "123:ABC") where an unquoted colon would be parsed as a YAML map.
+csv_to_yaml_str_array() {
+  local raw="${1:-}" out="" item
+  IFS=',' read -ra parts <<< "$raw"
+  for item in "${parts[@]}"; do
+    item="$(echo "$item" | xargs)"   # trim
+    [[ -z "$item" ]] && continue
+    [[ -n "$out" ]] && out+=", "
+    out+="\"$item\""
+  done
+  echo "[$out]"
+}
+
 ALLOWED_IDS_YAML="$(csv_to_yaml_array "${TELEGRAM_ALLOWED_CHAT_IDS:-}")"
 ADMIN_IDS_YAML="$(csv_to_yaml_array "${ADMIN_IDS:-}")"
+HELPER_TOKENS_YAML="$(csv_to_yaml_str_array "${HELPER_BOT_TOKENS:-}")"
 
 # --- bot/config.yaml ---
 # Non-secret values mirror the authoritative production config:
@@ -135,6 +150,8 @@ telegram-request-timeout-seconds: 3600
 telegram-api-id: ${TELEGRAM_API_ID:-0}
 telegram-api-hash: "${TELEGRAM_API_HASH:-}"
 gofile-token: "${GOFILE_TOKEN:-}"
+helper-bot-tokens: ${HELPER_TOKENS_YAML}
+dump-channel-id: ${DUMP_CHANNEL_ID:-0}
 task-concurrency: true
 lend-head-remaining-threshold: 50
 borrower-max-tracks: 30

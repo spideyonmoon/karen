@@ -62,6 +62,14 @@ type ConfigSet struct {
 	MediaUserToken                string  `yaml:"media-user-token"`
 	WrapperManagerAddrs           []string `yaml:"wrapper-manager-addrs"`
 
+	// HelperBotTokens is the pool of additional bot tokens used to parallelize
+	// uploads to the dump channel (Phase 1 multi-account upload). Empty disables
+	// the pool and the bot falls back to the single-client upload path.
+	HelperBotTokens []string `yaml:"helper-bot-tokens"`
+	// DumpChannelID is the private channel that physically stores uploaded media.
+	// All helper bots and the main bot must be admins of it. 0 disables the pool.
+	DumpChannelID int64 `yaml:"dump-channel-id"`
+
 	// TaskConcurrency enables running more than one queued rip at a time: a head
 	// task downloads with the full wrapper pool while an eligible queued gofile
 	// task borrows a few wrappers, and a finished rip's upload runs detached so the
