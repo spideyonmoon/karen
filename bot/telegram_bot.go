@@ -3407,7 +3407,7 @@ func (b *TelegramBot) deliverAudioViaPool(chatID int64, audioPaths []string, rep
 			if e > len(ids) {
 				e = len(ids)
 			}
-			if err := b.pool.DeliverManyFromDump(ctx, dumpID, ids[s:e], chatID); err != nil {
+			if err := b.pool.DeliverManyFromDump(ctx, dumpID, ids[s:e], chatID, replyToID); err != nil {
 				fmt.Printf("dump batch copy failed: %v; affected tracks fall back to direct upload\n", err)
 				continue // this chunk's tracks stay undelivered → per-track fallback below
 			}
@@ -3599,7 +3599,7 @@ func (b *TelegramBot) deliverTelegramZip(chatID int64, paths []string, replyToID
 	if b.pool != nil && b.pool.Ready() {
 		m := albumZipMeta(albumID, format, displayName)
 		if dumpID, msgID, uerr := b.pool.uploadToDump(ctx, zipPath, m, status); uerr == nil {
-			if derr := b.pool.DeliverFromDump(ctx, dumpID, msgID, chatID); derr == nil {
+			if derr := b.pool.DeliverFromDump(ctx, dumpID, msgID, chatID, replyToID); derr == nil {
 				status.Stop()
 				b.sendDeliverySummary(ctx, chatID, paths, format, replyToID)
 				return

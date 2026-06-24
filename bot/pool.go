@@ -183,21 +183,39 @@ func (p *Pool) uploadToDump(ctx context.Context, path string, m TrackMeta, statu
 // "forwarded from" header (DropAuthor). This is what a catalog HIT calls; the
 // Phase 1 MISS path calls it right after UploadToDump. Delivery always runs on the
 // main bot (the account the user talks to).
-func (p *Pool) DeliverFromDump(ctx context.Context, dumpID int64, msgID int, recipientID int64) error {
+func (p *Pool) DeliverFromDump(ctx context.Context, dumpID int64, msgID int, recipientID int64, replyToID int) error {
 	if p == nil || p.main == nil {
 		return fmt.Errorf("upload pool not available")
 	}
-	return p.main.DeliverFromDump(ctx, dumpID, msgID, recipientID)
+	return p.main.DeliverFromDump(ctx, dumpID, msgID, recipientID, replyToID)
 }
 
 // DeliverManyFromDump copies several same-dump messages to a recipient in one
 // forward RPC (DropAuthor), in msgIDs order. Used by the MISS path to deliver a
 // whole album with one send instead of one per track.
-func (p *Pool) DeliverManyFromDump(ctx context.Context, dumpID int64, msgIDs []int, recipientID int64) error {
+func (p *Pool) DeliverManyFromDump(ctx context.Context, dumpID int64, msgIDs []int, recipientID int64, replyToID int) error {
 	if p == nil || p.main == nil {
 		return fmt.Errorf("upload pool not available")
 	}
-	return p.main.DeliverManyFromDump(ctx, dumpID, msgIDs, recipientID)
+	return p.main.DeliverManyFromDump(ctx, dumpID, msgIDs, recipientID, replyToID)
+}
+
+// DumpID returns the configured dump channel id (Bot API -100… form).
+func (p *Pool) DumpID() int64 {
+	if p == nil {
+		return 0
+	}
+	return p.dumpChatID
+}
+
+// ResolveDumpAccessHash returns the dump channel's access hash via the main
+// client. Phase 2 calls this once at startup to register the dumps row
+// (catalog.UpsertDump) BEFORE any inline index, satisfying the tracks→dumps FK.
+func (p *Pool) ResolveDumpAccessHash(ctx context.Context) (int64, error) {
+	if p == nil || p.main == nil {
+		return 0, fmt.Errorf("upload pool not available")
+	}
+	return p.main.ChannelAccessHash(ctx, p.dumpChatID)
 }
 
 // Close tears down the helper clients (and their supervisors). The main client is

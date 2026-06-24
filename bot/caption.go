@@ -36,21 +36,44 @@ type TrackMeta struct {
 	Kind          string // "track" (default) | "album_zip" | "cover" | "animated" | "lrc"
 	LyricsSync    string // DESCRIPTIVE only (not in Variant): "none" | "line" | "word"
 	CoverEmbedded bool   // DESCRIPTIVE only (not in Variant): embedded cover present
-	Variant       string // cache-identity tier; v1 = format only (§4.6, D10)
+	Variant       string // cache-identity QUALITY tier (§4.6); "" = non-cacheable
 }
 
-// VariantKey is the cache-identity tier (§4.6, D10). v1 = format only.
+// QualityTier collapses a ripped format into the cache-identity quality tier.
+// This SUPERSEDES the earlier format-tier (coordinated with Phase 2,
+// feat/catalog-db): the audio container is not a cache dimension, so ALAC and
+// FLAC both collapse to "lossless". Anything not recognized as a cacheable tier
+// returns "" — meaning "not cacheable": such a rip is uploaded and delivered but
+// MUST NOT be indexed.
 //
-//	v1|fmt=alac   v1|fmt=aac   v1|fmt=atmos   v1|fmt=flac
+//	alac, flac → lossless    aac → aac    atmos → atmos    (other) → ""
 //
-// Cosmetic options (cover, lyrics sync, embed flags) are deliberately NOT in the
-// key — they are embedded maximally into every file instead, so they never fork
-// the cache. The format string is kept extensible ONLY for a future genuinely
-// non-derivable master dimension; do NOT add cosmetic options here.
+// PHASE-MERGE: catalog.QualityTier is the source of truth; delete this mirror.
+func QualityTier(format string) string {
+	switch strings.ToLower(strings.TrimSpace(format)) {
+	case "alac", "flac":
+		return "lossless"
+	case "aac":
+		return "aac"
+	case "atmos":
+		return "atmos"
+	default:
+		return ""
+	}
+}
+
+// VariantKey is the cache-identity key: v1|q=<tier> (§4.6). It returns "" when the
+// format is non-cacheable (QualityTier == ""), which callers treat as "upload &
+// deliver, but do not index". Cosmetic options (cover, lyrics sync, embed flags)
+// are deliberately NOT in the key — they are embedded maximally into every file.
 //
-// Phase 2 MUST produce this string identically.
+// Phase 2 MUST produce this string identically; catalog.VariantKey is canonical.
 func VariantKey(m TrackMeta) string {
-	return "v1|fmt=" + m.Format
+	tier := QualityTier(m.Format)
+	if tier == "" {
+		return ""
+	}
+	return "v1|q=" + tier
 }
 
 // kindOrDefault returns m.Kind, defaulting to "track" when unset.
@@ -133,11 +156,15 @@ func FormatCaption(m TrackMeta) string {
 	if m.CoverEmbedded {
 		tag = append(tag, "cov=1")
 	}
+	// var is omitted when the tier is non-cacheable ("") — per the omit-empty rule,
+	// the crawler reconstructs the tier from fmt via QualityTier when var is absent.
 	variant := m.Variant
 	if variant == "" {
 		variant = VariantKey(m)
 	}
-	tag = append(tag, "var="+variant)
+	if variant != "" {
+		tag = append(tag, "var="+variant)
+	}
 
 	return human.String() + "\n\n" + strings.Join(tag, " ")
 }
@@ -150,20 +177,24 @@ func FormatCaption(m TrackMeta) string {
 // CoverEmbedded) are descriptive only and never enter the variant key (D10).
 func buildTrackMeta(path, format string, meta AudioMeta, hasMeta bool) TrackMeta {
 	title := filepath.Base(path)
-	performer, album := "", ""
+	performer, album, isrc := "", "", ""
 	durationSec := 0
-	var adam int64
+	var adam, albumID int64
 	if hasMeta {
 		if meta.Title != "" {
 			title = meta.Title
 		}
 		performer = meta.Performer
 		album = meta.AlbumName
+		isrc = meta.ISRC
 		if meta.DurationMillis > 0 {
 			durationSec = int(meta.DurationMillis / 1000)
 		}
 		if id, err := strconv.ParseInt(strings.TrimSpace(meta.TrackID), 10, 64); err == nil {
 			adam = id
+		}
+		if id, err := strconv.ParseInt(strings.TrimSpace(meta.AlbumID), 10, 64); err == nil {
+			albumID = id
 		}
 	}
 
@@ -181,6 +212,8 @@ func buildTrackMeta(path, format string, meta AudioMeta, hasMeta bool) TrackMeta
 
 	m := TrackMeta{
 		AppleTrackID:  adam,
+		AppleAlbumID:  albumID,
+		ISRC:          isrc,
 		Title:         title,
 		Artist:        performer,
 		Album:         album,

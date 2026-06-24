@@ -512,6 +512,20 @@ func (m *MTProtoClient) resolveInputPeer(ctx context.Context, chatID int64) (tg.
 	return peer, nil
 }
 
+// ChannelAccessHash resolves a channel chat id to its access hash (resolving and
+// caching the peer if needed). Used to register the dump channel in the catalog —
+// Phase 2 needs dumps.access_hash on record before any track row (FK dependency).
+func (m *MTProtoClient) ChannelAccessHash(ctx context.Context, chatID int64) (int64, error) {
+	peer, err := m.resolveInputPeer(ctx, chatID)
+	if err != nil {
+		return 0, err
+	}
+	if ch, ok := peer.(*tg.InputPeerChannel); ok {
+		return ch.AccessHash, nil
+	}
+	return 0, fmt.Errorf("chat %d did not resolve to a channel peer", chatID)
+}
+
 // MTProtoAudioResult holds the result of an audio upload for caching.
 type MTProtoAudioResult struct {
 	FileID   string
@@ -1180,7 +1194,7 @@ func (m *MTProtoClient) uploadDocToDumpOnce(api *tg.Client, dumpChatID int64, fi
 // and what the MISS path calls after UploadToDump. Must be invoked on the MAIN bot
 // client (the account the user talks to). Returns an error if the source message
 // was deleted from the dump, so the caller can fall back to the next row / a rip.
-func (m *MTProtoClient) DeliverFromDump(ctx context.Context, dumpChatID int64, msgID int, recipientID int64) error {
+func (m *MTProtoClient) DeliverFromDump(ctx context.Context, dumpChatID int64, msgID int, recipientID int64, replyToID int) error {
 	fromPeer, err := m.resolveInputPeer(ctx, dumpChatID)
 	if err != nil {
 		return fmt.Errorf("failed to resolve dump peer %d: %w", dumpChatID, err)
@@ -1198,6 +1212,9 @@ func (m *MTProtoClient) DeliverFromDump(ctx context.Context, dumpChatID int64, m
 		DropAuthor:        true,
 		DropMediaCaptions: true,
 	}
+	if replyToID > 0 {
+		req.ReplyTo = &tg.InputReplyToMessage{ReplyToMsgID: replyToID}
+	}
 	req.SetFlags()
 	return m.withRPCRetry(ctx, "dump copy", func(api *tg.Client) error {
 		_, err := api.MessagesForwardMessages(ctx, req)
@@ -1210,7 +1227,7 @@ func (m *MTProtoClient) DeliverFromDump(ctx context.Context, dumpChatID int64, m
 // main account than a copy per track, which matters for big albums. Messages are
 // delivered in msgIDs order. Telegram caps a single forward at 100 ids; the caller
 // must chunk beyond that.
-func (m *MTProtoClient) DeliverManyFromDump(ctx context.Context, dumpChatID int64, msgIDs []int, recipientID int64) error {
+func (m *MTProtoClient) DeliverManyFromDump(ctx context.Context, dumpChatID int64, msgIDs []int, recipientID int64, replyToID int) error {
 	if len(msgIDs) == 0 {
 		return nil
 	}
@@ -1234,6 +1251,9 @@ func (m *MTProtoClient) DeliverManyFromDump(ctx context.Context, dumpChatID int6
 		RandomID:          rnd,
 		DropAuthor:        true,
 		DropMediaCaptions: true,
+	}
+	if replyToID > 0 {
+		req.ReplyTo = &tg.InputReplyToMessage{ReplyToMsgID: replyToID}
 	}
 	req.SetFlags()
 	return m.withRPCRetry(ctx, "dump copy batch", func(api *tg.Client) error {
