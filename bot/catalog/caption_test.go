@@ -96,10 +96,17 @@ func TestParseCaptionNoTag(t *testing.T) {
 }
 
 func TestVariantKey(t *testing.T) {
-	for _, f := range []string{"alac", "aac", "atmos", "flac"} {
-		want := "v1|fmt=" + f
-		if got := VariantKey(TrackMeta{Format: f}); got != want {
-			t.Fatalf("VariantKey(%q) = %q, want %q", f, got, want)
+	cases := map[string]string{
+		"alac":     "v1|q=lossless", // ALAC + FLAC collapse to one lossless tier
+		"flac":     "v1|q=lossless",
+		"aac":      "v1|q=aac",
+		"atmos":    "v1|q=atmos",
+		"binaural": "", // exotic → not cacheable
+		"":         "",
+	}
+	for format, want := range cases {
+		if got := VariantKey(TrackMeta{Format: format}); got != want {
+			t.Fatalf("VariantKey(%q) = %q, want %q", format, got, want)
 		}
 	}
 }

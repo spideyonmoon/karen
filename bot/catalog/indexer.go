@@ -1,6 +1,9 @@
 package catalog
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // CrawledMessage is one message read from a dump, normalized for indexing. Only
 // messages whose caption carries our #karenidx tag are indexed in Phase 2;
@@ -38,7 +41,14 @@ const crawlPageSize = 100
 // Phase 2 scope: only our own #karenidx captions are indexed; foreign-dump tag
 // extraction (download-to-read-tags) is Phase 3. progress (optional) is called
 // after each page with the running indexed count and the newest id seen.
-func (c *Catalog) IndexDump(ctx context.Context, f MessageFetcher, dumpID int64, progress func(indexed, newestID int)) (int, error) {
+//
+// pagePause is a floodwait-friendly sleep between GetHistory pages — Telegram bans
+// scale with how hard we hammer, so even this manual admin crawl paces itself. It
+// is the gentle-but-runs-to-completion knob; a fully autonomous, per-run-capped,
+// periodically-scheduled crawler (so we never hold an open crawl 24/7) is future
+// work and would walk ASCENDING with a per-message checkpoint so capped runs make
+// durable forward progress (this descending walk only checkpoints on completion).
+func (c *Catalog) IndexDump(ctx context.Context, f MessageFetcher, dumpID int64, pagePause time.Duration, progress func(indexed, newestID int)) (int, error) {
 	checkpoint, err := c.dumpCheckpoint(ctx, dumpID)
 	if err != nil {
 		return 0, err
@@ -86,6 +96,16 @@ func (c *Catalog) IndexDump(ctx context.Context, f MessageFetcher, dumpID int64,
 		}
 		if reachedCheckpoint {
 			break
+		}
+
+		// Floodwait-friendly pacing between pages (ctx-aware so /stop and the run
+		// timeout still cut it short).
+		if pagePause > 0 {
+			select {
+			case <-ctx.Done():
+				return indexed, ctx.Err()
+			case <-time.After(pagePause):
+			}
 		}
 	}
 

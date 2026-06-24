@@ -1804,7 +1804,7 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, username string,
 			if headlessMode != "" {
 				format := b.resolveFormat(chatID, forceFlac)
 				// PHASE-MERGE: read-through — try the JSON cache then the catalog before ripping.
-				if forceNoCache || (!b.trySendCachedTrack(chatID, replyToID, songID, format) && !b.catalogTryServeTrack(chatID, replyToID, songID, format)) {
+				if forceNoCache || (!b.trySendCachedTrack(chatID, replyToID, songID, format) && !b.catalogTryServeTrack(chatID, replyToID, songID, effectiveCatalogFormat(format, forceAAC, forceAtmos))) {
 					b.enqueueDownload(chatID, userID, "", replyToID, 0, true, format, headlessMode, "", forceNoCache, func(ctx context.Context) error {
 						// Honor -atmos for headless single-song rips (see handleTransferMode).
 						if forceAtmos {
@@ -2042,8 +2042,13 @@ func (b *TelegramBot) handleIndexDump(chatID int64, args []string, replyToID int
 		}
 	}
 
+	// Pace pages so even a manual backfill stays gentle on Telegram (ban risk scales
+	// with how hard we hammer). An autonomous, per-run-capped periodic crawler is
+	// future work — for now this is an admin-triggered, one-off, paced full crawl.
+	const indexPagePause = 1500 * time.Millisecond
+
 	var lastEdit time.Time
-	indexed, err := b.catalog.IndexDump(ctx, fetcher, dumpID, func(n, newest int) {
+	indexed, err := b.catalog.IndexDump(ctx, fetcher, dumpID, indexPagePause, func(n, newest int) {
 		// Throttle edits so a fast crawl doesn't flood the Bot API / trip FLOOD_WAIT.
 		if msgID != 0 && time.Since(lastEdit) > 2*time.Second {
 			lastEdit = time.Now()
@@ -2258,7 +2263,7 @@ func (b *TelegramBot) handleTransferMode(chatID int64, messageID int, mode strin
 		if mode == transferModeGofileZip && !pending.NoCache {
 			// PHASE-MERGE: read-through — JSON cache then catalog album-zip before ripping.
 			if b.trySendCachedAlbumZip(chatID, pending.AlbumID, replyToID, format) ||
-				b.catalogTryServeAlbumZip(chatID, pending.AlbumID, replyToID, format) {
+				b.catalogTryServeAlbumZip(chatID, pending.AlbumID, replyToID, effectiveCatalogFormat(format, pending.ForceAAC, pending.ForceAtmos)) {
 				return ""
 			}
 		}
@@ -2342,7 +2347,7 @@ func (b *TelegramBot) queueDownloadSongWithReply(chatID int64, userID int64, son
 	// --no-cache bypasses the file_id cache so the track is genuinely re-ripped.
 	// PHASE-MERGE: read-through — JSON cache then catalog before prompting/ripping.
 	if !noCache && (b.trySendCachedTrack(chatID, replyToID, songID, format) ||
-		b.catalogTryServeTrack(chatID, replyToID, songID, format)) {
+		b.catalogTryServeTrack(chatID, replyToID, songID, effectiveCatalogFormat(format, forceAAC, forceAtmos))) {
 		return
 	}
 	b.promptTransferMode(chatID, userID, "", songID, "", "", replyToID, true, forceAAC, forceAtmos, forceFlac, noCache)
@@ -2490,7 +2495,7 @@ func (b *TelegramBot) enqueueBulkItem(item bulkItem, mode string, fl dlFlags, ch
 		format := b.resolveFormat(chatID, fl.flac)
 		// PHASE-MERGE: read-through — JSON cache then catalog before queuing the rip.
 		if fl.noCache || (!b.trySendCachedTrack(chatID, replyToID, item.id, format) &&
-			!b.catalogTryServeTrack(chatID, replyToID, item.id, format)) {
+			!b.catalogTryServeTrack(chatID, replyToID, item.id, effectiveCatalogFormat(format, fl.aac, fl.atmos))) {
 			songID, forceAAC, forceAtmos := item.id, fl.aac, fl.atmos
 			b.enqueueDownload(chatID, userID, username, replyToID, 0, true, format, mode, "", fl.noCache, func(ctx context.Context) error {
 				if forceAtmos {
@@ -2509,7 +2514,7 @@ func (b *TelegramBot) enqueueBulkItem(item bulkItem, mode string, fl dlFlags, ch
 		// PHASE-MERGE: read-through — JSON cache then catalog album-zip before ripping.
 		if mode == transferModeGofileZip && !fl.noCache &&
 			(b.trySendCachedAlbumZip(chatID, item.id, replyToID, format) ||
-				b.catalogTryServeAlbumZip(chatID, item.id, replyToID, format)) {
+				b.catalogTryServeAlbumZip(chatID, item.id, replyToID, effectiveCatalogFormat(format, fl.aac, fl.atmos))) {
 			return
 		}
 		b.enqueueAlbumDownload(chatID, item.id, replyToID, 0, mode, fl.aac, fl.atmos, fl.flac, fl.noCache, userID, username)
@@ -2962,18 +2967,37 @@ func (b *TelegramBot) trySendCachedAlbumZip(chatID int64, albumID string, replyT
 	return true
 }
 
+// effectiveCatalogFormat maps a request's flags to the ripper format that will
+// actually be produced, so the read-through variant matches what gets stored.
+// resolveFormat only yields alac/flac (the lossless container choice); the AAC/Atmos
+// tiers come from the -aac/-atmos force flags, which must override it. VariantKey
+// then collapses alac/flac → the single "lossless" tier.
+func effectiveCatalogFormat(format string, forceAAC, forceAtmos bool) string {
+	switch {
+	case forceAtmos:
+		return "atmos"
+	case forceAAC:
+		return "aac"
+	default:
+		return format // alac | flac → lossless tier
+	}
+}
+
 // catalogTryServeTrack is the Phase 2 read-through HIT path for a single track. It
 // looks up the exact (adamID, variant) in the catalog and, on a HIT, delivers the
 // file by copying it out of the dump (no rip, no queue slot) — mirroring
 // trySendCachedTrack's short-circuit. It returns false on a miss, a disabled
-// catalog, or any lookup/delivery error, so the caller proceeds to the normal rip
-// path. variant pins format+quality (§4.6).
+// catalog, a non-cacheable tier, or any lookup/delivery error, so the caller
+// proceeds to the normal rip path. format is the EFFECTIVE format (see
+// effectiveCatalogFormat); variant pins the quality tier (§4.6).
 //
 // PHASE-MERGE: delivery (b.deliverFromDump) is stubbed until Phase 1 merges, so
 // today every HIT returns false here and the request rips as usual; the lookup is
-// still exercised. When wired, a delivery error (e.g. the dump message was deleted)
-// should try the next-best row before falling back to rip (§4.4) — Lookup currently
-// returns a single row; multi-row fallback lands with real delivery.
+// still exercised. When wired: (a) a delivery error (e.g. the dump message was
+// deleted) should try the next-best row before falling back to rip (§4.4) — Lookup
+// returns a single row today; (b) when the user's lossless container preference is
+// FLAC but the cached lossless artifact is ALAC, deliver it with a caption noting
+// "cached as ALAC — re-run with -nc for a fresh FLAC rip" (operator decision).
 func (b *TelegramBot) catalogTryServeTrack(chatID int64, replyToID int, trackID, format string) bool {
 	if b.catalog == nil || !b.catalog.Enabled() || b.deliverFromDump == nil {
 		return false
@@ -2983,6 +3007,9 @@ func (b *TelegramBot) catalogTryServeTrack(chatID int64, replyToID int, trackID,
 		return false
 	}
 	variant := catalog.VariantKey(catalog.TrackMeta{Format: format})
+	if variant == "" {
+		return false // non-cacheable tier (e.g. binaural) → always rip
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	hit, ok, err := b.catalog.Lookup(ctx, catalog.KindTrack, adamID, "", variant)
@@ -3013,6 +3040,9 @@ func (b *TelegramBot) catalogTryServeAlbumZip(chatID int64, albumID string, repl
 		return false
 	}
 	variant := catalog.VariantKey(catalog.TrackMeta{Format: format})
+	if variant == "" {
+		return false // non-cacheable tier → always rip
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	hit, ok, err := b.catalog.LookupAlbumZip(ctx, aid, variant)

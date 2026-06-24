@@ -10,6 +10,8 @@
 // main.
 package catalog
 
+import "strings"
+
 // TrackMeta is the identity+quality record both phases pass around (master §4.1).
 // Phase 1 writes it into the dump caption and hands it to IndexInline for our own
 // uploads; Phase 2 parses it back out of captions when crawling. Field names are
@@ -47,13 +49,45 @@ const (
 	KindLRC      = "lrc"
 )
 
-// VariantKey is the cache-identity tier (§4.6, D10). v1 = format only. Cosmetic
-// options (cover, lyrics sync, embed flags) are deliberately NOT in the key: every
-// cached file is tagged maximally (highest-res cover + word-synced lyrics, a
-// superset of line-synced), so one file serves cover/word/line users alike and the
-// cache never forks on cosmetics. The format/column is kept extensible ONLY for a
-// future genuinely non-derivable master dimension; do NOT add cosmetic options here.
-// Both phases MUST produce this key identically.
+// Quality tiers — the ONLY cache dimensions (operator decision 2026-06-25).
+// ALAC and FLAC are one "lossless" tier: lossless audio is bit-identical and the
+// container is not worth a duplicate cached file (a FLAC-preferring user is served
+// the cached lossless file with a note to re-run -nc for a fresh FLAC rip).
+const (
+	TierLossless = "lossless"
+	TierAAC      = "aac"
+	TierAtmos    = "atmos"
+)
+
+// QualityTier collapses an Apple/ripper format string into a cache tier. Anything
+// outside the three tiers (e.g. binaural) returns "" = NOT cacheable: the caller
+// rips fresh and does not store a row.
+func QualityTier(format string) string {
+	switch strings.ToLower(strings.TrimSpace(format)) {
+	case "alac", "flac", "lossless":
+		return TierLossless
+	case "aac":
+		return TierAAC
+	case "atmos":
+		return TierAtmos
+	default:
+		return ""
+	}
+}
+
+// VariantKey is the cache-identity tier (§4.6, D10). v1 = QUALITY TIER only:
+//
+//	v1|q=lossless   v1|q=aac   v1|q=atmos
+//
+// It returns "" when the format isn't a cached tier, which both phases MUST treat
+// as "do not look up, do not store — always rip." Cosmetics (cover, lyrics, embed
+// flags) and the ALAC-vs-FLAC container are deliberately NOT cache dimensions, so
+// the cache never forks beyond these three tiers. Both phases MUST produce this key
+// identically (Phase 1's pre-merge mirror included).
 func VariantKey(m TrackMeta) string {
-	return "v1|fmt=" + m.Format
+	tier := QualityTier(m.Format)
+	if tier == "" {
+		return ""
+	}
+	return "v1|q=" + tier
 }

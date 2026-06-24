@@ -221,6 +221,11 @@ func (c *Catalog) UpsertTrack(ctx context.Context, dumpID int64, msgID int, m Tr
 	if m.Variant == "" {
 		m.Variant = VariantKey(m)
 	}
+	// Empty variant = a non-cacheable tier (e.g. binaural): never store a row, so
+	// these always rip fresh and never produce a stale HIT.
+	if m.Variant == "" {
+		return nil
+	}
 	lyrics := m.LyricsSync
 	if lyrics == "" {
 		lyrics = "none"
