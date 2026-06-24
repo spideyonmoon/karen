@@ -24,6 +24,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"main/catalog"
 	apputils "main/utils"
 	"main/utils/ampapi"
 	"main/utils/structs"
@@ -98,6 +99,16 @@ type TelegramBot struct {
 	searchLimit  int
 	maxFileBytes int64
 	mtproto      *MTProtoClient
+
+	// catalog is the Phase 2 read-through pointer DB (Supabase Postgres). It is
+	// always non-nil; when DATABASE_URL is unset/unreachable it runs DISABLED and
+	// every method degrades to a miss/no-op, so the bot behaves exactly as today.
+	catalog *catalog.Catalog
+	// deliverFromDump copies an already-stored dump file to a recipient with no
+	// "forwarded from" header (Phase 1's Pool.DeliverFromDump, §4.5). Until the
+	// Phase 1 branch merges this is a stub that returns an error, so every catalog
+	// HIT falls through to a normal rip. PHASE-MERGE: wire to Pool.DeliverFromDump.
+	deliverFromDump func(ctx context.Context, dumpID int64, msgID int, recipientID int64) error
 
 	// username is the bot's own @username (lowercased, no @), fetched via getMe at
 	// startup. Used to reject commands explicitly addressed to a different bot
@@ -520,6 +531,33 @@ func runTelegramBot(appleToken string) {
 
 	bot := newTelegramBot(botToken, appleToken)
 	bot.mtproto = mtprotoClient
+
+	// Phase 2 read-through catalog. Best-effort: an unset/unreachable DATABASE_URL
+	// logs once and runs catalog-disabled (every request rips as today) — the
+	// catalog must never hard-block the bot (master §8).
+	cat, err := catalog.New(context.Background(), Config.DatabaseURL)
+	if err != nil {
+		fmt.Printf("Catalog disabled (connect failed): %v\n", err)
+		cat = &catalog.Catalog{} // disabled, nil-safe
+	} else if cat.Enabled() {
+		if err := cat.Migrate(context.Background()); err != nil {
+			fmt.Printf("Catalog disabled (migrate failed): %v\n", err)
+			cat.Close()
+			cat = &catalog.Catalog{}
+		} else {
+			fmt.Println("Catalog connected (read-through enabled).")
+		}
+	} else {
+		fmt.Println("Catalog disabled — set database-url for the read-through catalog.")
+	}
+	bot.catalog = cat
+	// PHASE-MERGE: replace this stub with Pool.DeliverFromDump (§4.5). Until then,
+	// every catalog HIT errors here and the caller falls through to a normal rip,
+	// so the read-through is dormant end-to-end but exercised up to the copy.
+	bot.deliverFromDump = func(ctx context.Context, dumpID int64, msgID int, recipientID int64) error {
+		return fmt.Errorf("deliverFromDump not wired (Phase 1 not merged)")
+	}
+
 	bot.fetchUsername()
 	fmt.Println("Telegram bot started. Waiting for updates...")
 	bot.loop()
@@ -1765,7 +1803,8 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, username string,
 			b.bumpStats(userID, func(s *UserStats) { s.SongRips++ })
 			if headlessMode != "" {
 				format := b.resolveFormat(chatID, forceFlac)
-				if forceNoCache || !b.trySendCachedTrack(chatID, replyToID, songID, format) {
+				// PHASE-MERGE: read-through — try the JSON cache then the catalog before ripping.
+				if forceNoCache || (!b.trySendCachedTrack(chatID, replyToID, songID, format) && !b.catalogTryServeTrack(chatID, replyToID, songID, format)) {
 					b.enqueueDownload(chatID, userID, "", replyToID, 0, true, format, headlessMode, "", forceNoCache, func(ctx context.Context) error {
 						// Honor -atmos for headless single-song rips (see handleTransferMode).
 						if forceAtmos {
@@ -1944,9 +1983,80 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, username string,
 			return // hidden admin command
 		}
 		go b.handleSysStatus(chatID, replyToID)
+	case "index":
+		if !b.isAdmin(userID) {
+			return // hidden admin command
+		}
+		go b.handleIndexDump(chatID, args, replyToID)
 	default:
 		// Silently ignore unknown commands
 	}
+}
+
+// handleIndexDump crawls a dump channel's history and upserts a catalog row for
+// every message carrying our #karenidx caption (Phase 2 = own/controlled-caption
+// dumps only). Resumable: it walks newest→oldest, stops at the stored checkpoint,
+// and advances the checkpoint, so a re-run only picks up newly-added messages.
+// Admin-only; progress is reported via a Rich Message that's edited as it goes.
+func (b *TelegramBot) handleIndexDump(chatID int64, args []string, replyToID int) {
+	if b.catalog == nil || !b.catalog.Enabled() {
+		_ = b.sendMessageWithReply(chatID, "Catalog is disabled (set database-url).", nil, replyToID)
+		return
+	}
+	if b.mtproto == nil {
+		_ = b.sendMessageWithReply(chatID, "MTProto is not configured; cannot crawl dumps.", nil, replyToID)
+		return
+	}
+	if len(args) == 0 {
+		_ = b.sendMessageWithReply(chatID, "Usage: /index <dump_channel_id>  (e.g. -1001234567890)", nil, replyToID)
+		return
+	}
+	dumpID, err := strconv.ParseInt(strings.TrimSpace(args[0]), 10, 64)
+	if err != nil || dumpID == 0 {
+		_ = b.sendMessageWithReply(chatID, "Invalid dump id — use the -100… channel id.", nil, replyToID)
+		return
+	}
+
+	// A crawl can be long; bound it so a stuck RPC can't pin a goroutine forever.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+
+	fetcher, accessHash, err := newMTProtoFetcher(ctx, b.mtproto, dumpID)
+	if err != nil {
+		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Could not resolve dump %d: %v", dumpID, err), nil, replyToID)
+		return
+	}
+	if err := b.catalog.UpsertDump(ctx, dumpID, accessHash, "", "own"); err != nil {
+		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Failed to record dump: %v", err), nil, replyToID)
+		return
+	}
+
+	msgID, _ := b.sendMessageWithReplyReturn(chatID, fmt.Sprintf("📇 Indexing dump %d…", dumpID), nil, replyToID)
+
+	report := func(emoji, body string) {
+		plain := emoji + " " + body
+		if msgID != 0 {
+			_, _ = b.editMessageRich(chatID, msgID, plain, plain, nil)
+		} else {
+			_ = b.sendMessageWithReply(chatID, plain, nil, replyToID)
+		}
+	}
+
+	var lastEdit time.Time
+	indexed, err := b.catalog.IndexDump(ctx, fetcher, dumpID, func(n, newest int) {
+		// Throttle edits so a fast crawl doesn't flood the Bot API / trip FLOOD_WAIT.
+		if msgID != 0 && time.Since(lastEdit) > 2*time.Second {
+			lastEdit = time.Now()
+			_, _ = b.editMessageRich(chatID, msgID,
+				fmt.Sprintf("📇 Indexing dump `%d`… **%d** tracks (at msg %d).", dumpID, n, newest),
+				fmt.Sprintf("Indexing dump %d… %d tracks (at msg %d).", dumpID, n, newest), nil)
+		}
+	})
+	if err != nil {
+		report("⚠️", fmt.Sprintf("Indexing dump %d stopped: %v (indexed %d before the error).", dumpID, err, indexed))
+		return
+	}
+	report("✅", fmt.Sprintf("Indexed dump %d — %d tracks catalogued.", dumpID, indexed))
 }
 
 func (b *TelegramBot) handleSearch(chatID int64, userID int64, kind string, query string, replyToID int) {
@@ -2146,7 +2256,9 @@ func (b *TelegramBot) handleTransferMode(chatID int64, messageID int, mode strin
 	} else if pending.AlbumID != "" {
 		format := b.resolveFormat(chatID, pending.ForceFlac)
 		if mode == transferModeGofileZip && !pending.NoCache {
-			if b.trySendCachedAlbumZip(chatID, pending.AlbumID, replyToID, format) {
+			// PHASE-MERGE: read-through — JSON cache then catalog album-zip before ripping.
+			if b.trySendCachedAlbumZip(chatID, pending.AlbumID, replyToID, format) ||
+				b.catalogTryServeAlbumZip(chatID, pending.AlbumID, replyToID, format) {
 				return ""
 			}
 		}
@@ -2228,7 +2340,9 @@ func (b *TelegramBot) queueDownloadSongWithReply(chatID int64, userID int64, son
 	}
 	format := b.resolveFormat(chatID, forceFlac)
 	// --no-cache bypasses the file_id cache so the track is genuinely re-ripped.
-	if !noCache && b.trySendCachedTrack(chatID, replyToID, songID, format) {
+	// PHASE-MERGE: read-through — JSON cache then catalog before prompting/ripping.
+	if !noCache && (b.trySendCachedTrack(chatID, replyToID, songID, format) ||
+		b.catalogTryServeTrack(chatID, replyToID, songID, format)) {
 		return
 	}
 	b.promptTransferMode(chatID, userID, "", songID, "", "", replyToID, true, forceAAC, forceAtmos, forceFlac, noCache)
@@ -2374,7 +2488,9 @@ func (b *TelegramBot) enqueueBulkItem(item bulkItem, mode string, fl dlFlags, ch
 	case "song":
 		b.bumpStats(userID, func(s *UserStats) { s.SongRips++ })
 		format := b.resolveFormat(chatID, fl.flac)
-		if fl.noCache || !b.trySendCachedTrack(chatID, replyToID, item.id, format) {
+		// PHASE-MERGE: read-through — JSON cache then catalog before queuing the rip.
+		if fl.noCache || (!b.trySendCachedTrack(chatID, replyToID, item.id, format) &&
+			!b.catalogTryServeTrack(chatID, replyToID, item.id, format)) {
 			songID, forceAAC, forceAtmos := item.id, fl.aac, fl.atmos
 			b.enqueueDownload(chatID, userID, username, replyToID, 0, true, format, mode, "", fl.noCache, func(ctx context.Context) error {
 				if forceAtmos {
@@ -2390,7 +2506,10 @@ func (b *TelegramBot) enqueueBulkItem(item bulkItem, mode string, fl dlFlags, ch
 	case "album":
 		b.bumpStats(userID, func(s *UserStats) { s.AlbumRips++ })
 		format := b.resolveFormat(chatID, fl.flac)
-		if mode == transferModeGofileZip && !fl.noCache && b.trySendCachedAlbumZip(chatID, item.id, replyToID, format) {
+		// PHASE-MERGE: read-through — JSON cache then catalog album-zip before ripping.
+		if mode == transferModeGofileZip && !fl.noCache &&
+			(b.trySendCachedAlbumZip(chatID, item.id, replyToID, format) ||
+				b.catalogTryServeAlbumZip(chatID, item.id, replyToID, format)) {
 			return
 		}
 		b.enqueueAlbumDownload(chatID, item.id, replyToID, 0, mode, fl.aac, fl.atmos, fl.flac, fl.noCache, userID, username)
@@ -2653,6 +2772,11 @@ func (b *TelegramBot) enqueueAlbumDownload(chatID int64, albumID string, replyTo
 		return
 	}
 	format := b.resolveFormat(chatID, forceFlac)
+	// PHASE-MERGE (D9 album expansion): once dump delivery is wired, expand the album
+	// to its ordered track list here, Lookup each track's (adamID, variant), deliver
+	// the HITs via deliverFromDump in order, and queue ONLY the MISSes to rip — so a
+	// fully-cached album rips nothing and a half-cached one rips just the gaps. Today
+	// the whole album rips as one task (delivery is stubbed), so this stays a note.
 	b.enqueueDownload(chatID, userID, username, replyToID, statusMessageID, false, format, transferMode, albumID, noCache, func(ctx context.Context) error {
 		if forceAtmos {
 			if rs := ripStateFrom(ctx); rs != nil {
@@ -2833,6 +2957,74 @@ func (b *TelegramBot) trySendCachedAlbumZip(chatID int64, albumID string, replyT
 	}
 	if err := b.sendDocumentByFileID(chatID, entry, replyToID); err != nil {
 		b.deleteCachedDocument(key)
+		return false
+	}
+	return true
+}
+
+// catalogTryServeTrack is the Phase 2 read-through HIT path for a single track. It
+// looks up the exact (adamID, variant) in the catalog and, on a HIT, delivers the
+// file by copying it out of the dump (no rip, no queue slot) — mirroring
+// trySendCachedTrack's short-circuit. It returns false on a miss, a disabled
+// catalog, or any lookup/delivery error, so the caller proceeds to the normal rip
+// path. variant pins format+quality (§4.6).
+//
+// PHASE-MERGE: delivery (b.deliverFromDump) is stubbed until Phase 1 merges, so
+// today every HIT returns false here and the request rips as usual; the lookup is
+// still exercised. When wired, a delivery error (e.g. the dump message was deleted)
+// should try the next-best row before falling back to rip (§4.4) — Lookup currently
+// returns a single row; multi-row fallback lands with real delivery.
+func (b *TelegramBot) catalogTryServeTrack(chatID int64, replyToID int, trackID, format string) bool {
+	if b.catalog == nil || !b.catalog.Enabled() || b.deliverFromDump == nil {
+		return false
+	}
+	adamID, _ := strconv.ParseInt(strings.TrimSpace(trackID), 10, 64)
+	if adamID == 0 {
+		return false
+	}
+	variant := catalog.VariantKey(catalog.TrackMeta{Format: format})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	hit, ok, err := b.catalog.Lookup(ctx, catalog.KindTrack, adamID, "", variant)
+	if err != nil {
+		fmt.Printf("catalog lookup track %d: %v\n", adamID, err)
+		return false
+	}
+	if !ok {
+		return false
+	}
+	if err := b.deliverFromDump(ctx, hit.DumpID, hit.MsgID, chatID); err != nil {
+		fmt.Printf("catalog deliver track %d (dump=%d msg=%d): %v\n", adamID, hit.DumpID, hit.MsgID, err)
+		return false
+	}
+	return true
+}
+
+// catalogTryServeAlbumZip is the read-through HIT path for an album-as-zip
+// artifact, keyed by (apple_album_id, variant) (§4.6, D9). Same short-circuit
+// semantics as catalogTryServeTrack. PHASE-MERGE: dormant until deliverFromDump is
+// wired.
+func (b *TelegramBot) catalogTryServeAlbumZip(chatID int64, albumID string, replyToID int, format string) bool {
+	if b.catalog == nil || !b.catalog.Enabled() || b.deliverFromDump == nil {
+		return false
+	}
+	aid, _ := strconv.ParseInt(strings.TrimSpace(albumID), 10, 64)
+	if aid == 0 {
+		return false
+	}
+	variant := catalog.VariantKey(catalog.TrackMeta{Format: format})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	hit, ok, err := b.catalog.LookupAlbumZip(ctx, aid, variant)
+	if err != nil {
+		fmt.Printf("catalog lookup album-zip %d: %v\n", aid, err)
+		return false
+	}
+	if !ok {
+		return false
+	}
+	if err := b.deliverFromDump(ctx, hit.DumpID, hit.MsgID, chatID); err != nil {
+		fmt.Printf("catalog deliver album-zip %d (dump=%d msg=%d): %v\n", aid, hit.DumpID, hit.MsgID, err)
 		return false
 	}
 	return true
@@ -4286,6 +4478,12 @@ func (b *TelegramBot) sendAudioFile(ctx context.Context, chatID int64, filePath 
 			Title:          meta.Title,
 			Performer:      meta.Performer,
 		})
+		// PHASE-MERGE (inline indexing, D8): this is the "we just uploaded our own
+		// file and hold full metadata" point. Once Phase 1 reroutes uploads to a dump
+		// channel and UploadToDump returns the durable handle (dumpID, msgID), call
+		//   b.catalog.IndexInline(ctx, dumpID, msgID, catalog.TrackMeta{…from meta…})
+		// here (alongside the JSON cache store) so the catalog grows on every own
+		// upload without a crawl. The Bot API file_id cached above stays as a fallback.
 	}
 	return nil
 }

@@ -6,6 +6,7 @@ require (
 	github.com/aead/cmac v0.0.0-20160719120800-7af84192f0b1
 	github.com/go-resty/resty/v2 v2.16.5
 	github.com/gotd/td v0.144.0
+	github.com/jackc/pgx/v5 v5.7.2
 	github.com/grafov/m3u8 v0.11.1
 	github.com/schollz/progressbar/v3 v3.14.6
 	github.com/spf13/pflag v1.0.5

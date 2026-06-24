@@ -62,6 +62,12 @@ type ConfigSet struct {
 	MediaUserToken                string  `yaml:"media-user-token"`
 	WrapperManagerAddrs           []string `yaml:"wrapper-manager-addrs"`
 
+	// DatabaseURL is the Supabase (Singapore) pooled Postgres connection string for
+	// the Phase 2 read-through catalog. Empty → catalog runs disabled (every request
+	// is a MISS → rip as today); the catalog never hard-blocks the bot. Secret: lives
+	// in .env only, injected via generate.sh.
+	DatabaseURL string `yaml:"database-url"`
+
 	// TaskConcurrency enables running more than one queued rip at a time: a head
 	// task downloads with the full wrapper pool while an eligible queued gofile
 	// task borrows a few wrappers, and a finished rip's upload runs detached so the

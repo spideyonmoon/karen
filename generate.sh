@@ -135,6 +135,7 @@ telegram-request-timeout-seconds: 3600
 telegram-api-id: ${TELEGRAM_API_ID:-0}
 telegram-api-hash: "${TELEGRAM_API_HASH:-}"
 gofile-token: "${GOFILE_TOKEN:-}"
+database-url: "${DATABASE_URL:-}"
 task-concurrency: true
 lend-head-remaining-threshold: 50
 borrower-max-tracks: 30
