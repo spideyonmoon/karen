@@ -1501,6 +1501,8 @@ func (b *TelegramBot) handleCallback(cb *CallbackQuery) {
 		if delta, err := strconv.Atoi(deltaStr); err == nil {
 			alert = b.handlePage(cb.Message.Chat.ID, cb.Message.MessageID, delta, clickerID)
 		}
+	} else if strings.HasPrefix(data, "help:") {
+		alert = b.handleHelpCallback(cb, data)
 	} else if strings.HasPrefix(data, "pf:") {
 		alert = b.handleProfileCallback(cb, data, clickerID)
 	} else if strings.HasPrefix(data, "artsel:") {
@@ -1620,7 +1622,7 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, username string,
 	case "scheduled", "pending":
 		b.handleScheduledBoard(chatID, replyToID)
 	case "start", "help":
-		_, _ = b.sendRichMessage(chatID, botHelpRich(), botHelpText(), nil, replyToID)
+		b.handleHelpCommand(chatID, replyToID)
 	case "profile":
 		b.handleProfileCommand(chatID, userID, replyToID)
 	case "status", "queue":
@@ -7617,92 +7619,192 @@ func (b *TelegramBot) adminRestart(chatID int64, replyToID int) {
 	os.Exit(0)
 }
 
-func botHelpText() string {
-	return strings.TrimSpace(`
-Commands:
-/dl <link> [link …] [flags]      download song(s), album(s), artist, or playlist
-/check <apple-music-link>        inspect a link: track count + metadata, or a full artist breakdown
-/status or /queue                show active task and queue count
-/scheduled                       list rips deferred to the sleeptime window
-/stop_<task_id>                  cancel a running or queued download
-/cancel_<id>                     cancel a scheduled (deferred) rip
-/profile                         set your saved rip preferences (buttons)
-/help                            show this message
+// =============================================================================
+// /help and /start — a compact, button-driven help card (Bot API 10.1 Rich UI).
+//
+// The old help dumped four tables in one wall of text. This is a short landing
+// card with nav buttons; each section (Commands / Flags / Delivery / Examples)
+// is one Rich Message edited in place, with a Back button home. Navigation is
+// stateless and read-only, so — unlike /profile — taps aren't owner-guarded;
+// anyone in the chat can browse. Callbacks are namespaced under "help:".
+// =============================================================================
 
-Bulk: pass several links (space- or line-separated) to queue them at once —
-up to 3 (regular) or 5 (donor), capped by your free task slots; extras are
-dropped. Bulk supports songs, albums, music videos, and stations — send
-playlists and artists one at a time. Flags apply to every link, and if no
-delivery target is set you're asked once for the whole batch.
-
-Delivery: playlists over 40 tracks are always delivered as a Gofile ZIP
-(sending dozens of individual files trips Telegram's rate limits). Very heavy
-rips (full artist discographies, playlists over 100 tracks) also wait for the
-2:30–6:00 AM Dhaka window.
-
-Default quality is ALAC. -aac and -atmos pick a different source codec; -flac
-re-encodes the downloaded audio to FLAC. If you combine codec flags, one wins.
-
-Flags:
-  -aac     download in AAC-LC format
-  -atmos   download in Dolby Atmos format
-  -flac    convert the downloaded audio to FLAC
-  -art     grab cover art + motion artwork (no audio)
-  -nc      no-cache: delete any cached copy and re-rip fresh
-  -tgu     send as individual Telegram tracks (skip keyboard)
-  -tgz     send as Telegram ZIP (skip keyboard)
-  -go      send as Gofile ZIP (skip keyboard)
-`)
+// handleHelpCommand sends the help landing card.
+func (b *TelegramBot) handleHelpCommand(chatID int64, replyToID int) {
+	_, _ = b.sendRichMessage(chatID, helpRich("home"), helpPlain("home"), helpMarkup("home"), replyToID)
 }
 
-// botHelpRich is the Bot API 10.1 Rich Markdown rendering of the help text:
-// real headings, a flags table, and code-formatted command examples. Falls back
-// to botHelpText() when the API can't serve rich content.
-func botHelpRich() string {
-	return strings.TrimSpace(`
-# Karen — Apple Music downloader
+// handleHelpCallback routes a "help:nav:<panel>" tap by editing the card in place.
+func (b *TelegramBot) handleHelpCallback(cb *CallbackQuery, data string) string {
+	panel := strings.TrimPrefix(data, "help:nav:")
+	if panel == "" {
+		panel = "home"
+	}
+	_, _ = b.editMessageRich(cb.Message.Chat.ID, cb.Message.MessageID,
+		helpRich(panel), helpPlain(panel), helpMarkup(panel))
+	return ""
+}
 
-Rips lossless ALAC, Dolby Atmos, and AAC from Apple Music straight to your chat.
+// helpMarkup returns the keyboard for a help panel: nav buttons on home, a single
+// Back button on every section.
+func helpMarkup(panel string) InlineKeyboardMarkup {
+	if panel == "home" {
+		return InlineKeyboardMarkup{InlineKeyboard: [][]InlineKeyboardButton{
+			{
+				{Text: "📥 Commands", CallbackData: "help:nav:commands", Style: "primary"},
+				{Text: "🚩 Flags", CallbackData: "help:nav:flags", Style: "primary"},
+			},
+			{
+				{Text: "📦 Delivery", CallbackData: "help:nav:delivery", Style: "primary"},
+				{Text: "💡 Examples", CallbackData: "help:nav:examples", Style: "primary"},
+			},
+		}}
+	}
+	return InlineKeyboardMarkup{InlineKeyboard: [][]InlineKeyboardButton{
+		{{Text: "‹ Back", CallbackData: "help:nav:home"}},
+	}}
+}
 
-## Commands
+// helpRich renders one help panel as Bot API 10.1 Rich Markdown.
+func helpRich(panel string) string {
+	switch panel {
+	case "commands":
+		return strings.TrimSpace(`
+## 📥 Commands
 
 | Command | What it does |
 |:--------|:-------------|
-| ` + "`/dl <link> [link …] [flags]`" + ` | Download one or several songs/albums/MVs/stations (or a single artist/playlist) |
-| ` + "`/check <link>`" + ` | Inspect a link: track count + metadata, or a full artist breakdown |
-| ` + "`/status`" + ` or ` + "`/queue`" + ` | Show the active task and queue |
+| ` + "`/dl <link> [flags]`" + ` | Download a song, album, MV, station, artist, or playlist |
+| ` + "`/check <link>`" + ` | Inspect a link: track count + metadata, or an artist breakdown |
+| ` + "`/status`" + ` · ` + "`/queue`" + ` | Show the active task and queue |
 | ` + "`/scheduled`" + ` | List rips deferred to the sleeptime window |
-| ` + "`/stop_<task_id>`" + ` | Cancel a running or queued download |
-| ` + "`/cancel_<id>`" + ` | Cancel a scheduled (deferred) rip |
 | ` + "`/profile`" + ` | Set your saved rip preferences (all buttons) |
-| ` + "`/help`" + ` | Show this message |
+| ` + "`/stop_<id>`" + ` | Cancel a running or queued download |
+| ` + "`/cancel_<id>`" + ` | Cancel a scheduled (deferred) rip |
+| ` + "`/help`" + ` | Show this card |
 
-> **Bulk:** pass several links (space- or line-separated) to queue them at once — up to **3** (regular) or **5** (donor), capped by your free task slots. Bulk covers songs, albums, music videos, and stations; send playlists and artists one at a time. Flags apply to every link, and if no delivery target is set you're asked once for the whole batch.
->
-> Playlists over **40 tracks** are always delivered as a Gofile ZIP (dozens of individual uploads trip Telegram's rate limits). Very heavy rips (full artist discographies, playlists over 100 tracks) also wait for the 2:30–6:00 AM Dhaka window.
->
-> Default quality is ALAC. ` + "`-aac`/`-atmos`" + ` pick a different source codec; ` + "`-flac`" + ` re-encodes after download. If you combine codec flags, one wins.
+> Tip: set your defaults once in ` + "`/profile`" + ` and ` + "`/dl <link>`" + ` needs nothing else.
+`)
+	case "flags":
+		return strings.TrimSpace(`
+## 🚩 Flags
 
-## Flags
+Append to any ` + "`/dl`" + `. Default quality is **ALAC**.
 
 | Flag | Effect |
 |:-----|:-------|
 | ` + "`-aac`" + ` | Download in AAC-LC format |
 | ` + "`-atmos`" + ` | Download in Dolby Atmos format |
-| ` + "`-flac`" + ` | Convert the downloaded audio to FLAC |
-| ` + "`-art`" + ` | Grab cover art + motion artwork (no audio) |
-| ` + "`-nc`" + ` | No-cache: delete any cached copy and re-rip fresh |
+| ` + "`-flac`" + ` | Re-encode the download to FLAC |
+| ` + "`-art`" + ` | Grab cover + motion artwork (no audio) |
+| ` + "`-nc`" + ` | No-cache: delete any cached copy, re-rip fresh |
 | ` + "`-tgu`" + ` | Send as individual Telegram tracks |
 | ` + "`-tgz`" + ` | Send as a Telegram ZIP |
 | ` + "`-go`" + ` | Send as a Gofile ZIP |
 
-## Examples
+> ` + "`-aac`/`-atmos`" + ` pick the source codec; ` + "`-flac`" + ` re-encodes after download. Combine codec flags and one wins.
+`)
+	case "delivery":
+		return strings.TrimSpace(`
+## 📦 Delivery & limits
+
+**Bulk** — pass several links (space- or line-separated) to queue them at once: up to **3** (regular) or **5** (donor), capped by your free task slots. Covers songs, albums, MVs, and stations; send playlists and artists one at a time. Flags apply to every link, and you're asked for a delivery target once for the whole batch.
+
+**Targets** — the ` + "`-tgu`/`-tgz`/`-go`" + ` flags skip the picker; otherwise you're prompted per rip.
+
+> Playlists over **40 tracks** always go out as a Gofile ZIP — dozens of individual uploads trip Telegram's rate limits.
+>
+> Very heavy rips (full discographies, playlists over **100 tracks**) wait for the **2:30–6:00 AM Dhaka** sleeptime window. Track them with ` + "`/scheduled`" + `.
+`)
+	case "examples":
+		return strings.TrimSpace(`
+## 💡 Examples
 
 ` + "```" + `
 /dl https://music.apple.com/album/123456
 /dl https://music.apple.com/album/123456 -aac
 /dl https://music.apple.com/song/789012 -atmos -tgz
-/dl <album-link> <song-link> <mv-link> -go     (bulk: queue all three)
+/dl <album> <song> <mv> -go      (bulk: queue all three)
+/check https://music.apple.com/artist/123456
 ` + "```" + `
 `)
+	default: // home
+		return strings.TrimSpace(`
+# 🎧 Karen — Apple Music downloader
+
+Rips lossless **ALAC**, **Dolby Atmos**, and **AAC** from Apple Music straight to your chat.
+
+**Quick start:** send ` + "`/dl <apple-music-link>`" + ` — that's it.
+
+Tap below for the rest, or set your defaults in ` + "`/profile`" + `.
+`)
+	}
+}
+
+// helpPlain is the pre-10.1 fallback for each help panel.
+func helpPlain(panel string) string {
+	switch panel {
+	case "commands":
+		return strings.TrimSpace(`
+Commands:
+/dl <link> [flags]   download a song, album, MV, station, artist, or playlist
+/check <link>        inspect a link: track count + metadata, or artist breakdown
+/status or /queue    show the active task and queue
+/scheduled           list rips deferred to the sleeptime window
+/profile             set your saved rip preferences (buttons)
+/stop_<id>           cancel a running or queued download
+/cancel_<id>         cancel a scheduled (deferred) rip
+/help                show this message
+`)
+	case "flags":
+		return strings.TrimSpace(`
+Flags (append to any /dl; default quality is ALAC):
+  -aac     download in AAC-LC format
+  -atmos   download in Dolby Atmos format
+  -flac    re-encode the download to FLAC
+  -art     grab cover + motion artwork (no audio)
+  -nc      no-cache: delete any cached copy and re-rip fresh
+  -tgu     send as individual Telegram tracks
+  -tgz     send as a Telegram ZIP
+  -go      send as a Gofile ZIP
+
+-aac/-atmos pick the source codec; -flac re-encodes after download.
+If you combine codec flags, one wins.
+`)
+	case "delivery":
+		return strings.TrimSpace(`
+Delivery & limits
+
+Bulk: pass several links (space- or line-separated) to queue them at once —
+up to 3 (regular) or 5 (donor), capped by your free task slots. Covers songs,
+albums, music videos, and stations; send playlists and artists one at a time.
+Flags apply to every link, and you're asked for a delivery target once for the
+whole batch.
+
+Playlists over 40 tracks always go out as a Gofile ZIP (dozens of individual
+uploads trip Telegram's rate limits). Very heavy rips (full discographies,
+playlists over 100 tracks) wait for the 2:30-6:00 AM Dhaka window. Track them
+with /scheduled.
+`)
+	case "examples":
+		return strings.TrimSpace(`
+Examples:
+/dl https://music.apple.com/album/123456
+/dl https://music.apple.com/album/123456 -aac
+/dl https://music.apple.com/song/789012 -atmos -tgz
+/dl <album> <song> <mv> -go      (bulk: queue all three)
+/check https://music.apple.com/artist/123456
+`)
+	default: // home
+		return strings.TrimSpace(`
+Karen — Apple Music downloader
+
+Rips lossless ALAC, Dolby Atmos, and AAC from Apple Music straight to your chat.
+
+Quick start: send /dl <apple-music-link>.
+
+Commands: /dl, /check, /status, /scheduled, /profile, /stop_<id>, /cancel_<id>, /help
+Set your defaults in /profile.
+`)
+	}
 }
