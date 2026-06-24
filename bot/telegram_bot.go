@@ -29,6 +29,8 @@ import (
 	"main/utils/ampapi"
 	"main/utils/structs"
 	"main/utils/task"
+
+	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -99,6 +101,10 @@ type TelegramBot struct {
 	searchLimit  int
 	maxFileBytes int64
 	mtproto      *MTProtoClient
+	// pool is the optional multi-account upload engine (Phase 1). When ready, audio
+	// delivery uploads tracks in parallel across helper accounts to the dump channel
+	// and copies them to the user. nil/not-ready → the single-client mtproto path.
+	pool *Pool
 
 	// catalog is the Phase 2 read-through pointer DB (Supabase Postgres). It is
 	// always non-nil; when DATABASE_URL is unset/unreachable it runs DISABLED and
@@ -535,6 +541,21 @@ func runTelegramBot(appleToken string) {
 	bot := newTelegramBot(botToken, appleToken)
 	bot.mtproto = mtprotoClient
 
+	// Phase 1: optional multi-account upload pool. Needs the main MTProto client,
+	// at least one helper token, and a dump channel. Any missing piece (or a helper
+	// that fails first auth) leaves bot.pool nil → uploads use the single-client
+	// path exactly as before, so a missing/broken pool can't break existing deploys.
+	if mtprotoClient != nil && len(Config.HelperBotTokens) > 0 && Config.DumpChannelID != 0 {
+		pool, perr := NewUploadPool(context.Background(), mtprotoClient, Config.TelegramApiID, Config.TelegramApiHash, Config.HelperBotTokens, Config.DumpChannelID)
+		if perr != nil {
+			fmt.Printf("Warning: upload pool init failed: %v\nFalling back to single-account uploads.\n", perr)
+		} else {
+			bot.pool = pool
+		}
+	} else if mtprotoClient != nil {
+		fmt.Println("Upload pool not configured — set helper-bot-tokens and dump-channel-id to parallelize uploads.")
+	}
+
 	// Phase 2 read-through catalog. Best-effort: an unset/unreachable DATABASE_URL
 	// logs once and runs catalog-disabled (every request rips as today) — the
 	// catalog must never hard-block the bot (master §8).
@@ -554,11 +575,24 @@ func runTelegramBot(appleToken string) {
 		fmt.Println("Catalog disabled — set database-url for the read-through catalog.")
 	}
 	bot.catalog = cat
-	// PHASE-MERGE: replace this stub with Pool.DeliverFromDump (§4.5). Until then,
-	// every catalog HIT errors here and the caller falls through to a normal rip,
-	// so the read-through is dormant end-to-end but exercised up to the copy.
-	bot.deliverFromDump = func(ctx context.Context, dumpID int64, msgID int, recipientID int64, replyToID int) error {
-		return fmt.Errorf("deliverFromDump not wired (Phase 1 not merged)")
+
+	// Wire the catalog HIT path to the pool's DropAuthor copy, and register the dump
+	// row (the FK target for inline indexing) once at startup with its real
+	// access_hash. Without a pool there is no dump to copy from, so deliverFromDump
+	// stays a stub that errors and every catalog HIT falls through to a normal rip.
+	if bot.pool != nil {
+		bot.deliverFromDump = bot.pool.DeliverFromDump
+		if cat.Enabled() {
+			if ah, ahErr := bot.pool.ResolveDumpAccessHash(context.Background()); ahErr != nil {
+				fmt.Printf("Catalog: could not resolve dump access hash (own uploads won't index until /index): %v\n", ahErr)
+			} else if derr := cat.UpsertDump(context.Background(), bot.pool.DumpID(), ah, "", "own"); derr != nil {
+				fmt.Printf("Catalog: UpsertDump failed: %v\n", derr)
+			}
+		}
+	} else {
+		bot.deliverFromDump = func(ctx context.Context, dumpID int64, msgID int, recipientID int64, replyToID int) error {
+			return fmt.Errorf("deliverFromDump unavailable: upload pool not configured")
+		}
 	}
 
 	bot.fetchUsername()
@@ -1520,6 +1554,8 @@ func (b *TelegramBot) handleCallback(cb *CallbackQuery) {
 		if delta, err := strconv.Atoi(deltaStr); err == nil {
 			alert = b.handlePage(cb.Message.Chat.ID, cb.Message.MessageID, delta, clickerID)
 		}
+	} else if strings.HasPrefix(data, "help:") {
+		alert = b.handleHelpCallback(cb, data)
 	} else if strings.HasPrefix(data, "pf:") {
 		alert = b.handleProfileCallback(cb, data, clickerID)
 	} else if strings.HasPrefix(data, "artsel:") {
@@ -1639,7 +1675,7 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, username string,
 	case "scheduled", "pending":
 		b.handleScheduledBoard(chatID, replyToID)
 	case "start", "help":
-		_, _ = b.sendRichMessage(chatID, botHelpRich(), botHelpText(), nil, replyToID)
+		b.handleHelpCommand(chatID, replyToID)
 	case "profile":
 		b.handleProfileCommand(chatID, userID, replyToID)
 	case "status", "queue":
@@ -1991,6 +2027,18 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, username string,
 			return // hidden admin command
 		}
 		go b.handleIndexDump(chatID, args, replyToID)
+	case "stopall":
+		if !b.isAdmin(userID) {
+			return // hidden admin command
+		}
+		b.cancelAllTasks(chatID, replyToID)
+	case "restart":
+		if !b.isAdmin(userID) {
+			return // hidden admin command
+		}
+		// Runs off the update loop: it sends a reply, frees in-flight work, purges,
+		// then os.Exit(0) — Docker's restart policy brings the bot back.
+		go b.adminRestart(chatID, replyToID)
 	default:
 		// Silently ignore unknown commands
 	}
@@ -3382,6 +3430,22 @@ func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, re
 		}
 	}
 
+	// PHASE-MERGE: when the multi-account pool is ready, audio tracks upload in
+	// parallel across helper accounts to the dump channel and are copied to the
+	// user (DropAuthor). This is also the seam where a Phase-2 catalog HIT delivers
+	// straight from the dump and a MISS records the inline catalog row. The
+	// single-client group-upload path below is the fallback when the pool is absent.
+	if b.pool != nil && b.pool.Ready() && len(audioPaths) > 0 {
+		if b.deliverAudioViaPool(chatID, audioPaths, replyToID, format, status, ctx) {
+			sentAny = true
+		}
+		if sentAny {
+			status.Stop()
+			b.sendDeliverySummary(ctx, chatID, paths, format, replyToID)
+		}
+		return
+	}
+
 	// Chunk the audio tracks into groups of up to 10
 	const maxGroupSize = 10
 	for i := 0; i < len(audioPaths); i += maxGroupSize {
@@ -3511,6 +3575,164 @@ func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, re
 	}
 }
 
+// deliverAudioViaPool delivers audio tracks through the multi-account upload pool.
+// Phase A uploads every track to the dump channel concurrently (capped at the
+// helper count, least-loaded scheduling); Phase B copies each stored message to
+// the user in original track order with no "forwarded from" header. A per-track
+// upload OR copy failure falls back to a direct single-client MTProto upload and
+// then Gofile, so a degraded pool never silently drops a track. Returns true if at
+// least one track reached the user.
+func (b *TelegramBot) deliverAudioViaPool(chatID int64, audioPaths []string, replyToID int, format string, status *DownloadStatus, ctx context.Context) bool {
+	type dumped struct {
+		path    string
+		dumpID  int64
+		msgID   int
+		meta    AudioMeta
+		hasMeta bool
+		err     error
+	}
+	results := make([]dumped, len(audioPaths))
+
+	// Phase A: upload to the dump in parallel across helpers.
+	var g errgroup.Group
+	if n := b.pool.Size(); n > 0 {
+		g.SetLimit(n)
+	}
+	var done atomic.Int64
+	total := len(audioPaths)
+	for i, path := range audioPaths {
+		results[i].path = path
+		g.Go(func() error {
+			if ctx != nil && ctx.Err() != nil {
+				results[i].err = ctx.Err()
+				return nil
+			}
+			meta, hasMeta := getDownloadedMeta(ctx, path)
+			results[i].meta, results[i].hasMeta = meta, hasMeta
+			m := buildTrackMeta(path, format, meta, hasMeta)
+			dumpID, msgID, err := b.pool.uploadToDump(ctx, path, m, status)
+			results[i].dumpID, results[i].msgID, results[i].err = dumpID, msgID, err
+			n := done.Add(1)
+			if status != nil {
+				status.Update(fmt.Sprintf("Uploading %d/%d", n, total), 0, 0)
+			}
+			return nil
+		})
+	}
+	_ = g.Wait() // per-item errors are captured in results; g.Go never returns non-nil
+
+	// Phase B: deliver. Batch the successful dump uploads into as few forward RPCs
+	// as possible (track order) so the main account takes one send per ~90 tracks
+	// instead of one per track; anything that failed to upload — or whose batch
+	// chunk failed — falls back to a direct per-track upload.
+	sentAny := false
+	delivered := make([]bool, len(results))
+	var ids []int
+	var idxOf []int
+	var dumpID int64
+	for i := range results {
+		if results[i].err == nil && results[i].msgID != 0 {
+			// Inline indexing (D8): record the catalog row for this own upload so
+			// repeat requests become copy-from-dump HITs. Best-effort and nil-safe —
+			// IndexInline no-ops when the catalog is disabled or the tier is
+			// non-cacheable. Rebuild the meta from the recorded fields (cheap).
+			if b.catalog != nil {
+				im := buildTrackMeta(results[i].path, format, results[i].meta, results[i].hasMeta)
+				if ierr := b.catalog.IndexInline(ctx, results[i].dumpID, results[i].msgID, im); ierr != nil {
+					fmt.Printf("catalog IndexInline (msg=%d): %v\n", results[i].msgID, ierr)
+				}
+			}
+			dumpID = results[i].dumpID
+			ids = append(ids, results[i].msgID)
+			idxOf = append(idxOf, i)
+		}
+	}
+	if len(ids) > 0 && (ctx == nil || ctx.Err() == nil) {
+		const fwdChunk = 90 // Telegram caps a single forward at 100 ids
+		for s := 0; s < len(ids); s += fwdChunk {
+			e := s + fwdChunk
+			if e > len(ids) {
+				e = len(ids)
+			}
+			if err := b.pool.DeliverManyFromDump(ctx, dumpID, ids[s:e], chatID, replyToID); err != nil {
+				fmt.Printf("dump batch copy failed: %v; affected tracks fall back to direct upload\n", err)
+				continue // this chunk's tracks stay undelivered → per-track fallback below
+			}
+			for k := s; k < e; k++ {
+				delivered[idxOf[k]] = true
+			}
+			sentAny = true
+		}
+	}
+
+	// Per-track fallback for anything not delivered above.
+	for i := range results {
+		if ctx != nil && ctx.Err() != nil {
+			status.UpdateSync("Cancelled", 0, 0)
+			return sentAny
+		}
+		if delivered[i] {
+			continue
+		}
+		r := results[i]
+		if r.err != nil && !errors.Is(r.err, context.Canceled) {
+			fmt.Printf("dump upload failed for %s: %v; falling back to direct upload\n", filepath.Base(r.path), r.err)
+		}
+		if b.deliverSingleTrackFallback(chatID, r.path, replyToID, format, r.meta, r.hasMeta, status, ctx) {
+			sentAny = true
+		}
+	}
+	return sentAny
+}
+
+// deliverSingleTrackFallback sends one track directly to the user via the main
+// MTProto client, then Gofile, when the pool path failed for that track. Returns
+// true on success. Mirrors the per-item fallback in the single-client group path.
+func (b *TelegramBot) deliverSingleTrackFallback(chatID int64, path string, replyToID int, format string, meta AudioMeta, hasMeta bool, status *DownloadStatus, ctx context.Context) bool {
+	if ctx != nil && ctx.Err() != nil {
+		return false
+	}
+	title := filepath.Base(path)
+	performer := ""
+	durationSecs := 0
+	if hasMeta {
+		if meta.Title != "" {
+			title = meta.Title
+		}
+		performer = meta.Performer
+		if meta.DurationMillis > 0 {
+			durationSecs = int(meta.DurationMillis / 1000)
+		}
+	}
+	thumbPath := ""
+	if coverPath := findCoverFile(filepath.Dir(path)); coverPath != "" {
+		if tp, err := makeTelegramThumb(coverPath); err == nil {
+			thumbPath = tp
+			defer os.Remove(tp)
+		}
+	}
+	var sizeBytes int64
+	if info, err := os.Stat(path); err == nil {
+		sizeBytes = info.Size()
+	}
+	caption := formatTelegramCaption(sizeBytes, calcBitrateKbps(sizeBytes, meta.DurationMillis), format)
+
+	if b.mtproto != nil && b.mtproto.IsReady() {
+		if err := b.mtproto.UploadAndSendAudio(chatID, path, title, performer, durationSecs, caption, thumbPath, replyToID, status, ctx); err == nil {
+			return true
+		} else if ctx != nil && ctx.Err() != nil {
+			return false
+		} else {
+			fmt.Printf("direct MTProto upload failed for %s: %v; trying Gofile\n", filepath.Base(path), err)
+		}
+	}
+	if link, gerr := apputils.UploadToGofile(ctx, path, Config.GofileToken); gerr == nil {
+		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("File: %s\nDownload Link: %s", filepath.Base(path), link), nil, replyToID)
+		return true
+	}
+	return false
+}
+
 // deliverTelegramIndividualFallback sends tracks via Bot API (limited to maxFileBytes) or Gofile.
 func (b *TelegramBot) deliverTelegramIndividualFallback(chatID int64, paths []string, replyToID int, format string, status *DownloadStatus, ctx context.Context) {
 	sentAny := false
@@ -3614,6 +3836,38 @@ func (b *TelegramBot) deliverTelegramZip(chatID int64, paths []string, replyToID
 
 	if ctx != nil && ctx.Err() != nil {
 		status.UpdateSync("Cancelled", 0, 0)
+		return
+	}
+
+	// PHASE-MERGE: route the album zip through a helper account (kind=album_zip)
+	// so the main bot account isn't the one taking the large-upload FLOOD_WAIT hit;
+	// the main bot only does the lightweight DropAuthor copy to the user. The inline
+	// catalog row for the zip artifact is recorded at the marked seam (Phase 2).
+	if b.pool != nil && b.pool.Ready() {
+		m := albumZipMeta(albumID, format, displayName)
+		if dumpID, msgID, uerr := b.pool.uploadToDump(ctx, zipPath, m, status); uerr == nil {
+			// Inline-index the album-zip artifact (D8) so repeat zip requests HIT.
+			// Best-effort and nil-safe.
+			if b.catalog != nil {
+				if ierr := b.catalog.IndexInline(ctx, dumpID, msgID, m); ierr != nil {
+					fmt.Printf("catalog IndexInline album-zip (msg=%d): %v\n", msgID, ierr)
+				}
+			}
+			if derr := b.pool.DeliverFromDump(ctx, dumpID, msgID, chatID, replyToID); derr == nil {
+				status.Stop()
+				b.sendDeliverySummary(ctx, chatID, paths, format, replyToID)
+				return
+			} else {
+				fmt.Printf("dump zip copy failed: %v; falling back to Gofile\n", derr)
+			}
+		} else if ctx != nil && ctx.Err() != nil {
+			status.UpdateSync("Cancelled", 0, 0)
+			return
+		} else {
+			fmt.Printf("dump zip upload failed: %v; falling back\n", uerr)
+		}
+		// Pool path failed (and not cancelled) → fall through to Gofile.
+		b.deliverGofileZipFromPath(chatID, zipPath, displayName, replyToID, status, ctx)
 		return
 	}
 
@@ -7537,92 +7791,280 @@ drain:
 		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Task %s not found.", taskID), nil, replyToID)
 	}
 }
-func botHelpText() string {
-	return strings.TrimSpace(`
-Commands:
-/dl <link> [link …] [flags]      download song(s), album(s), artist, or playlist
-/check <apple-music-link>        inspect a link: track count + metadata, or a full artist breakdown
-/status or /queue                show active task and queue count
-/scheduled                       list rips deferred to the sleeptime window
-/stop_<task_id>                  cancel a running or queued download
-/cancel_<id>                     cancel a scheduled (deferred) rip
-/profile                         set your saved rip preferences (buttons)
-/help                            show this message
 
-Bulk: pass several links (space- or line-separated) to queue them at once —
-up to 3 (regular) or 5 (donor), capped by your free task slots; extras are
-dropped. Bulk supports songs, albums, music videos, and stations — send
-playlists and artists one at a time. Flags apply to every link, and if no
-delivery target is set you're asked once for the whole batch.
-
-Delivery: playlists over 40 tracks are always delivered as a Gofile ZIP
-(sending dozens of individual files trips Telegram's rate limits). Very heavy
-rips (full artist discographies, playlists over 100 tracks) also wait for the
-2:30–6:00 AM Dhaka window.
-
-Default quality is ALAC. -aac and -atmos pick a different source codec; -flac
-re-encodes the downloaded audio to FLAC. If you combine codec flags, one wins.
-
-Flags:
-  -aac     download in AAC-LC format
-  -atmos   download in Dolby Atmos format
-  -flac    convert the downloaded audio to FLAC
-  -art     grab cover art + motion artwork (no audio)
-  -nc      no-cache: delete any cached copy and re-rip fresh
-  -tgu     send as individual Telegram tracks (skip keyboard)
-  -tgz     send as Telegram ZIP (skip keyboard)
-  -go      send as Gofile ZIP (skip keyboard)
-`)
+// cancelAllTasksLocked cancels every in-flight unit of work — the active head, the
+// sticky scheduler borrower, any heads still uploading, and everything queued — and
+// returns how many it stopped. It assumes b.queueMu is already held. Unlike
+// cancelTask it does NO ownership check (admin-only) and emits no per-task message.
+// Scheduled (deferred sleeptime) jobs are intentionally left alone — they aren't
+// "running" and have their own /cancel_<id>.
+func (b *TelegramBot) cancelAllTasksLocked() int {
+	n := 0
+	if b.activeReq != nil {
+		if b.activeReq.cancel != nil {
+			b.activeReq.cancel()
+		}
+		n++
+	}
+	if b.schedBorrowReq != nil {
+		if b.schedBorrowReq.cancel != nil {
+			b.schedBorrowReq.cancel()
+		}
+		n++
+	}
+	for _, req := range b.uploadingReqs {
+		if req != nil && req.cancel != nil {
+			req.cancel()
+		}
+		n++
+	}
+	// Drain the queue, cancelling each and releasing its pending slot — a queued task
+	// never reaches the worker's completion decrement, so without this the owner stays
+	// pinned at the per-user cap (mirrors the queued branch of cancelTask).
+	queueLen := len(b.downloadQueue)
+drainAll:
+	for i := 0; i < queueLen; i++ {
+		select {
+		case req := <-b.downloadQueue:
+			if req.cancel != nil {
+				req.cancel()
+			}
+			b.removeQueuedReqLocked(req.taskID)
+			if req.userID != 0 && b.userTaskCount[req.userID] > 0 {
+				b.userTaskCount[req.userID]--
+			}
+			n++
+		default:
+			break drainAll
+		}
+	}
+	return n
 }
 
-// botHelpRich is the Bot API 10.1 Rich Markdown rendering of the help text:
-// real headings, a flags table, and code-formatted command examples. Falls back
-// to botHelpText() when the API can't serve rich content.
-func botHelpRich() string {
-	return strings.TrimSpace(`
-# Karen — Apple Music downloader
+// cancelAllTasks is the /stopall handler: admin-only blanket cancel of all running
+// and queued tasks, with a single summary reply.
+func (b *TelegramBot) cancelAllTasks(chatID int64, replyToID int) {
+	b.queueMu.Lock()
+	n := b.cancelAllTasksLocked()
+	b.queueMu.Unlock()
+	if n == 0 {
+		_ = b.sendMessageWithReply(chatID, "No active or queued tasks to stop.", nil, replyToID)
+		return
+	}
+	_ = b.sendMessageWithReply(chatID, fmt.Sprintf("⛔ Stopped %d task(s).", n), nil, replyToID)
+}
 
-Rips lossless ALAC, Dolby Atmos, and AAC from Apple Music straight to your chat.
+// adminRestart is the /restart handler: stop in-flight work, purge the local audio
+// caches, then exit the process so Docker's `restart: unless-stopped` policy brings
+// the bot back. It does NOT touch the wrapper-manager containers. All mutable state
+// (cache, schedule, profiles) is persisted atomically to bot/state/, so an abrupt
+// exit is safe.
+func (b *TelegramBot) adminRestart(chatID int64, replyToID int) {
+	// Send the confirmation FIRST — sendMessageWithReply is a synchronous HTTP call,
+	// so it returns only once Telegram has accepted the message, guaranteeing it lands
+	// before os.Exit below.
+	_ = b.sendMessageWithReply(chatID, "♻️ Restarting Karen… back in a few seconds.", nil, replyToID)
 
-## Commands
+	// Cancel everything in-flight so files are released; otherwise purgeDownloadCaches
+	// self-skips on its busy / anyInUse() guards and the cache wouldn't actually clear.
+	b.queueMu.Lock()
+	b.cancelAllTasksLocked()
+	b.queueMu.Unlock()
+
+	// Best-effort: the periodic purge ticker and the startup purge are backstops if a
+	// just-cancelled upload still briefly holds files.
+	b.purgeDownloadCaches()
+
+	fmt.Println("Admin /restart: exiting for Docker to restart the container.")
+	os.Exit(0)
+}
+
+// =============================================================================
+// /help and /start — a compact, button-driven help card (Bot API 10.1 Rich UI).
+//
+// The old help dumped four tables in one wall of text. This is a short landing
+// card with nav buttons; each section (Commands / Flags / Delivery / Examples)
+// is one Rich Message edited in place, with a Back button home. Navigation is
+// stateless and read-only, so — unlike /profile — taps aren't owner-guarded;
+// anyone in the chat can browse. Callbacks are namespaced under "help:".
+// =============================================================================
+
+// handleHelpCommand sends the help landing card.
+func (b *TelegramBot) handleHelpCommand(chatID int64, replyToID int) {
+	_, _ = b.sendRichMessage(chatID, helpRich("home"), helpPlain("home"), helpMarkup("home"), replyToID)
+}
+
+// handleHelpCallback routes a "help:nav:<panel>" tap by editing the card in place.
+func (b *TelegramBot) handleHelpCallback(cb *CallbackQuery, data string) string {
+	panel := strings.TrimPrefix(data, "help:nav:")
+	if panel == "" {
+		panel = "home"
+	}
+	_, _ = b.editMessageRich(cb.Message.Chat.ID, cb.Message.MessageID,
+		helpRich(panel), helpPlain(panel), helpMarkup(panel))
+	return ""
+}
+
+// helpMarkup returns the keyboard for a help panel: nav buttons on home, a single
+// Back button on every section.
+func helpMarkup(panel string) InlineKeyboardMarkup {
+	if panel == "home" {
+		return InlineKeyboardMarkup{InlineKeyboard: [][]InlineKeyboardButton{
+			{
+				{Text: "📥 Commands", CallbackData: "help:nav:commands", Style: "primary"},
+				{Text: "🚩 Flags", CallbackData: "help:nav:flags", Style: "primary"},
+			},
+			{
+				{Text: "📦 Delivery", CallbackData: "help:nav:delivery", Style: "primary"},
+				{Text: "💡 Examples", CallbackData: "help:nav:examples", Style: "primary"},
+			},
+		}}
+	}
+	return InlineKeyboardMarkup{InlineKeyboard: [][]InlineKeyboardButton{
+		{{Text: "‹ Back", CallbackData: "help:nav:home"}},
+	}}
+}
+
+// helpRich renders one help panel as Bot API 10.1 Rich Markdown.
+func helpRich(panel string) string {
+	switch panel {
+	case "commands":
+		return strings.TrimSpace(`
+## 📥 Commands
 
 | Command | What it does |
 |:--------|:-------------|
-| ` + "`/dl <link> [link …] [flags]`" + ` | Download one or several songs/albums/MVs/stations (or a single artist/playlist) |
-| ` + "`/check <link>`" + ` | Inspect a link: track count + metadata, or a full artist breakdown |
-| ` + "`/status`" + ` or ` + "`/queue`" + ` | Show the active task and queue |
+| ` + "`/dl <link> [flags]`" + ` | Download a song, album, MV, station, artist, or playlist |
+| ` + "`/check <link>`" + ` | Inspect a link: track count + metadata, or an artist breakdown |
+| ` + "`/status`" + ` · ` + "`/queue`" + ` | Show the active task and queue |
 | ` + "`/scheduled`" + ` | List rips deferred to the sleeptime window |
-| ` + "`/stop_<task_id>`" + ` | Cancel a running or queued download |
-| ` + "`/cancel_<id>`" + ` | Cancel a scheduled (deferred) rip |
 | ` + "`/profile`" + ` | Set your saved rip preferences (all buttons) |
-| ` + "`/help`" + ` | Show this message |
+| ` + "`/stop_<id>`" + ` | Cancel a running or queued download |
+| ` + "`/cancel_<id>`" + ` | Cancel a scheduled (deferred) rip |
+| ` + "`/help`" + ` | Show this card |
 
-> **Bulk:** pass several links (space- or line-separated) to queue them at once — up to **3** (regular) or **5** (donor), capped by your free task slots. Bulk covers songs, albums, music videos, and stations; send playlists and artists one at a time. Flags apply to every link, and if no delivery target is set you're asked once for the whole batch.
->
-> Playlists over **40 tracks** are always delivered as a Gofile ZIP (dozens of individual uploads trip Telegram's rate limits). Very heavy rips (full artist discographies, playlists over 100 tracks) also wait for the 2:30–6:00 AM Dhaka window.
->
-> Default quality is ALAC. ` + "`-aac`/`-atmos`" + ` pick a different source codec; ` + "`-flac`" + ` re-encodes after download. If you combine codec flags, one wins.
+> Tip: set your defaults once in ` + "`/profile`" + ` and ` + "`/dl <link>`" + ` needs nothing else.
+`)
+	case "flags":
+		return strings.TrimSpace(`
+## 🚩 Flags
 
-## Flags
+Append to any ` + "`/dl`" + `. Default quality is **ALAC**.
 
 | Flag | Effect |
 |:-----|:-------|
 | ` + "`-aac`" + ` | Download in AAC-LC format |
 | ` + "`-atmos`" + ` | Download in Dolby Atmos format |
-| ` + "`-flac`" + ` | Convert the downloaded audio to FLAC |
-| ` + "`-art`" + ` | Grab cover art + motion artwork (no audio) |
-| ` + "`-nc`" + ` | No-cache: delete any cached copy and re-rip fresh |
+| ` + "`-flac`" + ` | Re-encode the download to FLAC |
+| ` + "`-art`" + ` | Grab cover + motion artwork (no audio) |
+| ` + "`-nc`" + ` | No-cache: delete any cached copy, re-rip fresh |
 | ` + "`-tgu`" + ` | Send as individual Telegram tracks |
 | ` + "`-tgz`" + ` | Send as a Telegram ZIP |
 | ` + "`-go`" + ` | Send as a Gofile ZIP |
 
-## Examples
+> ` + "`-aac`/`-atmos`" + ` pick the source codec; ` + "`-flac`" + ` re-encodes after download. Combine codec flags and one wins.
+`)
+	case "delivery":
+		return strings.TrimSpace(`
+## 📦 Delivery & limits
+
+**Bulk** — pass several links (space- or line-separated) to queue them at once: up to **3** (regular) or **5** (donor), capped by your free task slots. Covers songs, albums, MVs, and stations; send playlists and artists one at a time. Flags apply to every link, and you're asked for a delivery target once for the whole batch.
+
+**Targets** — the ` + "`-tgu`/`-tgz`/`-go`" + ` flags skip the picker; otherwise you're prompted per rip.
+
+> Playlists over **40 tracks** always go out as a Gofile ZIP — dozens of individual uploads trip Telegram's rate limits.
+>
+> Very heavy rips (full discographies, playlists over **100 tracks**) wait for the **2:30–6:00 AM Dhaka** sleeptime window. Track them with ` + "`/scheduled`" + `.
+`)
+	case "examples":
+		return strings.TrimSpace(`
+## 💡 Examples
 
 ` + "```" + `
 /dl https://music.apple.com/album/123456
 /dl https://music.apple.com/album/123456 -aac
 /dl https://music.apple.com/song/789012 -atmos -tgz
-/dl <album-link> <song-link> <mv-link> -go     (bulk: queue all three)
+/dl <album> <song> <mv> -go      (bulk: queue all three)
+/check https://music.apple.com/artist/123456
 ` + "```" + `
 `)
+	default: // home
+		return strings.TrimSpace(`
+# 🎧 Karen — Apple Music downloader
+
+Rips lossless **ALAC**, **Dolby Atmos**, and **AAC** from Apple Music straight to your chat.
+
+**Quick start:** send ` + "`/dl <apple-music-link>`" + ` — that's it.
+
+Tap below for the rest, or set your defaults in ` + "`/profile`" + `.
+`)
+	}
+}
+
+// helpPlain is the pre-10.1 fallback for each help panel.
+func helpPlain(panel string) string {
+	switch panel {
+	case "commands":
+		return strings.TrimSpace(`
+Commands:
+/dl <link> [flags]   download a song, album, MV, station, artist, or playlist
+/check <link>        inspect a link: track count + metadata, or artist breakdown
+/status or /queue    show the active task and queue
+/scheduled           list rips deferred to the sleeptime window
+/profile             set your saved rip preferences (buttons)
+/stop_<id>           cancel a running or queued download
+/cancel_<id>         cancel a scheduled (deferred) rip
+/help                show this message
+`)
+	case "flags":
+		return strings.TrimSpace(`
+Flags (append to any /dl; default quality is ALAC):
+  -aac     download in AAC-LC format
+  -atmos   download in Dolby Atmos format
+  -flac    re-encode the download to FLAC
+  -art     grab cover + motion artwork (no audio)
+  -nc      no-cache: delete any cached copy and re-rip fresh
+  -tgu     send as individual Telegram tracks
+  -tgz     send as a Telegram ZIP
+  -go      send as a Gofile ZIP
+
+-aac/-atmos pick the source codec; -flac re-encodes after download.
+If you combine codec flags, one wins.
+`)
+	case "delivery":
+		return strings.TrimSpace(`
+Delivery & limits
+
+Bulk: pass several links (space- or line-separated) to queue them at once —
+up to 3 (regular) or 5 (donor), capped by your free task slots. Covers songs,
+albums, music videos, and stations; send playlists and artists one at a time.
+Flags apply to every link, and you're asked for a delivery target once for the
+whole batch.
+
+Playlists over 40 tracks always go out as a Gofile ZIP (dozens of individual
+uploads trip Telegram's rate limits). Very heavy rips (full discographies,
+playlists over 100 tracks) wait for the 2:30-6:00 AM Dhaka window. Track them
+with /scheduled.
+`)
+	case "examples":
+		return strings.TrimSpace(`
+Examples:
+/dl https://music.apple.com/album/123456
+/dl https://music.apple.com/album/123456 -aac
+/dl https://music.apple.com/song/789012 -atmos -tgz
+/dl <album> <song> <mv> -go      (bulk: queue all three)
+/check https://music.apple.com/artist/123456
+`)
+	default: // home
+		return strings.TrimSpace(`
+Karen — Apple Music downloader
+
+Rips lossless ALAC, Dolby Atmos, and AAC from Apple Music straight to your chat.
+
+Quick start: send /dl <apple-music-link>.
+
+Commands: /dl, /check, /status, /scheduled, /profile, /stop_<id>, /cancel_<id>, /help
+Set your defaults in /profile.
+`)
+	}
 }

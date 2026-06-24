@@ -81,6 +81,11 @@ type AudioMeta struct {
 	ContentRating  string
 	Quality        string
 	Codec          string
+	// ISRC is the cross-source recording identity (catalog identity fallback after
+	// adamID, D6). AlbumID is the parent album's adamID (set for album rips), used
+	// for the album_zip artifact key. Both empty when unknown.
+	ISRC    string
+	AlbumID string
 	// PlaylistName / PlaylistArtist are set only when the track was downloaded as
 	// part of a playlist, so the Telegram caption can show the playlist's identity
 	// instead of masquerading as the first track's album. Empty for albums/songs.
@@ -136,6 +141,12 @@ func recordDownloadedTrack(ctx context.Context, track *task.Track) {
 		ContentRating:  strings.TrimSpace(track.Resp.Attributes.ContentRating),
 		Quality:        strings.TrimSpace(track.Quality),
 		Codec:          strings.TrimSpace(track.Codec),
+		ISRC:           strings.ToUpper(strings.TrimSpace(track.Resp.Attributes.Isrc)),
+	}
+	// For an album rip the parent is the album; PreID is its adamID (used as the
+	// album_zip artifact key). Playlists/stations have no album identity here.
+	if track.PreType == "albums" {
+		meta.AlbumID = strings.TrimSpace(track.PreID)
 	}
 	if track.PreType == "playlists" {
 		meta.PlaylistName = strings.TrimSpace(track.PlaylistData.Attributes.Name)
