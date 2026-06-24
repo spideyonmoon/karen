@@ -36,7 +36,7 @@ type TrackMeta struct {
 	Kind          string // "track" (default) | "album_zip" | "cover" | "animated" | "lrc"
 	LyricsSync    string // DESCRIPTIVE only (not in Variant): "none" | "line" | "word"
 	CoverEmbedded bool   // DESCRIPTIVE only (not in Variant): embedded cover present
-	Variant       string // cache-identity tier; v1 = format only (§4.6, D10)
+	Variant       string // cache-identity key; v1 = quality tier "v1|q=<tier>" (§4.6, D10)
 }
 
 // Artifact kinds (D12). "track" is the default for an embedded-cover/lyrics audio

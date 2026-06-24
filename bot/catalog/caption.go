@@ -119,6 +119,15 @@ func ParseCaption(s string) (TrackMeta, bool) {
 		Variant:       kv["var"],
 	}
 
+	// Reconstruct the variant from fmt when var= is absent. Phase 1 omits var=
+	// under the omit-empty rule whenever the tier is non-cacheable, and may omit it
+	// for cacheable tiers too; either way the tier is derivable from fmt, so the
+	// parsed meta stays self-consistent (a present var= always wins). VariantKey
+	// returns "" for a non-cacheable fmt, which UpsertTrack treats as "do not store."
+	if m.Variant == "" {
+		m.Variant = VariantKey(m)
+	}
+
 	// Recover Title/Artist/Album from the human block (display + fuzzy match).
 	m.Title, m.Artist, m.Album = parseHumanBlock(s)
 	return m, true

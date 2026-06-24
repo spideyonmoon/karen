@@ -105,10 +105,13 @@ type TelegramBot struct {
 	// every method degrades to a miss/no-op, so the bot behaves exactly as today.
 	catalog *catalog.Catalog
 	// deliverFromDump copies an already-stored dump file to a recipient with no
-	// "forwarded from" header (Phase 1's Pool.DeliverFromDump, §4.5). Until the
-	// Phase 1 branch merges this is a stub that returns an error, so every catalog
-	// HIT falls through to a normal rip. PHASE-MERGE: wire to Pool.DeliverFromDump.
-	deliverFromDump func(ctx context.Context, dumpID int64, msgID int, recipientID int64) error
+	// "forwarded from" header and no caption (Phase 1's Pool.DeliverFromDump sends
+	// DropAuthor+DropMediaCaptions, so users never see the #karenidx line; player
+	// attributes carry title/performer). replyToID threads the reply (0 = none).
+	// Until the Phase 1 branch merges this is a stub that returns an error, so every
+	// catalog HIT falls through to a normal rip. PHASE-MERGE: wire to
+	// Pool.DeliverFromDump.
+	deliverFromDump func(ctx context.Context, dumpID int64, msgID int, recipientID int64, replyToID int) error
 
 	// username is the bot's own @username (lowercased, no @), fetched via getMe at
 	// startup. Used to reject commands explicitly addressed to a different bot
@@ -554,7 +557,7 @@ func runTelegramBot(appleToken string) {
 	// PHASE-MERGE: replace this stub with Pool.DeliverFromDump (§4.5). Until then,
 	// every catalog HIT errors here and the caller falls through to a normal rip,
 	// so the read-through is dormant end-to-end but exercised up to the copy.
-	bot.deliverFromDump = func(ctx context.Context, dumpID int64, msgID int, recipientID int64) error {
+	bot.deliverFromDump = func(ctx context.Context, dumpID int64, msgID int, recipientID int64, replyToID int) error {
 		return fmt.Errorf("deliverFromDump not wired (Phase 1 not merged)")
 	}
 
@@ -2996,8 +2999,10 @@ func effectiveCatalogFormat(format string, forceAAC, forceAtmos bool) string {
 // still exercised. When wired: (a) a delivery error (e.g. the dump message was
 // deleted) should try the next-best row before falling back to rip (§4.4) — Lookup
 // returns a single row today; (b) when the user's lossless container preference is
-// FLAC but the cached lossless artifact is ALAC, deliver it with a caption noting
-// "cached as ALAC — re-run with -nc for a fresh FLAC rip" (operator decision).
+// FLAC but the cached lossless artifact is ALAC (hit.Meta.Format == "alac"), send a
+// SEPARATE short follow-up message "served cached ALAC — re-run -nc for a fresh
+// FLAC rip" (operator decision). It can't be a delivery caption: Phase 1's
+// DeliverFromDump sends DropMediaCaptions and takes no caption arg.
 func (b *TelegramBot) catalogTryServeTrack(chatID int64, replyToID int, trackID, format string) bool {
 	if b.catalog == nil || !b.catalog.Enabled() || b.deliverFromDump == nil {
 		return false
@@ -3020,7 +3025,7 @@ func (b *TelegramBot) catalogTryServeTrack(chatID int64, replyToID int, trackID,
 	if !ok {
 		return false
 	}
-	if err := b.deliverFromDump(ctx, hit.DumpID, hit.MsgID, chatID); err != nil {
+	if err := b.deliverFromDump(ctx, hit.DumpID, hit.MsgID, chatID, replyToID); err != nil {
 		fmt.Printf("catalog deliver track %d (dump=%d msg=%d): %v\n", adamID, hit.DumpID, hit.MsgID, err)
 		return false
 	}
@@ -3053,7 +3058,7 @@ func (b *TelegramBot) catalogTryServeAlbumZip(chatID int64, albumID string, repl
 	if !ok {
 		return false
 	}
-	if err := b.deliverFromDump(ctx, hit.DumpID, hit.MsgID, chatID); err != nil {
+	if err := b.deliverFromDump(ctx, hit.DumpID, hit.MsgID, chatID, replyToID); err != nil {
 		fmt.Printf("catalog deliver album-zip %d (dump=%d msg=%d): %v\n", aid, hit.DumpID, hit.MsgID, err)
 		return false
 	}
