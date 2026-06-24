@@ -1966,6 +1966,18 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, username string,
 			return // hidden admin command
 		}
 		go b.handleSysStatus(chatID, replyToID)
+	case "stopall":
+		if !b.isAdmin(userID) {
+			return // hidden admin command
+		}
+		b.cancelAllTasks(chatID, replyToID)
+	case "restart":
+		if !b.isAdmin(userID) {
+			return // hidden admin command
+		}
+		// Runs off the update loop: it sends a reply, frees in-flight work, purges,
+		// then os.Exit(0) — Docker's restart policy brings the bot back.
+		go b.adminRestart(chatID, replyToID)
 	default:
 		// Silently ignore unknown commands
 	}
@@ -7517,6 +7529,94 @@ drain:
 		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Task %s not found.", taskID), nil, replyToID)
 	}
 }
+
+// cancelAllTasksLocked cancels every in-flight unit of work — the active head, the
+// sticky scheduler borrower, any heads still uploading, and everything queued — and
+// returns how many it stopped. It assumes b.queueMu is already held. Unlike
+// cancelTask it does NO ownership check (admin-only) and emits no per-task message.
+// Scheduled (deferred sleeptime) jobs are intentionally left alone — they aren't
+// "running" and have their own /cancel_<id>.
+func (b *TelegramBot) cancelAllTasksLocked() int {
+	n := 0
+	if b.activeReq != nil {
+		if b.activeReq.cancel != nil {
+			b.activeReq.cancel()
+		}
+		n++
+	}
+	if b.schedBorrowReq != nil {
+		if b.schedBorrowReq.cancel != nil {
+			b.schedBorrowReq.cancel()
+		}
+		n++
+	}
+	for _, req := range b.uploadingReqs {
+		if req != nil && req.cancel != nil {
+			req.cancel()
+		}
+		n++
+	}
+	// Drain the queue, cancelling each and releasing its pending slot — a queued task
+	// never reaches the worker's completion decrement, so without this the owner stays
+	// pinned at the per-user cap (mirrors the queued branch of cancelTask).
+	queueLen := len(b.downloadQueue)
+drainAll:
+	for i := 0; i < queueLen; i++ {
+		select {
+		case req := <-b.downloadQueue:
+			if req.cancel != nil {
+				req.cancel()
+			}
+			b.removeQueuedReqLocked(req.taskID)
+			if req.userID != 0 && b.userTaskCount[req.userID] > 0 {
+				b.userTaskCount[req.userID]--
+			}
+			n++
+		default:
+			break drainAll
+		}
+	}
+	return n
+}
+
+// cancelAllTasks is the /stopall handler: admin-only blanket cancel of all running
+// and queued tasks, with a single summary reply.
+func (b *TelegramBot) cancelAllTasks(chatID int64, replyToID int) {
+	b.queueMu.Lock()
+	n := b.cancelAllTasksLocked()
+	b.queueMu.Unlock()
+	if n == 0 {
+		_ = b.sendMessageWithReply(chatID, "No active or queued tasks to stop.", nil, replyToID)
+		return
+	}
+	_ = b.sendMessageWithReply(chatID, fmt.Sprintf("⛔ Stopped %d task(s).", n), nil, replyToID)
+}
+
+// adminRestart is the /restart handler: stop in-flight work, purge the local audio
+// caches, then exit the process so Docker's `restart: unless-stopped` policy brings
+// the bot back. It does NOT touch the wrapper-manager containers. All mutable state
+// (cache, schedule, profiles) is persisted atomically to bot/state/, so an abrupt
+// exit is safe.
+func (b *TelegramBot) adminRestart(chatID int64, replyToID int) {
+	// Send the confirmation FIRST — sendMessageWithReply is a synchronous HTTP call,
+	// so it returns only once Telegram has accepted the message, guaranteeing it lands
+	// before os.Exit below.
+	_ = b.sendMessageWithReply(chatID, "♻️ Restarting Karen… back in a few seconds.", nil, replyToID)
+
+	// Cancel everything in-flight so files are released; otherwise purgeDownloadCaches
+	// self-skips on its busy / anyInUse() guards and the cache wouldn't actually clear.
+	b.queueMu.Lock()
+	b.cancelAllTasksLocked()
+	b.queueMu.Unlock()
+
+	// Best-effort: the periodic purge ticker and the startup purge are backstops if a
+	// just-cancelled upload still briefly holds files.
+	b.purgeDownloadCaches()
+
+	fmt.Println("Admin /restart: exiting for Docker to restart the container.")
+	os.Exit(0)
+}
+
 func botHelpText() string {
 	return strings.TrimSpace(`
 Commands:
