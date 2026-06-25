@@ -150,12 +150,13 @@ func (b *TelegramBot) handleSysStatus(chatID int64, replyToID int) {
 
 	rich, plain := rb.String(), pb.String()
 
-	// Edit the placeholder into the final card (rich, with automatic plain fallback
-	// inside editMessageRich). If the edit itself fails — e.g. the placeholder was
-	// deleted — send a fresh card instead.
-	if _, err := b.editMessageRich(chatID, msgID, rich, plain, nil); err != nil {
-		_, _ = b.sendRichMessage(chatID, rich, plain, nil, replyToID)
+	// Bot API 10.1 can't edit a plain placeholder into a rich card (the edit comes back
+	// "Bad Request: not Found" and silently degrades to plain), so delete the placeholder
+	// and send the final card as a fresh Rich Message instead.
+	if msgID != 0 {
+		_ = b.deleteMessage(chatID, msgID)
 	}
+	_, _ = b.sendRichMessage(chatID, rich, plain, nil, replyToID)
 }
 
 // readHostUptime returns the host uptime from /proc/uptime (first field, seconds).

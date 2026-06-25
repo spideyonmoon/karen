@@ -2082,7 +2082,11 @@ func (b *TelegramBot) handleIndexDump(chatID int64, args []string, replyToID int
 		return
 	}
 
-	msgID, _ := b.sendMessageWithReplyReturn(chatID, fmt.Sprintf("📇 Indexing dump %d…", dumpID), nil, replyToID)
+	// Born-rich so the live editMessageRich progress edits below are rich→rich (Bot API
+	// 10.1 can't edit a plain message into a rich one — that returns "Bad Request: not Found").
+	startMsg := fmt.Sprintf("📇 Indexing dump %d…", dumpID)
+	startRes, _ := b.sendRichMessage(chatID, startMsg, startMsg, nil, replyToID)
+	msgID := startRes.messageID
 
 	report := func(emoji, body string) {
 		plain := emoji + " " + body
@@ -5552,16 +5556,22 @@ func (g *chatBoard) flush(force bool) {
 
 // relocate deletes the current message and re-sends the combined board at the bottom
 // of the chat, so /status and new enqueues resurface a single up-to-date board (no
-// stale duplicates). The loop continues on the new message; the next flush upgrades
-// the plain re-send to the rich render.
+// stale duplicates). The board is re-sent as a Rich Message so it stays born-rich and
+// the loop's live edits remain rich→rich (Bot API 10.1 can't edit a plain re-send into
+// rich); a plain send is used only if the rich send is rejected outright.
 func (g *chatBoard) relocate(replyToID int) {
 	if g == nil || g.bot == nil {
 		return
 	}
-	plain, _ := g.renderCombined()
-	newID, err := g.bot.sendMessageWithReplyReturn(g.chatID, plain, nil, replyToID)
-	if err != nil {
-		return
+	plain, rich := g.renderCombined()
+	res, _ := g.bot.sendRichMessage(g.chatID, rich, plain, nil, replyToID)
+	newID := res.messageID
+	if newID == 0 {
+		id, err := g.bot.sendMessageWithReplyReturn(g.chatID, plain, nil, replyToID)
+		if err != nil {
+			return
+		}
+		newID = id
 	}
 	g.mu.Lock()
 	oldID := g.messageID
@@ -5607,11 +5617,21 @@ func (b *TelegramBot) attachBoard(chatID int64, replyToID int, req *downloadRequ
 	}
 
 	if newGroup {
-		// First task in this chat: adopt the request's pre-sent placeholder if it has
-		// one, else send the initial message. Set the message ID before starting the
-		// loop so flush never runs against a zero ID.
-		msgID := req.statusMessageID
-		if msgID <= 0 {
+		// First task in this chat: SEND the board as a Rich Message so it's *born* rich.
+		// Bot API 10.1 has no editRichMessage and can't convert a plain message into a
+		// rich one by editing — so a plain initial send (or an adopted plain placeholder)
+		// makes every live edit in flush() fail with "Bad Request: not Found" and the
+		// board renders as raw text. We therefore drop any pre-sent placeholder and send
+		// fresh. Set the message ID before starting the loop so flush never runs against
+		// a zero ID.
+		if req.statusMessageID > 0 {
+			_ = b.deleteMessage(chatID, req.statusMessageID)
+		}
+		res, _ := b.sendRichMessage(chatID, "Starting download...", "Starting download...", nil, replyToID)
+		msgID := res.messageID
+		if msgID == 0 {
+			// A content-level rich rejection doesn't auto-fall-back to plain, so send a
+			// plain message ourselves so the board still exists; edits degrade to plain.
 			id, err := b.sendMessageWithReplyReturn(chatID, "Starting download...", nil, replyToID)
 			if err != nil {
 				// Roll back this registration. Only drop the group if no other task
