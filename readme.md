@@ -278,3 +278,7 @@ karen/
 ├── docker-compose.override.yml # Generated: N wrapper-managers + volumes (gitignored)
 └── SESSION_HISTORY.md          # Development log
 ```
+
+## License
+
+Licensed under the GNU General Public License v3.0 — see [LICENSE](LICENSE).
