@@ -7117,6 +7117,14 @@ func (b *TelegramBot) doRichRequest(method string, payload map[string]any) (int,
 	if err != nil {
 		return 0, "", false, err
 	}
+	// TEMP DIAGNOSTIC: dump the raw server response for any non-OK rich call (sends and
+	// edits both route through here) so we can see exactly why e.g. the second board's
+	// sendRichMessage is rejected. Skips the benign "not modified". Remove once diagnosed.
+	if (resp.StatusCode != http.StatusOK || !bytes.Contains(respBody, []byte(`"ok":true`))) &&
+		!bytes.Contains(respBody, []byte("message is not modified")) {
+		fmt.Printf("[rich-debug] %s chat=%v msg=%v status=%d raw=%s\n",
+			method, payload["chat_id"], payload["message_id"], resp.StatusCode, string(respBody))
+	}
 	envelope := sendMessageResponse{}
 	if jerr := json.Unmarshal(respBody, &envelope); jerr != nil {
 		// Result may be a bare `true` (inline edits) which doesn't fit Message;
