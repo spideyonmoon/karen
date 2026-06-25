@@ -1,35 +1,51 @@
 # Karen
 
-Karen pulls lossless audio off Apple Music and drops it straight into your Telegram chat — ALAC, Dolby Atmos, or AAC, with cover art and metadata already baked in. She drives a hooked Apple Music app to deal with the DRM, rips the HLS stream in parallel, and works out the smartest way to hand you the result: individual tracks under 50 MB over the Bot API, a zip up to 2 GB over MTProto, or a Gofile link when it's bigger than that.
+Karen pulls lossless audio off Apple Music and delivers it to your Telegram chat — ALAC, Dolby Atmos, or AAC, with cover art and metadata baked in. Under the hood she's a **read-through catalog**: anything ripped once is stored in a private Telegram channel and copied back instantly the next time anyone asks. Popular music gets ripped exactly once and delivered forever.
 
 A docs site is on the way. Until then this readme is the short version — enough to understand it and get it running.
 
 ## What she does
 
 - **Lossless and then some** — ALAC up to 192 kHz, Dolby Atmos, AAC-LC, optional FLAC conversion. Music videos too.
-- **Many accounts, in parallel** — one Apple Music account per backend instance, with a pool spreading rips and uploads across all of them. Adding an account adds throughput.
-- **A catalog that remembers** — anything ripped once is cached in a private Telegram dump and served back instantly next time instead of being re-ripped. Only the missing tracks get fetched.
-- **Delivery that fits** — tracks, zip, or Gofile, chosen around Telegram's size limits. Huge discographies are flushed to Gofile in numbered parts mid-rip, so a rip never has to fit on disk all at once.
+- **Ripped once, served forever** — a catalog backed by a private Telegram dump channel. The first request for a track rips it; every request after that copies the stored file straight back, no re-ripping. A half-cached album only fetches the tracks it's missing.
+- **Parallel everything** — multiple Apple Music accounts rip concurrently across emulator backends, and a pool of helper bot accounts uploads in parallel. Telegram throttles per account, so spreading an album's tracks across several bots cuts upload time roughly proportionally and spreads out the rate limits.
+- **Delivery that fits** — files arrive as clean copies (no "forwarded from" header). Tracks, a zip, or a Gofile link depending on size; huge discographies are flushed to Gofile in numbered parts mid-rip, so a rip never has to fit on disk all at once.
 - **Per-user profiles** — save your codec, quality, and delivery preferences once and `/dl` runs with zero flags and zero prompts.
 - **Made to run unattended** — concurrent download scheduler, live per-task status boards, a queue, bulk `/dl`, inline search, and a full admin/sudo toolkit (bans, usage stats, restart, system status).
 
 ## How it works
 
+Karen treats Telegram itself as the storage layer. Every file she's produced lives in a private dump channel; a small Postgres catalog holds *pointers* to those messages — never the bytes themselves. So a request is, first and foremost, a lookup:
+
 ```
-┌─────────────┐     ┌──────────────┐     ┌──────────────┐
-│  Telegram   │────▶│  Bot (Go)    │────▶│  Wrapper-Mgr │  ← Android emulator
-│  User       │◀────│  docker      │◀────│  gRPC :8081  │     + Frida hooks
-└─────────────┘     │              │     └──────────────┘
-                    │   pool       │     ┌──────────────┐
-                    │  spreads     │────▶│  Wrapper-Mgr │  ← second account
-                    │  across N    │◀────│  gRPC :8082  │
-                    └──────────────┘     └──────────────┘   ...
+request → resolve to track IDs → catalog lookup (per track)
+  ├─ HIT   → copy the stored file straight to you  (no rip, no re-upload — instant)
+  └─ MISS  → rip it → upload to the dump → index it → copy it to you
 ```
 
-- **wrapper-manager** runs an Android emulator with a Frida-hooked Apple Music app and exposes gRPC for playlists, WebPlayback, and live DRM decryption. One account per instance.
-- **bot** (Go) takes your command, fetches the playlist, downloads HLS segments in parallel, decrypts them over a gRPC stream, remuxes with ffmpeg, and delivers.
-- **pool** distributes work across every wrapper-manager instance and rotates accounts.
-- **catalog** (optional, Postgres) tracks what's already been uploaded so repeat requests are read-through, not re-ripped.
+The pieces behind that flow:
+
+```
+   ┌──────────┐   /dl url     ┌────────────────────┐
+   │ Telegram │ ────────────▶ │      Bot (Go)      │ ──lookup──▶ Postgres
+   │   user   │ ◀──────────── │  orchestrator +    │ ◀──pointers─ (catalog)
+   └──────────┘  clean copy   │  delivery          │
+                              └──┬──────────────┬──┘
+                       rip + decrypt        upload in parallel
+                                │              │
+                     ┌──────────▼─────┐  ┌─────▼──────────────┐
+                     │ wrapper-mgr ×N │  │  helper-bot pool   │
+                     │ gRPC, 1 Apple  │  │  → dump channel    │
+                     │ account each   │  │  (stores the bytes)│
+                     └────────────────┘  └────────────────────┘
+```
+
+- **wrapper-manager ×N** — Android emulators running a Frida-hooked Apple Music app, one account each, exposing gRPC for playlists, WebPlayback, and live DRM decryption. The rip engine for cache misses.
+- **helper-bot pool** — extra bot accounts that upload to the dump channel in parallel, dividing both wall-time and FLOOD_WAIT pressure across accounts.
+- **catalog** — Postgres (managed on Supabase) holding pointer rows keyed by Apple track ID + format tier. This is the lookup that turns repeat requests into instant copies.
+- **bot** (Go) — fetches the playlist, downloads HLS segments in parallel, decrypts over a gRPC stream, remuxes with ffmpeg, and copies the result to you with no trace of the dump.
+
+The catalog and helper pool are optional. With neither configured, Karen falls back to the original behavior: rip on demand and upload directly.
 
 ## Quick start
 
@@ -42,7 +58,9 @@ cp .env.example .env   # fill in tokens + one APPLE_ID_N / APPLE_PASS_N per acco
 ./setup.sh
 ```
 
-`.env` is the single source of truth: the number of account pairs in it decides how many backend instances get built. `setup.sh` handles the rest — it generates the config and compose file, builds the images, logs each account in once (the session persists in a volume, so you never log in again), and starts everything. After that, pushing to `main` redeploys via GitHub Actions; `.env` stays untouched on the host.
+`.env` is the single source of truth: the number of account pairs in it decides how many backend instances get built. `setup.sh` does the rest — generates the config and compose file, builds the images, logs each account in once (the session persists in a volume, so you never log in again), and starts everything. After that, pushing to `main` redeploys via GitHub Actions; `.env` stays untouched on the host.
+
+The catalog and parallel-upload pool are opt-in: add `HELPER_BOT_TOKENS`, `DUMP_CHANNEL_ID`, and `DATABASE_URL` to `.env` to turn them on (channel setup details will live in the docs site).
 
 ## Usage
 
@@ -64,8 +82,10 @@ Common flags: `-aac`, `-atmos`, `-flac`, `-art`, plus delivery overrides `-tgu` 
 ## Layout
 
 ```
-bot/               Go service — ripping, delivery, catalog, profiles, admin
-  utils/wmgrpc/    gRPC client + parallel download/decrypt + account pool
+bot/               Go service — orchestration, delivery, profiles, admin
+  catalog/         Postgres read-through catalog (pointer rows) + indexer
+  pool.go          helper-bot upload pool → dump channel
+  utils/wmgrpc/    gRPC client + parallel download/decrypt across rip backends
 wrapper-manager/   upstream emulator backend + patches
 setup.sh           one-shot bootstrap: generate → build → login → start
 generate.sh        renders config.yaml + docker-compose from .env
