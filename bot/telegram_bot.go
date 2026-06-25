@@ -3125,7 +3125,7 @@ func (b *TelegramBot) catalogServeCollection(chatID int64, kind, collectionID st
 				dl_atmos = true
 			}
 		}
-		return b.ripCollectionWithCatalog(ctx, chatID, kind, collectionID, replyToID, variant, forceAAC)
+		return b.ripCollectionWithCatalog(ctx, chatID, kind, collectionID, replyToID, variant, format, forceAAC)
 	})
 	return true
 }
@@ -3135,9 +3135,9 @@ func (b *TelegramBot) catalogServeCollection(chatID int64, kind, collectionID st
 // rips only the misses (via ripSong, which appends to the worker's shared RipState
 // so the post-rip pipeline uploads + indexes + delivers them). On a clean expansion
 // failure or zero hits it falls back to ripping the whole collection.
-func (b *TelegramBot) ripCollectionWithCatalog(ctx context.Context, chatID int64, kind, collectionID string, replyToID int, variant string, forceAAC bool) error {
-	trackIDs, ok := b.collectionTrackIDs(kind, collectionID)
-	if !ok || len(trackIDs) == 0 {
+func (b *TelegramBot) ripCollectionWithCatalog(ctx context.Context, chatID int64, kind, collectionID string, replyToID int, variant, format string, forceAAC bool) error {
+	info, ok := b.fetchCollection(kind, collectionID)
+	if !ok || len(info.trackIDs) == 0 {
 		return b.ripWholeCollection(ctx, kind, collectionID, forceAAC)
 	}
 
@@ -3149,7 +3149,7 @@ func (b *TelegramBot) ripCollectionWithCatalog(ctx context.Context, chatID int64
 	var dumpID int64
 	var hits []chit
 	var missIDs []string
-	for _, tid := range trackIDs {
+	for _, tid := range info.trackIDs {
 		adamID, _ := strconv.ParseInt(tid, 10, 64)
 		if adamID == 0 {
 			missIDs = append(missIDs, tid)
@@ -3173,6 +3173,13 @@ func (b *TelegramBot) ripCollectionWithCatalog(ctx context.Context, chatID int64
 	// keeps the normal progress board.
 	if len(hits) == 0 {
 		return b.ripWholeCollection(ctx, kind, collectionID, forceAAC)
+	}
+
+	// Fully cached (no gaps) → the gap rip that normally sends the standalone cover
+	// photo won't run, so send it here first (matching the fresh-rip order). A partial
+	// album instead gets its cover from the gap delivery (deliverTelegramIndividual).
+	if len(missIDs) == 0 {
+		b.sendCollectionCover(chatID, info, format, len(hits), replyToID)
 	}
 
 	// Deliver the cached tracks; a stale pointer fails the whole batch, so failures
@@ -3218,38 +3225,126 @@ func (b *TelegramBot) ripWholeCollection(ctx context.Context, kind, collectionID
 	return ripAlbum(collectionID, b.appleToken, Config.Storefront, "", forceAAC, ctx)
 }
 
-// collectionTrackIDs expands an album or playlist to its ordered Apple track ids
-// WITHOUT ripping (a single catalog API fetch). Returns ok=false on any fetch error
-// or if a track is missing its catalog id (can't be cached or gap-ripped on its
-// own) — the caller then rips the whole collection instead of half-handling it.
-func (b *TelegramBot) collectionTrackIDs(kind, id string) ([]string, bool) {
+// collectionMeta is the album/playlist data the read-through needs: the ordered
+// track ids plus enough to render the standalone cover photo for a fully-cached
+// delivery (where nothing is ripped, so no cover file lands on disk).
+type collectionMeta struct {
+	trackIDs      []string
+	artworkURL    string // Apple {w}x{h} template URL; writeCover fills the size
+	artist        string
+	name          string
+	releaseDate   string // album only
+	contentRating string // album only ("explicit" | "clean" | "")
+	isPlaylist    bool
+}
+
+// fetchCollection expands an album or playlist (a single catalog API fetch, no
+// rip) into its ordered track ids and cover metadata. Returns ok=false on any fetch
+// error or if a track is missing its catalog id (can't be cached or gap-ripped on
+// its own) — the caller then rips the whole collection instead of half-handling it.
+func (b *TelegramBot) fetchCollection(kind, id string) (*collectionMeta, bool) {
 	var tracks []ampapi.TrackRespData
+	m := &collectionMeta{}
 	switch kind {
 	case "playlist":
 		pl := task.NewPlaylist(Config.Storefront, id)
 		if err := pl.GetResp(b.appleToken, Config.Language); err != nil || len(pl.Resp.Data) == 0 {
 			return nil, false
 		}
+		a := pl.Resp.Data[0].Attributes
+		m.isPlaylist = true
+		m.artworkURL = a.Artwork.URL
+		m.artist = a.ArtistName
+		m.name = a.Name
 		tracks = pl.Resp.Data[0].Relationships.Tracks.Data
 	default: // "album"
 		al := task.NewAlbum(Config.Storefront, id)
 		if err := al.GetResp(b.appleToken, Config.Language); err != nil || len(al.Resp.Data) == 0 {
 			return nil, false
 		}
+		a := al.Resp.Data[0].Attributes
+		m.artworkURL = a.Artwork.URL
+		m.artist = a.ArtistName
+		m.name = a.Name
+		m.releaseDate = a.ReleaseDate
+		m.contentRating = a.ContentRating
 		tracks = al.Resp.Data[0].Relationships.Tracks.Data
 	}
-	ids := make([]string, 0, len(tracks))
+	m.trackIDs = make([]string, 0, len(tracks))
 	for _, t := range tracks {
 		tid := strings.TrimSpace(t.ID)
 		if tid == "" {
 			return nil, false
 		}
-		ids = append(ids, tid)
+		m.trackIDs = append(m.trackIDs, tid)
 	}
-	if len(ids) == 0 {
+	if len(m.trackIDs) == 0 {
 		return nil, false
 	}
-	return ids, true
+	return m, true
+}
+
+// sendCollectionCover downloads the album/playlist artwork and sends it as the
+// standalone cover photo + info caption that a fresh rip would post up front. Used
+// for a fully-cached delivery, where no cover file is ripped to disk. Best-effort:
+// any failure (no artwork, download error) is silently skipped — the tracks (which
+// carry embedded cover art) still deliver.
+func (b *TelegramBot) sendCollectionCover(chatID int64, m *collectionMeta, format string, totalTracks, replyToID int) {
+	if m == nil || strings.TrimSpace(m.artworkURL) == "" {
+		return
+	}
+	dir, err := os.MkdirTemp("", "karencover")
+	if err != nil {
+		return
+	}
+	defer os.RemoveAll(dir)
+	coverPath, err := writeCover(dir, "cover", m.artworkURL)
+	if err != nil || coverPath == "" {
+		return
+	}
+	_ = b.sendPhotoWithReply(chatID, coverPath, buildCachedCoverCaption(m, format, totalTracks), replyToID)
+}
+
+// buildCachedCoverCaption renders the cover caption from catalog/API metadata (the
+// file-based buildCoverCaption can't be used — a cached delivery has no files).
+// Quality is the requested tier; exact bit depth/sample rate isn't stored per row.
+func buildCachedCoverCaption(m *collectionMeta, format string, totalTracks int) string {
+	lines := []string{}
+	if m.artist != "" {
+		lines = append(lines, fmt.Sprintf("Artist : %s", m.artist))
+	}
+	if m.name != "" {
+		lines = append(lines, fmt.Sprintf("Album : %s", m.name))
+	}
+	if !m.isPlaylist && m.releaseDate != "" {
+		lines = append(lines, fmt.Sprintf("Release Date : %s", m.releaseDate))
+	}
+	lines = append(lines, fmt.Sprintf("Total Tracks : %d", totalTracks))
+	lines = append(lines, fmt.Sprintf("Quality : %s", cachedQualityLabel(format)))
+	if !m.isPlaylist && m.contentRating != "" {
+		explicit := "False"
+		if m.contentRating == "explicit" {
+			explicit = "True"
+		}
+		lines = append(lines, fmt.Sprintf("Explicit : %s", explicit))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// cachedQualityLabel maps a rip format to the quality tier shown on a cached cover.
+func cachedQualityLabel(format string) string {
+	switch catalog.QualityTier(format) {
+	case "lossless":
+		return "Lossless"
+	case "atmos":
+		return "Dolby Atmos"
+	case "aac":
+		return "AAC"
+	}
+	if strings.TrimSpace(format) == "" {
+		return "Unknown"
+	}
+	return strings.ToUpper(format)
 }
 
 // deliverHitsInOrder copies cached dump messages (in track order) to the recipient
