@@ -103,6 +103,12 @@ type RipState struct {
 	measuredIdx    int        // paths[:measuredIdx] already summed into pendingBytes
 	pendingBytes   int64      // on-disk size of paths[flushStart:measuredIdx]
 	flushedAny     atomic.Bool
+
+	// cacheDelivered counts tracks already delivered straight from the dump by the
+	// D9 read-through (catalogServeCollection) before/instead of ripping. When a
+	// fully-cached collection rips nothing, runDownload uses this to report success
+	// instead of "No files were downloaded".
+	cacheDelivered atomic.Int64
 }
 
 func newRipState() *RipState {
@@ -566,6 +572,23 @@ func (rs *RipState) flushedSomething() bool {
 		return false
 	}
 	return rs.flushedAny.Load()
+}
+
+// markCacheDelivered records that n tracks were delivered from the dump by the D9
+// read-through (no-op on the nil/CLI path).
+func (rs *RipState) markCacheDelivered(n int) {
+	if rs == nil || n <= 0 {
+		return
+	}
+	rs.cacheDelivered.Add(int64(n))
+}
+
+// cacheDeliveredCount returns how many tracks were delivered from the dump.
+func (rs *RipState) cacheDeliveredCount() int {
+	if rs == nil {
+		return 0
+	}
+	return int(rs.cacheDelivered.Load())
 }
 
 // remainderPaths returns the files not yet delivered by a mid-rip flush — i.e. the
