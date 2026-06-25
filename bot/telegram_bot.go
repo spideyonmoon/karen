@@ -3542,9 +3542,13 @@ func (b *TelegramBot) runDownload(req *downloadRequest) {
 		return
 	}
 
-	// Playlists with >40 tracks are automatically routed to Gofile regardless of the
-	// chosen delivery mode — sending 40+ individual uploads triggers FloodWait hard.
-	const largePlaylistThreshold = 40
+	// Very large playlists are still routed to Gofile regardless of the chosen mode.
+	// The old ceiling was 40 (single-account TG upload was the bottleneck), but the
+	// multi-account upload pool plus the D9 track-level read-through (we now upload
+	// only the uncached gaps, in parallel across helpers) lifted that bottleneck, so
+	// the guardrail moves to >100. Note len(paths) here is the count actually being
+	// uploaded — for a mostly-cached playlist that's just the gaps, not the whole list.
+	const largePlaylistThreshold = 100
 	if strings.HasPrefix(req.albumID, "pl.") && len(paths) > largePlaylistThreshold &&
 		transferMode != transferModeGofileZip && transferMode != transferModeMv && transferMode != transferModeMvGofile && transferMode != transferModeArt {
 		status.UpdateSync(fmt.Sprintf("Large playlist (%d tracks) — routing to Gofile.", len(paths)), 0, 0)
