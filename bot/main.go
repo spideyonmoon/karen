@@ -710,6 +710,67 @@ func stripLrcTimestamps(s string) string {
 	return strings.Join(lines, "\n")
 }
 
+// isTransientWrapperErr reports whether err is a transient wrapper-pool condition —
+// an instance restarting, a dropped gRPC stream, backpressure — that is worth
+// retrying on another instance after a backoff, rather than a permanent per-track
+// failure. These are exactly the errors a crashing/recovering wrapper produces, and
+// the symptoms that silently dropped tracks from healthy albums under the old
+// 2-attempt retry.
+func isTransientWrapperErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "no available instance") ||
+		strings.Contains(s, "connection reset by peer") ||
+		strings.Contains(s, "EOF") ||
+		strings.Contains(s, "engine was closed") ||
+		strings.Contains(s, "engine forcibly closed") ||
+		strings.Contains(s, "transport is closing")
+}
+
+// withWrapperRetry runs fn against a freshly-acquired wrapper client, retrying on
+// transient pool errors with exponential backoff. It returns early on success, on a
+// permanent unsupported-encryption error (which must NEVER be retried — a non-FairPlay
+// key crashes the wrapper), or when ctx is cancelled. Acquire/Release (and the
+// panic-safe token return) are handled here so a leaked token can't shrink the pool.
+func withWrapperRetry(ctx context.Context, op string, fn func(wm *wmgrpc.Client) error) error {
+	const maxAttempts = 5
+	backoff := 2 * time.Second
+	var err error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		func() {
+			wm := wmPool.Acquire()
+			defer wmPool.Release(wm)
+			err = fn(wm)
+		}()
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, wmgrpc.ErrNoFairPlayKey) {
+			return err // permanent: don't retry, don't feed another wrapper a bad key
+		}
+		if attempt == maxAttempts {
+			break
+		}
+		fmt.Printf("%s attempt %d/%d failed (%v); retrying with different instance...\n", op, attempt, maxAttempts, err)
+		if isTransientWrapperErr(err) {
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			if backoff < 16*time.Second {
+				backoff *= 2
+			}
+		}
+	}
+	return err
+}
+
 func ripTrack(track *task.Track, token string, ctx context.Context) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -763,20 +824,11 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 	// If AAC-LC, get M3U8 via WebPlayback; otherwise use track.M3u8
 	var downloadM3u8 string
 	if needDlAacLc {
-		for attempt := 0; attempt < 2; attempt++ {
-			func() {
-				wm := wmPool.Acquire()
-				defer wmPool.Release(wm)
-				downloadM3u8, err = wm.WebPlayback(ctx, track.ID)
-			}()
-			if err == nil {
-				break
-			}
-			if attempt == 0 {
-				fmt.Printf("WebPlayback attempt 1 failed, retrying with different instance: %v\n", err)
-				time.Sleep(2 * time.Second)
-			}
-		}
+		err = withWrapperRetry(ctx, "WebPlayback", func(wm *wmgrpc.Client) error {
+			var e error
+			downloadM3u8, e = wm.WebPlayback(ctx, track.ID)
+			return e
+		})
 		if err != nil {
 			fmt.Println("Failed to get AAC-LC playback URL:", err)
 			recordDownloadFailure(ctx, "%s: AAC-LC WebPlayback failed: %v", track.Name, err)
@@ -784,20 +836,11 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 			return
 		}
 	} else {
-		for attempt := 0; attempt < 2; attempt++ {
-			func() {
-				wm := wmPool.Acquire()
-				defer wmPool.Release(wm)
-				downloadM3u8, err = wm.M3U8(ctx, track.ID)
-			}()
-			if err == nil {
-				break
-			}
-			if attempt == 0 {
-				fmt.Printf("M3U8 attempt 1 failed, retrying with different instance: %v\n", err)
-				time.Sleep(2 * time.Second)
-			}
-		}
+		err = withWrapperRetry(ctx, "M3U8", func(wm *wmgrpc.Client) error {
+			var e error
+			downloadM3u8, e = wm.M3U8(ctx, track.ID)
+			return e
+		})
 		if err != nil {
 			fmt.Println("Failed to get ALAC/Atmos playback URL:", err)
 			recordDownloadFailure(ctx, "%s: ALAC/Atmos M3U8 failed: %v", track.Name, err)
@@ -947,32 +990,21 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 		}
 	}
 
-	{
-		// Retry on a different pool client if the wrapper crashes mid-decrypt
-		// (Invalid CKC from the Android CDM, connection reset, etc.). Mirrors
-		// the M3U8/WebPlayback retry pattern added in b7d1ea9 — without this,
-		// a single bad wrapper takes the whole track down.
-		for attempt := 0; attempt < 2; attempt++ {
-			// Release in a deferred closure per attempt so a panic inside
-			// DownloadAndDecrypt (mp4 decode/encode, sample handling) can never
-			// leak a pool token — a leaked token permanently shrinks the pool and
-			// would eventually deadlock every future rip.
-			func() {
-				wm := wmPool.Acquire()
-				defer wmPool.Release(wm)
-				track.WorkerID = wm.ID()
-				err = wmgrpc.DownloadAndDecrypt(ctx, wm, track.ID, downloadM3u8, trackPath, wmgrpc.ProgressFunc(trackProgress))
-			}()
-			if err == nil {
-				break
-			}
-			if attempt == 0 {
-				fmt.Printf("DownloadAndDecrypt attempt 1 failed, retrying with different instance: %v\n", err)
-				time.Sleep(2 * time.Second)
-			}
-		}
-	}
+	// Retry on a different pool client for transient wrapper errors (an instance
+	// restarting, connection reset). A permanent ErrNoFairPlayKey is NOT retried —
+	// it never reaches the wrapper, so it can't crash one. withWrapperRetry handles
+	// Acquire/Release in a panic-safe closure so a leaked token can't shrink the pool.
+	err = withWrapperRetry(ctx, "DownloadAndDecrypt", func(wm *wmgrpc.Client) error {
+		track.WorkerID = wm.ID()
+		return wmgrpc.DownloadAndDecrypt(ctx, wm, track.ID, downloadM3u8, trackPath, wmgrpc.ProgressFunc(trackProgress))
+	})
 	if err != nil {
+		if errors.Is(err, wmgrpc.ErrNoFairPlayKey) {
+			fmt.Println("Skipping (unsupported encryption, no FairPlay key):", track.Name)
+			recordDownloadFailure(ctx, "%s: unsupported encryption (no FairPlay key)", track.Name)
+			ctr.Inc(&ctr.Unavailable)
+			return
+		}
 		fmt.Println("Failed to download/decrypt:", err)
 		recordDownloadFailure(ctx, "%s: download/decrypt failed: %v", track.Name, err)
 		if strings.Contains(err.Error(), "Unavailable") {

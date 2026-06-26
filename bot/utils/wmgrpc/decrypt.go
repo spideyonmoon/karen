@@ -36,6 +36,52 @@ func (p *progressWriter) Write(b []byte) (int, error) {
 
 const prefetchKey = "skd://itunes.apple.com/P000000000/s1/e1"
 
+// fairPlayKeyScheme is the URI scheme of Apple's FairPlay Streaming key. Some
+// releases ship a multi-DRM media playlist whose segments carry several
+// #EXT-X-KEY tags — FairPlay (skd://) plus Widevine/PlayReady, whose URI is a
+// data:;base64,… blob the wrapper-manager cannot license.
+const fairPlayKeyScheme = "skd://"
+
+// ErrNoFairPlayKey means the media playlist is encrypted but exposes no FairPlay
+// (skd://) key — only schemes (Widevine/PlayReady) the FairPlay-only wrapper can't
+// decrypt. Callers treat it as a clean, NON-retryable per-track failure: it must
+// never reach the wrapper (a non-FairPlay key crashes the wrapper process).
+var ErrNoFairPlayKey = errors.New("playlist has no FairPlay (skd://) key; unsupported encryption")
+
+// keepFairPlayKeysOnly strips every #EXT-X-KEY line whose URI is not a FairPlay
+// (skd://) key. The grafov/m3u8 parser keeps only ONE key per segment (the last
+// #EXT-X-KEY seen), so on a multi-DRM playlist where FairPlay is not listed last we
+// would otherwise hand the wrapper a Widevine data:;base64, key → "Invalid CKC" →
+// the wrapper process crashes, browning out the shared pool for every concurrent
+// rip. Filtering on the raw text BEFORE parsing guarantees the skd:// key survives.
+// Returns ErrNoFairPlayKey when the playlist has (non-NONE) key tags but none are
+// FairPlay.
+func keepFairPlayKeysOnly(playlist []byte) ([]byte, error) {
+	lines := strings.Split(string(playlist), "\n")
+	out := make([]string, 0, len(lines))
+	var sawDRMKey, sawFairPlayKey bool
+	for _, ln := range lines {
+		if strings.HasPrefix(strings.TrimSpace(ln), "#EXT-X-KEY") {
+			if strings.Contains(ln, "METHOD=NONE") {
+				out = append(out, ln) // explicit "unencrypted from here" marker — keep
+				continue
+			}
+			sawDRMKey = true
+			if strings.Contains(ln, fairPlayKeyScheme) {
+				sawFairPlayKey = true
+				out = append(out, ln)
+			}
+			// Drop non-FairPlay key tags (Widevine/PlayReady data:;base64,…).
+			continue
+		}
+		out = append(out, ln)
+	}
+	if sawDRMKey && !sawFairPlayKey {
+		return nil, ErrNoFairPlayKey
+	}
+	return []byte(strings.Join(out, "\n")), nil
+}
+
 func downloadBytes(ctx context.Context, url string) ([]byte, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -139,6 +185,14 @@ func DownloadAndDecrypt(ctx context.Context, wm *Client, adamID string, playlist
 	mediaBytes, err := downloadBytes(ctx, mediaURL)
 	if err != nil {
 		return fmt.Errorf("download media playlist: %w", err)
+	}
+
+	// Drop non-FairPlay #EXT-X-KEY lines so the single-key m3u8 parser retains the
+	// skd:// key (see keepFairPlayKeysOnly). Returns ErrNoFairPlayKey for content
+	// that only ships Widevine/PlayReady keys — bubbled up as a non-retryable failure.
+	mediaBytes, err = keepFairPlayKeysOnly(mediaBytes)
+	if err != nil {
+		return err
 	}
 
 	segments, err := parseMediaPlaylist(bytes.NewReader(mediaBytes))
