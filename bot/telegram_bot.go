@@ -3641,14 +3641,18 @@ func (b *TelegramBot) runDownload(req *downloadRequest) {
 		return
 	}
 
-	// Very large playlists are still routed to Gofile regardless of the chosen mode.
-	// The old ceiling was 40 (single-account TG upload was the bottleneck), but the
-	// multi-account upload pool plus the D9 track-level read-through (we now upload
-	// only the uncached gaps, in parallel across helpers) lifted that bottleneck, so
-	// the guardrail moves to >100. Note len(paths) here is the count actually being
-	// uploaded — for a mostly-cached playlist that's just the gaps, not the whole list.
+	// Very large playlists are still routed to Gofile regardless of the chosen mode —
+	// EXCEPT telegram-individual, where the user explicitly asked for per-track TG
+	// delivery: each track is its own small upload (no single file approaches the TG
+	// size limit), so a high track count is no reason to force Gofile. The old ceiling
+	// was 40 (single-account TG upload was the bottleneck); the multi-account pool +
+	// D9 track-level read-through (we upload only the uncached gaps, in parallel)
+	// lifted that, so for zip modes the guardrail is >100. (The 20 GB mid-rip flush
+	// above remains the disk-safety valve for both modes.) Note len(paths) is the
+	// count actually uploaded — for a mostly-cached playlist that's just the gaps.
 	const largePlaylistThreshold = 100
 	if strings.HasPrefix(req.albumID, "pl.") && len(paths) > largePlaylistThreshold &&
+		transferMode != transferModeTelegramIndividual &&
 		transferMode != transferModeGofileZip && transferMode != transferModeMv && transferMode != transferModeMvGofile && transferMode != transferModeArt {
 		status.UpdateSync(fmt.Sprintf("Large playlist (%d tracks) — routing to Gofile.", len(paths)), 0, 0)
 		b.deliverGofileZip(chatID, paths, replyToID, single, status, rctx)
