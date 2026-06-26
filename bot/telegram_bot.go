@@ -8195,18 +8195,21 @@ func (b *TelegramBot) cancelAllTasks(chatID int64, replyToID int) {
 }
 
 // adminRestart is the /restart handler: stop in-flight work, purge the local audio
-// caches, then exit the process so Docker's `restart: unless-stopped` policy brings
-// the bot back. It does NOT touch the wrapper-manager containers. All mutable state
-// (cache, schedule, profiles) is persisted atomically to bot/state/, so an abrupt
-// exit is safe.
+// caches, cycle the wrapper-manager containers, then exit the process so Docker's
+// `restart: unless-stopped` policy brings the bot back. Restarting the wrappers
+// needs the Docker socket mounted into the bot (docker-compose.yml); if it isn't,
+// that step degrades to a warning and the bot still restarts itself. All mutable
+// state (cache, schedule, profiles) is persisted atomically to bot/state/, so an
+// abrupt exit is safe.
 func (b *TelegramBot) adminRestart(chatID int64, replyToID int) {
 	// Send the confirmation FIRST — sendMessageWithReply is a synchronous HTTP call,
 	// so it returns only once Telegram has accepted the message, guaranteeing it lands
 	// before os.Exit below.
-	_ = b.sendMessageWithReply(chatID, "♻️ Restarting Karen… back in a few seconds.", nil, replyToID)
+	_ = b.sendMessageWithReply(chatID, "♻️ Restarting Karen and the wrapper-managers… back in a few seconds.", nil, replyToID)
 
-	// Cancel everything in-flight so files are released; otherwise purgeDownloadCaches
-	// self-skips on its busy / anyInUse() guards and the cache wouldn't actually clear.
+	// Cancel everything in-flight so files are released (otherwise purgeDownloadCaches
+	// self-skips on its busy / anyInUse() guards) and no rip is mid-decrypt on a
+	// wrapper we're about to cycle.
 	b.queueMu.Lock()
 	b.cancelAllTasksLocked()
 	b.queueMu.Unlock()
@@ -8214,6 +8217,13 @@ func (b *TelegramBot) adminRestart(chatID int64, replyToID int) {
 	// Best-effort: the periodic purge ticker and the startup purge are backstops if a
 	// just-cancelled upload still briefly holds files.
 	b.purgeDownloadCaches()
+
+	// Cycle the wrapper-manager containers via the Docker socket. Best-effort: a
+	// missing socket / permission denial / absent container just yields a warning;
+	// the bot still restarts itself below.
+	if failed := restartAllWrappers(); len(failed) > 0 {
+		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("⚠️ Couldn't restart wrapper(s): %s. Is the Docker socket mounted? Restarting the bot anyway.", strings.Join(failed, ", ")), nil, replyToID)
+	}
 
 	fmt.Println("Admin /restart: exiting for Docker to restart the container.")
 	os.Exit(0)

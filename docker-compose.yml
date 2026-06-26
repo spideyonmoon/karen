@@ -19,6 +19,11 @@ services:
       # target on the same fs, so rename is atomic and actually persists.
       # generate.sh creates ./bot/state first so Docker mounts a dir, not a file.
       - ./bot/state:/app/state
+      # Docker Engine socket — used ONLY by the admin /restart command to cycle the
+      # wrapper-manager containers (karen-wm-*) alongside the bot. This grants the
+      # bot host-root-equivalent control of Docker; acceptable here because the bot
+      # is single-admin and private. Remove this line to revert /restart to bot-only.
+      - /var/run/docker.sock:/var/run/docker.sock
     command: ["--bot"]
     restart: unless-stopped
     # MTProto uploads to DC5 (Singapore, ~176ms RTT) drop/resume because
