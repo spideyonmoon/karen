@@ -1751,6 +1751,24 @@ type artistBreakdown struct {
 	musicVideos int
 	playlists   int
 	appearsOn   int
+	// Max-quality breakdown, tallied from each release's album-level audioTraits
+	// (no per-release probing — Apple only exposes the tier, not exact kHz, at album
+	// level). Each release counts once toward its top lossless tier (hi-res >
+	// lossless > lossy); Atmos is orthogonal and counted separately.
+	hiResReleases, hiResTracks       int
+	losslessReleases, losslessTracks int
+	lossyReleases, lossyTracks       int
+	atmosReleases, atmosTracks       int
+}
+
+// hasTrait reports whether an album's audioTraits slice contains t.
+func hasTrait(traits []string, t string) bool {
+	for _, x := range traits {
+		if x == t {
+			return true
+		}
+	}
+	return false
 }
 
 // countArtist builds a categorized breakdown of an artist's entire catalog:
@@ -1793,6 +1811,23 @@ func (b *TelegramBot) countArtist(chatID int64, storefront, artistID, sfCode str
 			bd.singles++
 		default:
 			bd.fullAlbums++
+		}
+
+		// Max-quality tier from the album's audioTraits (instant, no probing).
+		switch {
+		case hasTrait(a.AudioTraits, "hi-res-lossless"):
+			bd.hiResReleases++
+			bd.hiResTracks += a.TrackCount
+		case hasTrait(a.AudioTraits, "lossless"):
+			bd.losslessReleases++
+			bd.losslessTracks += a.TrackCount
+		default:
+			bd.lossyReleases++
+			bd.lossyTracks += a.TrackCount
+		}
+		if hasTrait(a.AudioTraits, "atmos") || hasTrait(a.AudioTraits, "spatial") {
+			bd.atmosReleases++
+			bd.atmosTracks += a.TrackCount
 		}
 	}
 	bd.genre = primaryGenre(genres)
@@ -1856,6 +1891,25 @@ func (bd artistBreakdown) render() (rich, plain string) {
 	}
 	if len(rel) > 0 {
 		body = append(body, strings.Join(rel, " · "))
+	}
+
+	// Max-quality breakdown — releases + tracks per top lossless tier, plus an Atmos
+	// row. Header + one line per non-zero tier; dropped entirely for an artist whose
+	// releases expose no audioTraits at all.
+	if bd.hiResReleases+bd.losslessReleases+bd.lossyReleases > 0 {
+		body = append(body, "🎚 Max quality")
+		if bd.hiResReleases > 0 {
+			body = append(body, fmt.Sprintf("💎 Hi-Res Lossless · %s · %s", countLabel(bd.hiResReleases, "release"), countLabel(bd.hiResTracks, "track")))
+		}
+		if bd.losslessReleases > 0 {
+			body = append(body, fmt.Sprintf("🔷 Lossless · %s · %s", countLabel(bd.losslessReleases, "release"), countLabel(bd.losslessTracks, "track")))
+		}
+		if bd.lossyReleases > 0 {
+			body = append(body, fmt.Sprintf("🔸 AAC / Lossy · %s · %s", countLabel(bd.lossyReleases, "release"), countLabel(bd.lossyTracks, "track")))
+		}
+		if bd.atmosReleases > 0 {
+			body = append(body, fmt.Sprintf("🎧 Dolby Atmos · %s · %s", countLabel(bd.atmosReleases, "release"), countLabel(bd.atmosTracks, "track")))
+		}
 	}
 
 	// Media + related — only non-zero buckets.
