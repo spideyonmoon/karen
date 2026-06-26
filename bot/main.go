@@ -998,13 +998,25 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 		track.WorkerID = wm.ID()
 		return wmgrpc.DownloadAndDecrypt(ctx, wm, track.ID, downloadM3u8, trackPath, wmgrpc.ProgressFunc(trackProgress))
 	})
-	if err != nil {
-		if errors.Is(err, wmgrpc.ErrNoFairPlayKey) {
-			fmt.Println("Skipping (unsupported encryption, no FairPlay key):", track.Name)
-			recordDownloadFailure(ctx, "%s: unsupported encryption (no FairPlay key)", track.Name)
+	if err != nil && errors.Is(err, wmgrpc.ErrNoFairPlayKey) {
+		// No FairPlay key for this track — Widevine/PlayReady-only content the
+		// FairPlay wrapper can't license. Fall back to karen's bundled Widevine CDM
+		// (runv3, the same path music videos use): it acquires a Widevine license
+		// directly from Apple and writes the decrypted file to the SAME trackPath,
+		// so the rest of the pipeline (remux → tag → deliver) is unchanged. Output is
+		// AAC — the best available when there's no FairPlay (hence no lossless)
+		// stream. runv3 talks to Apple with the local CDM and never touches the
+		// wrapper pool, so this can't affect concurrent rips.
+		fmt.Println("No FairPlay key; trying Widevine (runv3) fallback:", track.Name)
+		if _, werr := runv3.Run(ctx, track.ID, trackPath, token, Config.MediaUserToken, false, "", runv3.ProgressFunc(trackProgress)); werr != nil {
+			fmt.Println("Widevine fallback failed:", werr)
+			recordDownloadFailure(ctx, "%s: no FairPlay key; Widevine fallback failed: %v", track.Name, werr)
 			ctr.Inc(&ctr.Unavailable)
 			return
 		}
+		err = nil // Widevine rip wrote trackPath; continue the normal pipeline.
+	}
+	if err != nil {
 		fmt.Println("Failed to download/decrypt:", err)
 		recordDownloadFailure(ctx, "%s: download/decrypt failed: %v", track.Name, err)
 		if strings.Contains(err.Error(), "Unavailable") {
