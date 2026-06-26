@@ -7881,11 +7881,15 @@ func buildCoverCaption(ctx context.Context, paths []string) string {
 	contentRating := ""
 	quality := ""
 	codec := ""
+	actualFormat := ""
 	playlistName := ""
 	playlistArtist := ""
 
 	for _, p := range paths {
 		if meta, ok := getDownloadedMeta(ctx, p); ok {
+			if actualFormat == "" && meta.ActualFormat != "" {
+				actualFormat = meta.ActualFormat
+			}
 			if artist == "" && meta.Performer != "" {
 				artist = meta.Performer
 			}
@@ -7927,7 +7931,7 @@ func buildCoverCaption(ctx context.Context, paths []string) string {
 		}
 	}
 
-	qualityDisplay := formatQualityDisplay(quality, codec)
+	qualityDisplay := formatQualityDisplay(quality, codec, actualFormat)
 
 	explicit := "False"
 	if contentRating == "explicit" {
@@ -7953,23 +7957,50 @@ func buildCoverCaption(ctx context.Context, paths []string) string {
 	return strings.Join(lines, "\n")
 }
 
-func formatQualityDisplay(quality string, codec string) string {
-	if quality == "" {
-		if codec != "" {
-			return codec
-		}
-		return "Unknown"
+// formatQualityDisplay renders the caption's Quality field as "<codec> <spec>",
+// e.g. "ALAC 24Bit - 48kHz", "AAC 256Kbps", "Dolby Atmos (E-AC3) 768Kbps". The
+// codec label prefers the REAL probed format (actualFormat) over the requested one
+// (codec), so a fallback (lossless→AAC, Widevine AAC) is labelled correctly.
+func formatQualityDisplay(quality, codec, actualFormat string) string {
+	label := codecLabel(actualFormat)
+	if label == "" {
+		label = codecLabel(codec)
 	}
+
+	spec := quality
 	// ALAC quality format: "24B-48.0kHz" → "24Bit - 48kHz"
 	re := regexp.MustCompile(`^(\d+)B-(\d+(?:\.\d+)?)kHz$`)
-	if m := re.FindStringSubmatch(quality); len(m) == 3 {
-		sampleRate := m[2]
-		if strings.HasSuffix(sampleRate, ".0") {
-			sampleRate = strings.TrimSuffix(sampleRate, ".0")
-		}
-		return fmt.Sprintf("%sBit - %skHz", m[1], sampleRate)
+	if m := re.FindStringSubmatch(spec); len(m) == 3 {
+		sampleRate := strings.TrimSuffix(m[2], ".0")
+		spec = fmt.Sprintf("%sBit - %skHz", m[1], sampleRate)
 	}
-	return quality
+
+	switch {
+	case label != "" && spec != "":
+		return label + " " + spec
+	case label != "":
+		return label
+	case spec != "":
+		return spec
+	}
+	return "Unknown"
+}
+
+// codecLabel maps a format/codec token (either the canonical ActualFormat
+// "alac|aac|flac|atmos" or the requested "ALAC|AAC|ATMOS") to a caption label.
+// Returns "" for unknown tokens so callers can fall back.
+func codecLabel(c string) string {
+	switch strings.ToLower(strings.TrimSpace(c)) {
+	case "alac":
+		return "ALAC"
+	case "aac":
+		return "AAC"
+	case "flac":
+		return "FLAC"
+	case "atmos", "ec-3", "ec3", "eac3", "e-ac3":
+		return "Dolby Atmos (E-AC3)"
+	}
+	return ""
 }
 
 func buildTransferKeyboard(mtprotoReady bool) InlineKeyboardMarkup {
