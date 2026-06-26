@@ -7852,7 +7852,7 @@ func (b *TelegramBot) sendDeliverySummary(ctx context.Context, chatID int64, pat
 	}
 	rows := make([]row, 0, len(paths))
 	var totalBytes int64
-	albumName, albumArtist, quality, codec, playlistName, playlistArtist := "", "", "", "", "", ""
+	albumName, albumArtist, quality, codec, actualFormat, playlistName, playlistArtist := "", "", "", "", "", "", ""
 
 	for i, p := range paths {
 		r := row{num: i + 1, title: filepath.Base(p)}
@@ -7868,6 +7868,9 @@ func (b *TelegramBot) sendDeliverySummary(ctx context.Context, chatID int64, pat
 			if quality == "" {
 				quality = meta.Quality
 				codec = meta.Codec
+			}
+			if actualFormat == "" && meta.ActualFormat != "" {
+				actualFormat = meta.ActualFormat
 			}
 			if playlistName == "" && meta.PlaylistName != "" {
 				playlistName = meta.PlaylistName
@@ -7892,7 +7895,7 @@ func (b *TelegramBot) sendDeliverySummary(ctx context.Context, chatID int64, pat
 		}
 	}
 	fmtLabel := strings.ToUpper(normalizeTelegramFormat(format))
-	if q := formatQualityDisplay(quality, codec); q != "" {
+	if q := formatQualityDisplay(quality, codec, actualFormat); q != "" {
 		fmtLabel = q
 	}
 
