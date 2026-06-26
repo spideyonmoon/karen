@@ -1521,6 +1521,7 @@ func (b *TelegramBot) handleCount(chatID int64, link string, replyToID int) {
 		b.maybePublishTracklist(&card)
 		rich, plain := card.render()
 		_, _ = b.sendRichMessage(chatID, rich, plain, nil, replyToID)
+		b.sendRegionAvailability(chatID, albumID, replyToID)
 		return
 	}
 	if sf, playlistID := checkUrlPlaylist(link); playlistID != "" {
@@ -1631,6 +1632,7 @@ func (b *TelegramBot) countSong(chatID int64, storefront, songID, sfCode string,
 	rich := fmt.Sprintf("## 🎵 %s\n\n%s\n", escapeRichMD(a.Name), richLines(richBody))
 	plain := "🎵 " + a.Name + "\n" + strings.Join(plainBody, "\n")
 	_, _ = b.sendRichMessage(chatID, rich, plain, nil, replyToID)
+	b.sendRegionAvailability(chatID, songID, replyToID)
 }
 
 // countMusicVideo renders a card for a music-video link: title, artist, album,
