@@ -4253,6 +4253,10 @@ func (b *TelegramBot) deliverGofileZip(chatID int64, paths []string, replyToID i
 				status.UpdateSync("Cancelled", 0, 0)
 				return
 			}
+			var fileSize int64
+			if info, statErr := os.Stat(path); statErr == nil {
+				fileSize = info.Size()
+			}
 			status.UpdateSync("Uploading to Gofile...", 0, 0)
 			downloadLink, err := apputils.UploadToGofile(ctx, path, Config.GofileToken)
 			if err != nil {
@@ -4260,8 +4264,7 @@ func (b *TelegramBot) deliverGofileZip(chatID int64, paths []string, replyToID i
 				status.UpdateSync(fmt.Sprintf("Gofile upload failed: %v", err), 0, 0)
 				continue
 			}
-			msg := fmt.Sprintf("File: %s\nDownload Link: %s", filepath.Base(path), downloadLink)
-			_ = b.sendMessageWithReply(chatID, msg, nil, replyToID)
+			_ = b.sendMessageWithReply(chatID, formatGofileDelivery(filepath.Base(path), downloadLink, fileSize, status), nil, replyToID)
 			sentAny = true
 		}
 		if sentAny {
@@ -4330,6 +4333,57 @@ func (b *TelegramBot) flushChunkToGofile(chatID int64, paths []string, replyToID
 	return nil
 }
 
+// deliverySummary snapshots the rip's headline facts for the delivery message,
+// read from the status board (which already tracks them for its live render):
+// the release title, delivered/total track counts, and wall-clock elapsed since
+// the rip started (rip + remux + upload). Zero values on a nil receiver.
+func (s *DownloadStatus) deliverySummary() (title string, done, total int, elapsed time.Duration) {
+	if s == nil {
+		return "", 0, 0, 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.releaseTitle, s.finishedTracks, s.trackTotal, time.Since(s.startedAt)
+}
+
+// formatGofileDelivery builds the user-facing Gofile message: a clean summary
+// (name · tracks · size · time taken) above the link, replacing the bare
+// "File: …\nDownload Link: …". Degrades gracefully (name + size + link) when the
+// status board isn't available.
+func formatGofileDelivery(displayName, link string, sizeBytes int64, status *DownloadStatus) string {
+	name := strings.TrimSuffix(displayName, ".zip")
+	var done, total int
+	var elapsed time.Duration
+	if status != nil {
+		if t, d, tot, el := status.deliverySummary(); t != "" || tot > 0 {
+			if t != "" {
+				name = t
+			}
+			done, total, elapsed = d, tot, el
+		}
+	}
+
+	var sb strings.Builder
+	sb.WriteString("✅ Upload complete\n\n")
+	fmt.Fprintf(&sb, "📀 %s\n", name)
+	switch {
+	case total > 0 && done > 0 && done < total:
+		fmt.Fprintf(&sb, "🔢 %d/%d tracks (some unavailable)\n", done, total)
+	case total == 1:
+		sb.WriteString("🔢 1 track\n")
+	case total > 0:
+		fmt.Fprintf(&sb, "🔢 %d tracks\n", total)
+	}
+	if sizeBytes > 0 {
+		fmt.Fprintf(&sb, "🗂️ %s\n", formatBytes(sizeBytes))
+	}
+	if elapsed > 0 {
+		fmt.Fprintf(&sb, "⏱️ Took %s\n", formatDuration(elapsed))
+	}
+	fmt.Fprintf(&sb, "🔗 %s", link)
+	return sb.String()
+}
+
 // deliverGofileZipFromPath uploads a pre-created ZIP file to Gofile and sends the link.
 func (b *TelegramBot) deliverGofileZipFromPath(chatID int64, zipPath string, displayName string, replyToID int, status *DownloadStatus, ctx context.Context) {
 	if ctx != nil && ctx.Err() != nil {
@@ -4338,6 +4392,10 @@ func (b *TelegramBot) deliverGofileZipFromPath(chatID int64, zipPath string, dis
 		}
 		return
 	}
+	var zipSize int64
+	if info, statErr := os.Stat(zipPath); statErr == nil {
+		zipSize = info.Size()
+	}
 	status.UpdateSync("Uploading to Gofile...", 0, 0)
 	downloadLink, err := apputils.UploadToGofileAs(ctx, zipPath, Config.GofileToken, displayName)
 	if err != nil {
@@ -4345,8 +4403,7 @@ func (b *TelegramBot) deliverGofileZipFromPath(chatID int64, zipPath string, dis
 		return
 	}
 
-	msg := fmt.Sprintf("File: %s\nDownload Link: %s", displayName, downloadLink)
-	_ = b.sendMessageWithReply(chatID, msg, nil, replyToID)
+	_ = b.sendMessageWithReply(chatID, formatGofileDelivery(displayName, downloadLink, zipSize, status), nil, replyToID)
 
 	status.Stop()
 }
@@ -4529,14 +4586,17 @@ func (b *TelegramBot) deliverMusicVideo(chatID int64, path string, replyToID int
 		status.UpdateSync("Cancelled", 0, 0)
 		return
 	}
+	var fileSize int64
+	if info, statErr := os.Stat(path); statErr == nil {
+		fileSize = info.Size()
+	}
 	status.UpdateSync("Uploading to Gofile...", 0, 0)
 	link, err := apputils.UploadToGofile(ctx, path, Config.GofileToken)
 	if err != nil {
 		b.reportDeliveryFailure(chatID, replyToID, status, err)
 		return
 	}
-	msg := fmt.Sprintf("File: %s\nDownload Link: %s", filepath.Base(path), link)
-	_ = b.sendMessageWithReply(chatID, msg, nil, replyToID)
+	_ = b.sendMessageWithReply(chatID, formatGofileDelivery(filepath.Base(path), link, fileSize, status), nil, replyToID)
 	status.Stop()
 }
 
@@ -4549,14 +4609,17 @@ func (b *TelegramBot) deliverMvGofile(chatID int64, path string, replyToID int, 
 		return
 	}
 	status.SetReleaseTitle(mvBoardTitle(ctx, path))
+	var fileSize int64
+	if info, statErr := os.Stat(path); statErr == nil {
+		fileSize = info.Size()
+	}
 	status.UpdateSync("Uploading to Gofile...", 0, 0)
 	link, err := apputils.UploadToGofile(ctx, path, Config.GofileToken)
 	if err != nil {
 		b.reportDeliveryFailure(chatID, replyToID, status, err)
 		return
 	}
-	msg := fmt.Sprintf("File: %s\nDownload Link: %s", filepath.Base(path), link)
-	_ = b.sendMessageWithReply(chatID, msg, nil, replyToID)
+	_ = b.sendMessageWithReply(chatID, formatGofileDelivery(filepath.Base(path), link, fileSize, status), nil, replyToID)
 	status.Stop()
 }
 
