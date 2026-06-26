@@ -996,7 +996,7 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 	// Acquire/Release in a panic-safe closure so a leaked token can't shrink the pool.
 	err = withWrapperRetry(ctx, "DownloadAndDecrypt", func(wm *wmgrpc.Client) error {
 		track.WorkerID = wm.ID()
-		return wmgrpc.DownloadAndDecrypt(ctx, wm, track.ID, downloadM3u8, trackPath, wmgrpc.ProgressFunc(trackProgress))
+		return wmgrpc.DownloadAndDecrypt(ctx, wm, track.ID, downloadM3u8, trackPath, rs.atmos(), wmgrpc.ProgressFunc(trackProgress))
 	})
 	if err != nil && errors.Is(err, wmgrpc.ErrNoFairPlayKey) {
 		// No FairPlay key for this track — Widevine/PlayReady-only content the
@@ -1229,7 +1229,7 @@ func ripStation(albumId string, token string, storefront string, ctx context.Con
 		func() {
 			wm := wmPool.Acquire()
 			defer wmPool.Release(wm)
-			err = wmgrpc.DownloadAndDecrypt(ctx, wm, station.ID, trackM3U8, trackPath, nil)
+			err = wmgrpc.DownloadAndDecrypt(ctx, wm, station.ID, trackM3U8, trackPath, false, nil)
 		}()
 		if err != nil {
 			fmt.Println("Failed to download station stream.", err)

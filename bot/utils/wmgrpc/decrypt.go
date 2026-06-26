@@ -149,7 +149,20 @@ func resolveSegmentKeyURIs(segments []*m3u8.MediaSegment) []string {
 	return keyURIs
 }
 
-func DownloadAndDecrypt(ctx context.Context, wm *Client, adamID string, playlistURL string, outfile string, progress ProgressFunc) error {
+// firstVariantWithCodec returns the URI of the first master-playlist variant whose
+// CODECS attribute contains sub (case-insensitive), e.g. "ec-3" for Dolby Atmos or
+// "alac" for lossless. Apple's enhanced master lists each rendition as its own
+// variant, so this is how we target a codec instead of blindly taking Variants[0].
+func firstVariantWithCodec(variants []*m3u8.Variant, sub string) (string, bool) {
+	for _, v := range variants {
+		if v != nil && strings.Contains(strings.ToLower(v.Codecs), sub) {
+			return v.URI, true
+		}
+	}
+	return "", false
+}
+
+func DownloadAndDecrypt(ctx context.Context, wm *Client, adamID string, playlistURL string, outfile string, preferAtmos bool, progress ProgressFunc) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -169,7 +182,19 @@ func DownloadAndDecrypt(ctx context.Context, wm *Client, adamID string, playlist
 		if len(master.Variants) == 0 {
 			return errors.New("no variants in master playlist")
 		}
+		// Default to the first variant (historic behavior for ALAC/AAC). Only
+		// -atmos overrides it: pick the Dolby Atmos (ec-3) variant explicitly,
+		// since it is rarely listed first and the old Variants[0] grab silently
+		// downloaded stereo ALAC/AAC instead. If no ec-3 variant exists, warn and
+		// fall back rather than failing.
 		mediaURL = master.Variants[0].URI
+		if preferAtmos {
+			if uri, ok := firstVariantWithCodec(master.Variants, "ec-3"); ok {
+				mediaURL = uri
+			} else {
+				fmt.Printf("Atmos requested but no ec-3 variant among %d master variants; using default variant\n", len(master.Variants))
+			}
+		}
 		if !strings.HasPrefix(mediaURL, "http") {
 			lastSlash := strings.LastIndex(playlistURL, "/")
 			if lastSlash >= 0 {
