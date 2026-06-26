@@ -1106,11 +1106,6 @@ const inlineTracklistMax = 40
 // Telegram's size limit. Extra tracks fold into an "…and N more" line.
 const countTracklistCap = 60
 
-// qualityProbeCap bounds how many tracks /check probes for exact per-track audio
-// quality, so a huge playlist can't fan out into thousands of CDN requests.
-// Tracks beyond it are listed without a quality column.
-const qualityProbeCap = 100
-
 // countStreamable counts tracks that are actually playable/rip-able: a track
 // with an empty PlayParams.ID is unavailable (region-locked, pulled, etc.).
 func countStreamable(tracks []ampapi.TrackRespData) int {
@@ -1373,40 +1368,53 @@ func (c countCard) render() (rich, plain string) {
 	return rb.String(), strings.TrimRight(pb.String(), "\n")
 }
 
-// probeCardQuality reads exact per-track audio quality from each track's HLS
-// manifest (capped at qualityProbeCap) and fills the card's preciseQuality +
+// probeCardQuality reads exact per-track audio quality from EVERY track's HLS
+// manifest (no cap — Go handles the fan-out) and fills the card's preciseQuality +
 // qualityReports. Bounded-concurrency network work; for larger sets it posts a
 // brief progress note so the chat isn't silent during the fetches.
 func (b *TelegramBot) probeCardQuality(chatID int64, card *countCard, replyToID int) {
 	shown := card.tracks
-	if len(shown) > qualityProbeCap {
-		shown = shown[:qualityProbeCap]
-	}
 	urls := make([]string, len(shown))
-	any := false
+	withURL := 0
 	for i, t := range shown {
 		urls[i] = t.Attributes.ExtendedAssetUrls.EnhancedHls
 		if urls[i] != "" {
-			any = true
+			withURL++
 		}
 	}
-	if !any {
+	if withURL == 0 {
+		// Every track came back without an enhancedHls manifest URL, so there's
+		// nothing to probe — the card shows the coarse audioTraits badge only. Log it
+		// so a card full of "—" is explained rather than mysterious.
+		fmt.Printf("/check quality: 0/%d tracks expose an enhancedHls URL — skipping per-track probe\n", len(shown))
 		return
 	}
 	if len(shown) >= 10 {
 		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("🔎 Reading per-track quality from %d track(s)…", len(shown)), nil, replyToID)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	// Per-track probes are network-bound (one CDN manifest fetch each), so scale the
+	// timeout generously and fan out wide.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	reports := probeTracksQuality(ctx, urls, 8)
+	reports := probeTracksQuality(ctx, urls, 24)
 	card.qualityReports = reports
 	card.preciseQuality = bestQualitySummary(reports)
+	// Diagnostic: how many probes actually yielded a quality. A card full of "—"
+	// despite manifest URLs being present points the finger at the probe/manifest,
+	// not at the cap — this line distinguishes the two.
+	got := 0
+	for _, r := range reports {
+		if r != nil {
+			got++
+		}
+	}
+	fmt.Printf("/check quality: %d/%d tracks had a manifest URL, %d returned quality\n", withURL, len(shown), got)
 }
 
 // publishTracklist renders the card's full tracklist to a Telegraph page (a
-// numbered list — Telegraph has no tables) and returns its URL. Per-track
-// quality is included where it was probed (qualityProbeCap); tracks beyond that
-// list name + duration only, with a footnote.
+// numbered list — Telegraph has no tables) and returns its URL. Per-track quality
+// is included for every track whose manifest probe succeeded; the rest show name +
+// duration only.
 func (b *TelegramBot) publishTracklist(c countCard) (string, error) {
 	lis := make([]interface{}, 0, len(c.tracks))
 	for i, t := range c.tracks {
