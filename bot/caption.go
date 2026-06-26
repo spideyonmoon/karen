@@ -96,6 +96,21 @@ func albumZipMeta(albumID, format, displayName string) catalog.TrackMeta {
 // VariantKey then collapses alac/flac → the single "lossless" tier. Defaults to
 // "aac" when nothing else matches (AAC is Karen's default).
 func normalizeFormatTier(format string, meta AudioMeta) string {
+	// Prefer the REAL codec probed from the delivered file (recordDownloadedTrack
+	// via ffprobe) over the requested format. They diverge on fallbacks (lossless→
+	// AAC, Widevine AAC) and -atmos degradation, and only the real format may set
+	// the catalog tier — otherwise an AAC file gets indexed as q=lossless and a
+	// future lossless request is served that AAC file.
+	switch strings.ToLower(strings.TrimSpace(meta.ActualFormat)) {
+	case "alac":
+		return "alac"
+	case "flac":
+		return "flac"
+	case "aac":
+		return "aac"
+	case "atmos":
+		return "atmos"
+	}
 	switch strings.ToLower(strings.TrimSpace(format)) {
 	case "alac":
 		return "alac"

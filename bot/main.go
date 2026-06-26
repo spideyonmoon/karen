@@ -81,6 +81,13 @@ type AudioMeta struct {
 	ContentRating  string
 	Quality        string
 	Codec          string
+	// ActualFormat is the REAL codec of the delivered file, probed from disk with
+	// ffprobe after remux (alac|aac|flac|atmos), as opposed to Codec which is the
+	// REQUESTED codec. They diverge whenever a rip falls back (lossless→AAC, the
+	// Widevine AAC fallback) or -atmos degrades. Only this may set the catalog tier.
+	// Empty when ffprobe is unavailable or the probe fails (→ caption falls back to
+	// the requested format, the old behavior).
+	ActualFormat string
 	// ISRC is the cross-source recording identity (catalog identity fallback after
 	// adamID, D6). AlbumID is the parent album's adamID (set for album rips), used
 	// for the album_zip artifact key. Both empty when unknown.
@@ -125,6 +132,45 @@ func loadConfig() error {
 	return nil
 }
 
+// probeAudioFormat reads the REAL codec of a delivered audio file via ffprobe and
+// maps it to a canonical catalog format (alac|aac|flac|atmos). This is ground truth
+// for the #karenidx caption + catalog tier — unlike the requested codec, it reflects
+// fallbacks (lossless→AAC, Widevine AAC) and -atmos degradation. Returns "" on any
+// error (ffprobe missing, unreadable file), so callers keep the requested format.
+func probeAudioFormat(ctx context.Context, path string) string {
+	if path == "" {
+		return ""
+	}
+	out, err := exec.CommandContext(ctx, "ffprobe",
+		"-v", "error",
+		"-select_streams", "a:0",
+		"-show_entries", "stream=codec_name,channels",
+		"-of", "default=nw=1",
+		path,
+	).Output()
+	if err != nil {
+		return ""
+	}
+	var codec string
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "codec_name=") {
+			codec = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(line, "codec_name=")))
+		}
+	}
+	switch {
+	case codec == "alac":
+		return "alac"
+	case codec == "flac":
+		return "flac"
+	case strings.Contains(codec, "eac3"), strings.Contains(codec, "ec-3"), strings.Contains(codec, "ac3"):
+		return "atmos"
+	case strings.Contains(codec, "aac"):
+		return "aac"
+	}
+	return ""
+}
+
 func recordDownloadedTrack(ctx context.Context, track *task.Track) {
 	if track == nil || track.SavePath == "" {
 		return
@@ -162,6 +208,9 @@ func recordDownloadedTrack(ctx context.Context, track *task.Track) {
 			}
 		}
 	}
+	// Record the REAL codec from the finalized file on disk so the caption/catalog
+	// tier reflects what was actually delivered, not what was requested.
+	meta.ActualFormat = probeAudioFormat(ctx, track.SavePath)
 	if meta.Title != "" || meta.Performer != "" {
 		rs.putMeta(track.SavePath, meta)
 	}
