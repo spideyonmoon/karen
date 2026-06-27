@@ -4302,15 +4302,18 @@ func (b *TelegramBot) flushChunkToGofile(chatID int64, paths []string, replyToID
 	if ctx != nil && ctx.Err() != nil {
 		return ctx.Err()
 	}
+	// Phase 1: zipping. createZipFromPaths reads + writes the whole chunk (tens of GB
+	// for the 20 GB valve), which takes minutes — report it as its own phase so the
+	// board doesn't sit on "uploading" while it's actually still zipping (reads as hung).
 	if status != nil {
 		if label != "" {
-			status.UpdateSync(fmt.Sprintf("Uploading %s to Gofile…", label), 0, 0)
+			status.UpdateSync(fmt.Sprintf("Zipping %s…", label), 0, 0)
 		} else {
 			thresholdGB := Config.RipFlushThresholdGB
 			if thresholdGB <= 0 {
 				thresholdGB = defaultRipFlushThresholdGB
 			}
-			status.UpdateSync(fmt.Sprintf("Reached ~%d GB — uploading part %d to Gofile to free disk…", thresholdGB, part), 0, 0)
+			status.UpdateSync(fmt.Sprintf("Reached ~%d GB — zipping part %d…", thresholdGB, part), 0, 0)
 		}
 	}
 	zipPath, base, err := createZipFromPaths(paths)
@@ -4319,11 +4322,25 @@ func (b *TelegramBot) flushChunkToGofile(chatID int64, paths []string, replyToID
 	}
 	defer os.Remove(zipPath)
 
+	var zipSize int64
+	if info, statErr := os.Stat(zipPath); statErr == nil {
+		zipSize = info.Size()
+	}
+
 	name := strings.TrimSuffix(base, ".zip") + fmt.Sprintf(" (Part %d).zip", part)
 	announce := fmt.Sprintf("📦 Part %d: %s", part, name)
 	if label != "" {
 		name = forbiddenNames.ReplaceAllString(label, "_") + ".zip"
 		announce = "📦 " + label
+	}
+
+	// Phase 2: uploading. Show the chunk size so the wait has a sense of scale.
+	if status != nil {
+		if label != "" {
+			status.UpdateSync(fmt.Sprintf("Uploading %s to Gofile (%s)…", label, formatBytes(zipSize)), 0, 0)
+		} else {
+			status.UpdateSync(fmt.Sprintf("Uploading part %d to Gofile (%s)…", part, formatBytes(zipSize)), 0, 0)
+		}
 	}
 	link, err := apputils.UploadToGofileAs(ctx, zipPath, Config.GofileToken, name)
 	if err != nil {
