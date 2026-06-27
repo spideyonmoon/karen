@@ -556,6 +556,24 @@ func (b *TelegramBot) donorStar(userID int64, username string) string {
 	return ""
 }
 
+// heavyRipLimit is how many in-flight heavy rips of a kind a user may hold at once:
+// 1 artist / 2 huge-playlist for regular users, 2 / 3 for donors. Because non-admin
+// heavy rips defer to the nightly sleeptime window, this works out to ~that many per
+// day. Single source of truth for the cap (scheduleOrRun) and the /profile readout —
+// keep them from drifting.
+func heavyRipLimit(kind string, donor bool) int {
+	if kind == "playlist" {
+		if donor {
+			return 3
+		}
+		return 2
+	}
+	if donor { // artist
+		return 2
+	}
+	return 1
+}
+
 // countUserHeavyRips counts a user's heavy rips of the given kind ("artist" |
 // "playlist") across EVERY committed state: scheduled for a later window, waiting in
 // the download queue, actively downloading (head or sticky borrower), or uploading.
@@ -769,14 +787,10 @@ func (b *TelegramBot) scheduleOrRun(j *scheduledJob) {
 	// and huge playlists are tracked separately. Admins never reach here (they
 	// bypass scheduling entirely), so this only ever gates non-admins.
 	donor := b.isUserDonor(j.UserID, j.Username)
-	limit, capLabel := 1, "discography"
+	limit := heavyRipLimit(j.Kind, donor)
+	capLabel := "discography"
 	if j.Kind == "playlist" {
-		limit, capLabel = 2, "huge playlist"
-		if donor {
-			limit = 3
-		}
-	} else if donor { // "artist" discography
-		limit = 2
+		capLabel = "huge playlist"
 	}
 	// Count every in-flight state (scheduled + queued + active + uploading), not just
 	// the scheduled list — otherwise the cap is bypassed entirely inside the sleeptime

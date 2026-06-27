@@ -69,9 +69,9 @@ func profileKey(chatID int64, messageID int) string {
 func (b *TelegramBot) handleProfileCommand(chatID int64, userID int64, replyToID int) {
 	prefs := b.getPrefs(userID)
 	rich, plain := b.renderProfile("root", prefs, b.getStats(userID), b.isUserDonor(userID, ""))
-	tasks, maxTasks, artist, playlist := b.userQuota(userID, "")
-	rich += quotaLineRich(tasks, maxTasks, artist, playlist)
-	plain += quotaLinePlain(tasks, maxTasks, artist, playlist)
+	tasks, maxTasks, artist, artistMax, playlist, playlistMax := b.userQuota(userID, "")
+	rich += quotaLineRich(tasks, maxTasks, artist, artistMax, playlist, playlistMax)
+	plain += quotaLinePlain(tasks, maxTasks, artist, artistMax, playlist, playlistMax)
 	markup := b.profileMarkup("root", prefs)
 	res, err := b.sendRichMessage(chatID, rich, plain, markup, replyToID)
 	if err != nil || res.messageID == 0 {
@@ -89,25 +89,30 @@ func (b *TelegramBot) handleProfileCommand(chatID int64, userID int64, replyToID
 // (donor-aware) and heavy rips currently in flight per kind. Karen has no DAILY
 // quota — the limit is concurrent in-flight tasks. Reads userTaskCount under
 // queueMu, then calls countUserHeavyRips (which takes its own locks) — never nested.
-func (b *TelegramBot) userQuota(userID int64, username string) (tasks, maxTasks, artist, playlist int) {
+func (b *TelegramBot) userQuota(userID int64, username string) (tasks, maxTasks, artist, artistMax, playlist, playlistMax int) {
+	donor := b.isUserDonor(userID, username)
 	b.queueMu.Lock()
 	tasks = b.userTaskCount[userID]
 	b.queueMu.Unlock()
 	maxTasks = 3
-	if b.isUserDonor(userID, username) {
+	if donor {
 		maxTasks = 5
 	}
 	artist = b.countUserHeavyRips(userID, "artist")
 	playlist = b.countUserHeavyRips(userID, "playlist")
+	artistMax = heavyRipLimit("artist", donor)
+	playlistMax = heavyRipLimit("playlist", donor)
 	return
 }
 
-func quotaLineRich(tasks, maxTasks, artist, playlist int) string {
-	return fmt.Sprintf("\n📊 **Quota** (in flight): tasks %d/%d · artist %d · playlist %d\n", tasks, maxTasks, artist, playlist)
+func quotaLineRich(tasks, maxTasks, artist, artistMax, playlist, playlistMax int) string {
+	return fmt.Sprintf("\n📊 **Quota**: tasks %d/%d · artist %d/%d · huge-playlist %d/%d (in flight)\n",
+		tasks, maxTasks, artist, artistMax, playlist, playlistMax)
 }
 
-func quotaLinePlain(tasks, maxTasks, artist, playlist int) string {
-	return fmt.Sprintf("\n📊 Quota (in flight): tasks %d/%d · artist %d · playlist %d\n", tasks, maxTasks, artist, playlist)
+func quotaLinePlain(tasks, maxTasks, artist, artistMax, playlist, playlistMax int) string {
+	return fmt.Sprintf("\n📊 Quota: tasks %d/%d · artist %d/%d · huge-playlist %d/%d (in flight)\n",
+		tasks, maxTasks, artist, artistMax, playlist, playlistMax)
 }
 
 // userIDByUsername resolves a @username to a user ID by scanning recorded stats
@@ -143,7 +148,7 @@ func (b *TelegramBot) handleAdminProfileView(chatID int64, ref string, replyToID
 	prefs := b.getPrefs(id)
 	stats := b.getStats(id)
 	donor := b.isUserDonor(id, uname)
-	tasks, maxTasks, artist, playlist := b.userQuota(id, uname)
+	tasks, maxTasks, artist, artistMax, playlist, playlistMax := b.userQuota(id, uname)
 
 	ref = formatUserRef(id, uname)
 	var rb, pb strings.Builder
@@ -159,10 +164,10 @@ func (b *TelegramBot) handleAdminProfileView(chatID int64, ref string, replyToID
 	}
 	rb.WriteString(profileCompactRich(prefs))
 	rb.WriteString(usageBoxRich(stats))
-	rb.WriteString(quotaLineRich(tasks, maxTasks, artist, playlist))
+	rb.WriteString(quotaLineRich(tasks, maxTasks, artist, artistMax, playlist, playlistMax))
 	pb.WriteString(profileCompactPlain(prefs))
 	pb.WriteString(usageBoxPlain(stats))
-	pb.WriteString(quotaLinePlain(tasks, maxTasks, artist, playlist))
+	pb.WriteString(quotaLinePlain(tasks, maxTasks, artist, artistMax, playlist, playlistMax))
 	_, _ = b.sendRichMessage(chatID, rb.String(), pb.String(), nil, replyToID)
 }
 
