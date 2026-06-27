@@ -4327,7 +4327,13 @@ func (b *TelegramBot) flushChunkToGofile(chatID int64, paths []string, replyToID
 		zipSize = info.Size()
 	}
 
-	name := strings.TrimSuffix(base, ".zip") + fmt.Sprintf(" (Part %d).zip", part)
+	// Name the part after the rip's display name (e.g. the artist, for a discography)
+	// when set, instead of the collapsed download-folder basename ("ALAC").
+	partBase := strings.TrimSuffix(base, ".zip")
+	if dn := ripStateFrom(ctx).flushDisplayName(); dn != "" {
+		partBase = forbiddenNames.ReplaceAllString(dn, "_")
+	}
+	name := partBase + fmt.Sprintf(" (Part %d).zip", part)
 	announce := fmt.Sprintf("📦 Part %d: %s", part, name)
 	if label != "" {
 		name = forbiddenNames.ReplaceAllString(label, "_") + ".zip"
@@ -4408,6 +4414,11 @@ func (b *TelegramBot) deliverGofileZipFromPath(chatID int64, zipPath string, dis
 			status.UpdateSync("Cancelled", 0, 0)
 		}
 		return
+	}
+	// Name after the rip's display name (e.g. artist, for a discography remainder)
+	// when set, instead of the collapsed folder basename.
+	if dn := ripStateFrom(ctx).flushDisplayName(); dn != "" {
+		displayName = forbiddenNames.ReplaceAllString(dn, "_") + ".zip"
 	}
 	var zipSize int64
 	if info, statErr := os.Stat(zipPath); statErr == nil {

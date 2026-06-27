@@ -1043,8 +1043,10 @@ func (b *TelegramBot) runArtistMusicVideos(chatID, userID int64, storefront stri
 // per-release degrades to one final combined ZIP.
 func (b *TelegramBot) runArtistRip(chatID, userID int64, username, storefront, artistID string, albums []ampapi.ArtistSectionItem, replyToID int, forceAAC, forceAtmos, forceFlac bool, label string, perRelease bool) {
 	format := b.resolveFormat(chatID, forceFlac)
+	artistName := ampapi.GetArtistName(storefront, artistID, b.searchLanguage(), b.appleToken)
 	ok := b.enqueueDownloadWithAfter(chatID, userID, username, replyToID, 0, false, format, transferModeGofileZip, "artist:"+artistID, false, func(ctx context.Context) error {
 		rs := ripStateFrom(ctx)
+		rs.setFlushName(artistName) // name the Gofile ZIP parts after the artist, not the "ALAC" folder
 		if forceAtmos {
 			if rs != nil {
 				rs.Atmos = true

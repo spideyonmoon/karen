@@ -103,6 +103,11 @@ type RipState struct {
 	measuredIdx    int        // paths[:measuredIdx] already summed into pendingBytes
 	pendingBytes   int64      // on-disk size of paths[flushStart:measuredIdx]
 	flushedAny     atomic.Bool
+	// flushName is a human label for this rip's Gofile ZIP parts (e.g. the artist
+	// name for a discography), set once at rip start. When set, flush/delivery names
+	// the zip after it instead of the collapsed download-folder basename ("ALAC").
+	// Guarded by flushMu.
+	flushName string
 
 	// cacheDelivered counts tracks already delivered straight from the dump by the
 	// D9 read-through (catalogServeCollection) before/instead of ripping. When a
@@ -562,6 +567,28 @@ func (rs *RipState) setFlush(threshold int64, fn func(ctx context.Context, paths
 	rs.flushThreshold = threshold
 	rs.flush = fn
 	rs.flushMu.Unlock()
+}
+
+// setFlushName records the human label used to name this rip's Gofile ZIP parts
+// (e.g. the artist name). No-op on a nil receiver or empty name.
+func (rs *RipState) setFlushName(name string) {
+	if rs == nil || name == "" {
+		return
+	}
+	rs.flushMu.Lock()
+	rs.flushName = name
+	rs.flushMu.Unlock()
+}
+
+// flushDisplayName returns the label set by setFlushName, or "" if none. Callers use
+// it to name flush/delivery zips after the content instead of the folder basename.
+func (rs *RipState) flushDisplayName() string {
+	if rs == nil {
+		return ""
+	}
+	rs.flushMu.Lock()
+	defer rs.flushMu.Unlock()
+	return rs.flushName
 }
 
 // flushedSomething reports whether at least one chunk was flushed mid-rip. When

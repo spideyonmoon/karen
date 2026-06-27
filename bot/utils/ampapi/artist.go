@@ -8,6 +8,44 @@ import (
 	"net/url"
 )
 
+// GetArtistName fetches just an artist's display name from the catalog. Best-effort:
+// returns "" on any failure, so callers fall back to a generic label. Used to name
+// an artist discography's Gofile ZIP parts after the artist instead of the collapsed
+// download-folder basename.
+func GetArtistName(storefront, artistID, language, token string) string {
+	if token == "" || artistID == "" {
+		return ""
+	}
+	req, err := http.NewRequest("GET", fmt.Sprintf("https://amp-api.music.apple.com/v1/catalog/%s/artists/%s", storefront, artistID), nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
+	req.Header.Set("Origin", "https://music.apple.com")
+	q := url.Values{}
+	q.Set("l", language)
+	req.URL.RawQuery = q.Encode()
+	do, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer do.Body.Close()
+	if do.StatusCode != http.StatusOK {
+		return ""
+	}
+	var obj struct {
+		Data []struct {
+			Attributes struct {
+				Name string `json:"name"`
+			} `json:"attributes"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(do.Body).Decode(&obj); err != nil || len(obj.Data) == 0 {
+		return ""
+	}
+	return obj.Data[0].Attributes.Name
+}
+
 // ArtistAlbum is the slimmed-down view of one release in an artist's `albums`
 // relationship — just the fields /check needs to categorize releases and tally
 // tracks. Apple returns trackCount/isSingle/isCompilation right here, so the
