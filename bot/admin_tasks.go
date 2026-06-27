@@ -88,9 +88,10 @@ type UserStats struct {
 	ArtistRips    int64 `json:"artist_rips"`    // /dl artist links (any scope)
 	PlaylistRips  int64 `json:"playlist_rips"`  // /dl playlist links
 	SongRips      int64 `json:"song_rips"`      // /dl single-song links
-	Cancels       int64 `json:"cancels"`        // /stop_* + /cancel_* they issued
-	FirstSeenUnix int64 `json:"first_seen_unix"`
-	LastSeenUnix  int64 `json:"last_seen_unix"`
+	Cancels       int64  `json:"cancels"`            // /stop_* + /cancel_* they issued
+	Username      string `json:"username,omitempty"` // last-seen @username, for /profile @user lookup
+	FirstSeenUnix int64  `json:"first_seen_unix"`
+	LastSeenUnix  int64  `json:"last_seen_unix"`
 }
 
 // telegramStateFile is the IMPORTANT, DM-backed-up state: the admin lock and

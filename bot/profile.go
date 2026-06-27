@@ -69,6 +69,9 @@ func profileKey(chatID int64, messageID int) string {
 func (b *TelegramBot) handleProfileCommand(chatID int64, userID int64, replyToID int) {
 	prefs := b.getPrefs(userID)
 	rich, plain := b.renderProfile("root", prefs, b.getStats(userID), b.isUserDonor(userID, ""))
+	tasks, maxTasks, artist, playlist := b.userQuota(userID, "")
+	rich += quotaLineRich(tasks, maxTasks, artist, playlist)
+	plain += quotaLinePlain(tasks, maxTasks, artist, playlist)
 	markup := b.profileMarkup("root", prefs)
 	res, err := b.sendRichMessage(chatID, rich, plain, markup, replyToID)
 	if err != nil || res.messageID == 0 {
@@ -80,6 +83,87 @@ func (b *TelegramBot) handleProfileCommand(chatID int64, userID int64, replyToID
 	}
 	b.profileOwners[profileKey(chatID, res.messageID)] = userID
 	b.profileMu.Unlock()
+}
+
+// userQuota returns a user's CONCURRENT usage: pending tasks vs their cap
+// (donor-aware) and heavy rips currently in flight per kind. Karen has no DAILY
+// quota — the limit is concurrent in-flight tasks. Reads userTaskCount under
+// queueMu, then calls countUserHeavyRips (which takes its own locks) — never nested.
+func (b *TelegramBot) userQuota(userID int64, username string) (tasks, maxTasks, artist, playlist int) {
+	b.queueMu.Lock()
+	tasks = b.userTaskCount[userID]
+	b.queueMu.Unlock()
+	maxTasks = 3
+	if b.isUserDonor(userID, username) {
+		maxTasks = 5
+	}
+	artist = b.countUserHeavyRips(userID, "artist")
+	playlist = b.countUserHeavyRips(userID, "playlist")
+	return
+}
+
+func quotaLineRich(tasks, maxTasks, artist, playlist int) string {
+	return fmt.Sprintf("\n📊 **Quota** (in flight): tasks %d/%d · artist %d · playlist %d\n", tasks, maxTasks, artist, playlist)
+}
+
+func quotaLinePlain(tasks, maxTasks, artist, playlist int) string {
+	return fmt.Sprintf("\n📊 Quota (in flight): tasks %d/%d · artist %d · playlist %d\n", tasks, maxTasks, artist, playlist)
+}
+
+// userIDByUsername resolves a @username to a user ID by scanning recorded stats
+// (Username is stamped on every command since this update). 0 if not found.
+func (b *TelegramBot) userIDByUsername(uname string) int64 {
+	uname = strings.TrimPrefix(strings.ToLower(strings.TrimSpace(uname)), "@")
+	if uname == "" {
+		return 0
+	}
+	b.stateMu.Lock()
+	defer b.stateMu.Unlock()
+	for id, s := range b.userStats {
+		if s != nil && strings.EqualFold(strings.TrimPrefix(s.Username, "@"), uname) {
+			return id
+		}
+	}
+	return 0
+}
+
+// handleAdminProfileView shows a read-only view of another user's saved profile,
+// lifetime usage stats, and current quota usage. Admin-only. Resolves a numeric ID
+// directly, or a @username from recorded stats (seen since this update).
+func (b *TelegramBot) handleAdminProfileView(chatID int64, ref string, replyToID int) {
+	id, uname := parseUserRef(ref)
+	if id == 0 && uname != "" {
+		id = b.userIDByUsername(uname)
+	}
+	if id == 0 {
+		_ = b.sendMessageWithReply(chatID, "Couldn't resolve that user. Use a numeric Telegram ID, or @username of someone who's used the bot since this update.", nil, replyToID)
+		return
+	}
+
+	prefs := b.getPrefs(id)
+	stats := b.getStats(id)
+	donor := b.isUserDonor(id, uname)
+	tasks, maxTasks, artist, playlist := b.userQuota(id, uname)
+
+	ref = formatUserRef(id, uname)
+	var rb, pb strings.Builder
+	rb.WriteString("# 👤 Profile — " + escapeRichMD(ref) + "\n")
+	pb.WriteString("👤 Profile — " + ref + "\n")
+	if donor {
+		rb.WriteString("⭐ **Donor**\n")
+		pb.WriteString("⭐ Donor\n")
+	}
+	if stats.FirstSeenUnix == 0 {
+		rb.WriteString("_No recorded activity yet — showing defaults._\n")
+		pb.WriteString("No recorded activity yet — showing defaults.\n")
+	}
+	rb.WriteString(profileCompactRich(prefs))
+	rb.WriteString(usageBoxRich(stats))
+	rb.WriteString(quotaLineRich(tasks, maxTasks, artist, playlist))
+	pb.WriteString(profileCompactPlain(prefs))
+	pb.WriteString(usageBoxPlain(stats))
+	pb.WriteString(quotaLinePlain(tasks, maxTasks, artist, playlist))
+	_, _ = b.sendRichMessage(chatID, rb.String(), pb.String(), nil, replyToID)
 }
 
 // handleProfileCallback routes a "pf:*" callback: enforces ownership, mutates the

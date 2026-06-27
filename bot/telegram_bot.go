@@ -1686,7 +1686,12 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, username string,
 	}
 	// Tally every command the user is allowed to run (incl. /stop_*, /cancel_*).
 	// Rip-type and cancel counters below add to this on top of the command count.
-	b.bumpStats(userID, func(s *UserStats) { s.TotalCommands++ })
+	b.bumpStats(userID, func(s *UserStats) {
+		s.TotalCommands++
+		if username != "" {
+			s.Username = username // keep fresh for /profile @username lookup
+		}
+	})
 	if strings.HasPrefix(cmd, "stop_") {
 		taskID := strings.TrimPrefix(cmd, "stop_")
 		b.cancelTask(chatID, userID, taskID, replyToID)
@@ -1704,6 +1709,11 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, username string,
 	case "start", "help":
 		b.handleHelpCommand(chatID, replyToID)
 	case "profile":
+		// Admins can inspect another user's profile read-only: /profile <id|@username>.
+		if len(args) > 0 && b.isAdmin(userID) {
+			b.handleAdminProfileView(chatID, args[0], replyToID)
+			return
+		}
 		b.handleProfileCommand(chatID, userID, replyToID)
 	case "status", "queue":
 		// Split active boards into this chat's and others'. Boards in this chat are
