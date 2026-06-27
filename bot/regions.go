@@ -102,13 +102,19 @@ func regionAvailability(ctx context.Context, id string) []string {
 	return available
 }
 
-// formatRegionAvailability renders the sweep as flag badges: a count headline, the
+// formatRegionAvailability renders the sweep as flag badges: a count summary, the
 // available regions, and — when the unavailable set is short — exactly which
-// storefronts are missing (the common, useful case of "everywhere but RU").
-func formatRegionAvailability(available []string) string {
+// storefronts are missing (the common, useful case of "everywhere but RU"). It
+// returns two forms: rich tucks the (often long) flag lists into a collapsed
+// <details> dropdown keyed by the count summary (Bot API 10.1 Rich Markdown renders
+// supported HTML directly, the same construct the status board's tracklist uses), so
+// the /check card stays compact until tapped; plain is the flat text for the
+// non-rich fallback.
+func formatRegionAvailability(available []string) (rich, plain string) {
 	total := len(appleStorefronts)
 	if len(available) == 0 {
-		return "🌍 Availability: not found in any of the checked regions."
+		s := "🌍 Availability: not found in any of the checked regions."
+		return s, s
 	}
 
 	avail := map[string]bool{}
@@ -130,23 +136,29 @@ func formatRegionAvailability(available []string) string {
 		return strings.Join(parts, ", ")
 	}
 
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "🌍 Available in %d of %d regions\n\n%s", len(available), total, badge(available))
+	summary := fmt.Sprintf("🌍 Available in %d of %d regions", len(available), total)
+	var body strings.Builder
+	body.WriteString(badge(available))
 	// When only a handful are missing, listing them is far more useful than the long
 	// available block; when many are missing, the available list above already says it.
 	if len(missing) > 0 && len(missing) <= 15 {
-		fmt.Fprintf(&sb, "\n\n❌ Not available in %d: %s", len(missing), badge(missing))
+		fmt.Fprintf(&body, "\n\n❌ Not available in %d: %s", len(missing), badge(missing))
 	}
-	return sb.String()
+
+	// Blank lines around the body keep the Rich GFM parser happy inside <details>.
+	rich = fmt.Sprintf("<details>\n<summary>%s</summary>\n\n%s\n\n</details>", summary, body.String())
+	plain = summary + "\n\n" + body.String()
+	return rich, plain
 }
 
 // regionAvailabilityBlock runs the storefront sweep for an album/song id and returns
-// the formatted region block, for folding into the /check card (one message, not a
-// separate one). Returns "" for an empty id. Blocking (~a couple seconds); callers
-// (handleCount/countSong) already run off the update loop.
-func regionAvailabilityBlock(id string) string {
+// the formatted region block in both rich (collapsed <details> dropdown) and plain
+// forms, for folding into the /check card (one message, not a separate one). Both ""
+// for an empty id. Blocking (~a couple seconds); callers (handleCount/countSong)
+// already run off the update loop.
+func regionAvailabilityBlock(id string) (rich, plain string) {
 	if id == "" {
-		return ""
+		return "", ""
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()

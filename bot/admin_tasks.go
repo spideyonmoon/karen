@@ -1335,10 +1335,11 @@ type countCard struct {
 	// full list; the card links it instead of inlining the table.
 	seqNumbers   bool
 	tracklistURL string
-	// regionAvail is the pre-formatted region-availability block (flag badges),
-	// folded into THIS card rather than sent as a separate message — rich messages
-	// hold ~32k chars, so one message is plenty. Empty = omit.
-	regionAvail string
+	// regionAvail{Rich,Plain} are the pre-formatted region-availability block (flag
+	// badges), folded into THIS card rather than sent as a separate message. The rich
+	// form is a collapsed <details> dropdown; the plain form is flat text. Empty = omit.
+	regionAvailRich  string
+	regionAvailPlain string
 }
 
 // richLines joins body lines with GFM hard breaks (two trailing spaces + a
@@ -1476,11 +1477,14 @@ func (c countCard) render() (rich, plain string) {
 		fmt.Fprintf(&pb, "%s\n", strings.Join(foot, " · "))
 	}
 
-	// Region availability, folded into this one card (not a separate message). Flags
-	// + codes carry no Markdown specials, so it's appended raw on both tracks.
-	if c.regionAvail != "" {
-		fmt.Fprintf(&rb, "\n%s\n", c.regionAvail)
-		fmt.Fprintf(&pb, "\n%s\n", c.regionAvail)
+	// Region availability, folded into this one card (not a separate message). The rich
+	// form is a collapsed <details> dropdown; the plain fallback stays flat text. Flags
+	// + codes carry no Markdown specials, so each is appended raw on its track.
+	if c.regionAvailRich != "" {
+		fmt.Fprintf(&rb, "\n%s\n", c.regionAvailRich)
+	}
+	if c.regionAvailPlain != "" {
+		fmt.Fprintf(&pb, "\n%s\n", c.regionAvailPlain)
 	}
 
 	return rb.String(), strings.TrimRight(pb.String(), "\n")
@@ -1633,7 +1637,7 @@ func (b *TelegramBot) handleCount(chatID int64, link string, replyToID int) {
 			tracks:      tracks,
 		}
 		b.probeCardQuality(chatID, &card, replyToID)
-		card.regionAvail = regionAvailabilityBlock(albumID)
+		card.regionAvailRich, card.regionAvailPlain = regionAvailabilityBlock(albumID)
 		b.maybePublishTracklist(&card)
 		rich, plain := card.render()
 		_, _ = b.sendRichMessage(chatID, rich, plain, nil, replyToID)
@@ -1746,9 +1750,9 @@ func (b *TelegramBot) countSong(chatID int64, storefront, songID, sfCode string,
 
 	rich := fmt.Sprintf("## 🎵 %s\n\n%s\n", escapeRichMD(a.Name), richLines(richBody))
 	plain := "🎵 " + a.Name + "\n" + strings.Join(plainBody, "\n")
-	if region := regionAvailabilityBlock(songID); region != "" {
-		rich += "\n" + region + "\n"
-		plain += "\n" + region
+	if rRich, rPlain := regionAvailabilityBlock(songID); rRich != "" {
+		rich += "\n" + rRich + "\n"
+		plain += "\n" + rPlain
 	}
 	_, _ = b.sendRichMessage(chatID, rich, plain, nil, replyToID)
 }
