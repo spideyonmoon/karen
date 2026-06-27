@@ -200,6 +200,7 @@ type TelegramBot struct {
 	stateFile     string               // admin lock + user profiles (DM-backed-up daily)
 	scheduleFile  string               // pending sleeptime rips (persisted, NOT backed up)
 	adminLock     bool                 // true => only admins may use the bot (persisted)
+	lockReason    string               // optional reason shown to users while locked (set via /unauth <reason>, persisted)
 	scheduledJobs []*scheduledJob      // pending sleeptime rips (persisted)
 	userPrefs     map[int64]*UserPrefs // saved per-user rip profiles (persisted, keyed by user ID)
 	userStats     map[int64]*UserStats // per-user lifetime usage tally (persisted, keyed by user ID)
@@ -1525,7 +1526,7 @@ func (b *TelegramBot) handleCallback(cb *CallbackQuery) {
 	// Lockdown also blocks non-admins from completing in-flight button flows
 	// (delivery-mode picker, paging, selection).
 	if b.isLocked() && !b.isAdmin(clickerID) {
-		_ = b.answerCallbackAlert(cb.ID, "The bot is currently restricted to admins.")
+		_ = b.answerCallbackAlert(cb.ID, b.lockedNotice())
 		return
 	}
 	data := strings.TrimSpace(cb.Data)
@@ -1650,11 +1651,37 @@ func (b *TelegramBot) handleChosenInlineResult(result *ChosenInlineResult) {
 	b.queueInlineSongDownload(chatID, songID, result.InlineMessageID)
 }
 
+// karenUserCommands is the set of user-facing commands Karen owns. The admin-lock
+// gate uses it to decide when to reply "restricted": Karen must stay SILENT for
+// anything else — other bots share the group (/rip, /fs, /amdl, …) and spamming the
+// lock notice at every stray command is noise. Hidden admin commands are excluded so
+// the notice never reveals them to non-admins.
+var karenUserCommands = map[string]bool{
+	"dl": true, "check": true, "status": true, "queue": true,
+	"scheduled": true, "pending": true, "start": true, "help": true, "profile": true,
+}
+
+func isKarenUserCommand(cmd string) bool {
+	return karenUserCommands[cmd] || strings.HasPrefix(cmd, "stop_") || strings.HasPrefix(cmd, "cancel_")
+}
+
+// lockedNotice is shown to a non-admin while the bot is locked, including the
+// optional reason set via /unauth <reason>.
+func (b *TelegramBot) lockedNotice() string {
+	if reason := b.lockedReason(); reason != "" {
+		return "The bot is not available for services at this moment.\nReason: " + reason
+	}
+	return "The bot is currently restricted to admins."
+}
+
 func (b *TelegramBot) handleCommand(chatID int64, userID int64, username string, cmd string, args []string, replyToID int) {
-	// Admin lockdown: when /auth is active, non-admins can't run ANY command
-	// (including /stop and /status). Admins are unaffected.
+	// Admin lockdown: when locked, non-admins can't run ANY Karen command. But only
+	// reply for Karen's own user-facing commands — staying silent otherwise so we
+	// don't spam the notice at other bots' commands sharing the group.
 	if b.isLocked() && !b.isAdmin(userID) {
-		_ = b.sendMessageWithReply(chatID, "The bot is currently restricted to admins.", nil, replyToID)
+		if isKarenUserCommand(cmd) {
+			_ = b.sendMessageWithReply(chatID, b.lockedNotice(), nil, replyToID)
+		}
 		return
 	}
 	// Tally every command the user is allowed to run (incl. /stop_*, /cancel_*).
@@ -1941,45 +1968,48 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, username string,
 		// Blocking metadata fetches — run off the update loop.
 		go b.handleCount(chatID, args[0], replyToID)
 	case "auth":
+		// /auth = AUTHENTICATE (open). No arg → reopen the bot to all allowed users.
+		// With a user ref → restore one banned user's access.
 		if !b.isAdmin(userID) {
 			return // don't reveal the command to non-admins
 		}
-		// No arg → global lockdown (existing behavior). With an id → restore one
-		// banned user's access.
 		if len(args) == 0 {
-			b.setAdminLock(true)
-			_ = b.sendMessageWithReply(chatID, "🔒 Bot restricted to admins. Use /unauth to reopen.", nil, replyToID)
-			return
-		}
-		id, uname := parseUserRef(args[0])
-		if id == 0 && uname == "" {
-			_ = b.sendMessageWithReply(chatID, "Usage: /auth <telegram-id | @username> — restores a banned user's access.", nil, replyToID)
-			return
-		}
-		b.setUserBlocked(id, uname, false)
-		_ = b.sendMessageWithReply(chatID, "✅ Access restored for "+formatUserRef(id, uname)+".", nil, replyToID)
-	case "unauth":
-		if !b.isAdmin(userID) {
-			return
-		}
-		// No arg → reopen the bot (existing behavior). With an id → revoke one
-		// user's access.
-		if len(args) == 0 {
-			b.setAdminLock(false)
+			b.setAdminLock(false, "")
 			_ = b.sendMessageWithReply(chatID, "🔓 Bot reopened to all allowed users.", nil, replyToID)
 			return
 		}
 		id, uname := parseUserRef(args[0])
 		if id == 0 && uname == "" {
-			_ = b.sendMessageWithReply(chatID, "Usage: /unauth <telegram-id | @username> — revokes a user's access.", nil, replyToID)
+			_ = b.sendMessageWithReply(chatID, "Usage: /auth (reopen the bot) or /auth <telegram-id | @username> (restore a banned user).", nil, replyToID)
 			return
 		}
-		if b.isAdmin(id) {
-			_ = b.sendMessageWithReply(chatID, "Can't revoke an admin's access.", nil, replyToID)
+		b.setUserBlocked(id, uname, false)
+		_ = b.sendMessageWithReply(chatID, "✅ Access restored for "+formatUserRef(id, uname)+".", nil, replyToID)
+	case "unauth":
+		// /unauth = DE-AUTHENTICATE (restrict). A single valid user ref → ban that
+		// user. Otherwise → lock the bot to admins, using any extra text as the
+		// reason shown to users (e.g. /unauth back in 2 hours).
+		if !b.isAdmin(userID) {
 			return
 		}
-		b.setUserBlocked(id, uname, true)
-		_ = b.sendMessageWithReply(chatID, "🚫 Access revoked for "+formatUserRef(id, uname)+". They'll be told once, then ignored.", nil, replyToID)
+		if len(args) == 1 {
+			if id, uname := parseUserRef(args[0]); id != 0 || uname != "" {
+				if b.isAdmin(id) {
+					_ = b.sendMessageWithReply(chatID, "Can't revoke an admin's access.", nil, replyToID)
+					return
+				}
+				b.setUserBlocked(id, uname, true)
+				_ = b.sendMessageWithReply(chatID, "🚫 Access revoked for "+formatUserRef(id, uname)+". They'll be told once, then ignored.", nil, replyToID)
+				return
+			}
+		}
+		reason := strings.TrimSpace(strings.Join(args, " "))
+		b.setAdminLock(true, reason)
+		msg := "🔒 Bot restricted to admins. Use /auth to reopen."
+		if reason != "" {
+			msg = "🔒 Bot restricted to admins (reason: " + reason + "). Use /auth to reopen."
+		}
+		_ = b.sendMessageWithReply(chatID, msg, nil, replyToID)
 	case "p":
 		// Promote a user to donor (admin-only). Mirrors /auth's id|@username parsing.
 		if !b.isAdmin(userID) {

@@ -100,6 +100,7 @@ type UserStats struct {
 type telegramStateFile struct {
 	Version          int                  `json:"version"`
 	AdminLock        bool                 `json:"admin_lock"`
+	LockReason       string               `json:"lock_reason,omitempty"`
 	ScheduledJobs    []*scheduledJob      `json:"scheduled_jobs,omitempty"`
 	UserPrefs        map[int64]*UserPrefs `json:"user_prefs"`
 	UserStats        map[int64]*UserStats `json:"user_stats,omitempty"`
@@ -115,10 +116,11 @@ type telegramStateFile struct {
 // are stored as sorted-free slices; key order is irrelevant on reload.
 func (b *TelegramBot) stateFilePayloadLocked() telegramStateFile {
 	payload := telegramStateFile{
-		Version:   1,
-		AdminLock: b.adminLock,
-		UserPrefs: b.userPrefs,
-		UserStats: b.userStats,
+		Version:    1,
+		AdminLock:  b.adminLock,
+		LockReason: b.lockReason,
+		UserPrefs:  b.userPrefs,
+		UserStats:  b.userStats,
 	}
 	for id := range b.blockedUserIDs {
 		payload.BlockedUserIDs = append(payload.BlockedUserIDs, id)
@@ -149,6 +151,7 @@ func (b *TelegramBot) loadState() {
 	b.stateMu.Lock()
 	defer b.stateMu.Unlock()
 	b.adminLock = false
+	b.lockReason = ""
 	b.scheduledJobs = nil
 	b.userPrefs = make(map[int64]*UserPrefs)
 	b.userStats = make(map[int64]*UserStats)
@@ -177,6 +180,7 @@ func (b *TelegramBot) loadState() {
 		return
 	}
 	b.adminLock = payload.AdminLock
+	b.lockReason = payload.LockReason
 	b.scheduledJobs = payload.ScheduledJobs
 	if payload.UserPrefs != nil {
 		b.userPrefs = payload.UserPrefs
@@ -419,11 +423,25 @@ func (b *TelegramBot) isLocked() bool {
 	return b.adminLock
 }
 
-func (b *TelegramBot) setAdminLock(on bool) {
+// setAdminLock toggles admins-only mode. reason is shown to users in the lock
+// notice; it is cleared when unlocking (on=false) regardless of what's passed.
+func (b *TelegramBot) setAdminLock(on bool, reason string) {
 	b.stateMu.Lock()
 	b.adminLock = on
+	if on {
+		b.lockReason = strings.TrimSpace(reason)
+	} else {
+		b.lockReason = ""
+	}
 	b.saveStateLocked()
 	b.stateMu.Unlock()
+}
+
+// lockedReason returns the optional reason set with the current lock ("" if none).
+func (b *TelegramBot) lockedReason() string {
+	b.stateMu.Lock()
+	defer b.stateMu.Unlock()
+	return b.lockReason
 }
 
 // isBlockedUser reports whether a user has been banned via /unauth <id>. A user
