@@ -1228,6 +1228,10 @@ type countCard struct {
 	// full list; the card links it instead of inlining the table.
 	seqNumbers   bool
 	tracklistURL string
+	// regionAvail is the pre-formatted region-availability block (flag badges),
+	// folded into THIS card rather than sent as a separate message — rich messages
+	// hold ~32k chars, so one message is plenty. Empty = omit.
+	regionAvail string
 }
 
 // richLines joins body lines with GFM hard breaks (two trailing spaces + a
@@ -1365,13 +1369,20 @@ func (c countCard) render() (rich, plain string) {
 		fmt.Fprintf(&pb, "%s\n", strings.Join(foot, " · "))
 	}
 
+	// Region availability, folded into this one card (not a separate message). Flags
+	// + codes carry no Markdown specials, so it's appended raw on both tracks.
+	if c.regionAvail != "" {
+		fmt.Fprintf(&rb, "\n%s\n", c.regionAvail)
+		fmt.Fprintf(&pb, "\n%s\n", c.regionAvail)
+	}
+
 	return rb.String(), strings.TrimRight(pb.String(), "\n")
 }
 
 // probeCardQuality reads exact per-track audio quality from EVERY track's HLS
 // manifest (no cap — Go handles the fan-out) and fills the card's preciseQuality +
-// qualityReports. Bounded-concurrency network work; for larger sets it posts a
-// brief progress note so the chat isn't silent during the fetches.
+// qualityReports. Bounded-concurrency network work; runs silently (the result folds
+// into the single /check card, so no interim progress message).
 func (b *TelegramBot) probeCardQuality(chatID int64, card *countCard, replyToID int) {
 	shown := card.tracks
 	urls := make([]string, len(shown))
@@ -1388,9 +1399,6 @@ func (b *TelegramBot) probeCardQuality(chatID int64, card *countCard, replyToID 
 		// so a card full of "—" is explained rather than mysterious.
 		fmt.Printf("/check quality: 0/%d tracks expose an enhancedHls URL — skipping per-track probe\n", len(shown))
 		return
-	}
-	if len(shown) >= 10 {
-		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("🔎 Reading per-track quality from %d track(s)…", len(shown)), nil, replyToID)
 	}
 	// Per-track probes are network-bound (one CDN manifest fetch each), so scale the
 	// timeout generously and fan out wide.
@@ -1518,10 +1526,10 @@ func (b *TelegramBot) handleCount(chatID int64, link string, replyToID int) {
 			tracks:      tracks,
 		}
 		b.probeCardQuality(chatID, &card, replyToID)
+		card.regionAvail = regionAvailabilityBlock(albumID)
 		b.maybePublishTracklist(&card)
 		rich, plain := card.render()
 		_, _ = b.sendRichMessage(chatID, rich, plain, nil, replyToID)
-		b.sendRegionAvailability(chatID, albumID, replyToID)
 		return
 	}
 	if sf, playlistID := checkUrlPlaylist(link); playlistID != "" {
@@ -1631,8 +1639,11 @@ func (b *TelegramBot) countSong(chatID int64, storefront, songID, sfCode string,
 
 	rich := fmt.Sprintf("## 🎵 %s\n\n%s\n", escapeRichMD(a.Name), richLines(richBody))
 	plain := "🎵 " + a.Name + "\n" + strings.Join(plainBody, "\n")
+	if region := regionAvailabilityBlock(songID); region != "" {
+		rich += "\n" + region + "\n"
+		plain += "\n" + region
+	}
 	_, _ = b.sendRichMessage(chatID, rich, plain, nil, replyToID)
-	b.sendRegionAvailability(chatID, songID, replyToID)
 }
 
 // countMusicVideo renders a card for a music-video link: title, artist, album,

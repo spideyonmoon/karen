@@ -131,7 +131,7 @@ func formatRegionAvailability(available []string) string {
 	}
 
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "🌍 Available in %d of %d regions\n%s", len(available), total, badge(available))
+	fmt.Fprintf(&sb, "🌍 Available in %d of %d regions\n\n%s", len(available), total, badge(available))
 	// When only a handful are missing, listing them is far more useful than the long
 	// available block; when many are missing, the available list above already says it.
 	if len(missing) > 0 && len(missing) <= 15 {
@@ -140,15 +140,15 @@ func formatRegionAvailability(available []string) string {
 	return sb.String()
 }
 
-// sendRegionAvailability runs the storefront sweep for an album/song id and posts
-// the result as its own message after the /check card. Runs inline on the caller's
-// goroutine (handleCount already runs off the update loop), so the card shows first.
-func (b *TelegramBot) sendRegionAvailability(chatID int64, id string, replyToID int) {
+// regionAvailabilityBlock runs the storefront sweep for an album/song id and returns
+// the formatted region block, for folding into the /check card (one message, not a
+// separate one). Returns "" for an empty id. Blocking (~a couple seconds); callers
+// (handleCount/countSong) already run off the update loop.
+func regionAvailabilityBlock(id string) string {
 	if id == "" {
-		return
+		return ""
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
-	available := regionAvailability(ctx, id)
-	_ = b.sendMessageWithReply(chatID, formatRegionAvailability(available), nil, replyToID)
+	return formatRegionAvailability(regionAvailability(ctx, id))
 }
