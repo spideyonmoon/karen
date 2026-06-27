@@ -25,10 +25,18 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/grafov/m3u8"
 	"github.com/schollz/progressbar/v3"
 )
+
+// runv3HTTP bounds runv3's bare HTTP calls (webplayback, account info) with a
+// timeout. Those call sites used http.DefaultClient, which has NO timeout, so a
+// stalled Apple endpoint could hang a track — and a hung track blocks the batch
+// rip's per-release drain + 20 GB flush. Mutating the global DefaultClient would
+// affect the whole process, so this is a dedicated client.
+var runv3HTTP = &http.Client{Timeout: 90 * time.Second}
 
 type ProgressFunc func(phase string, done, total int64)
 
@@ -144,7 +152,7 @@ func GetWebplayback(adamId string, authtoken string, mutoken string, mvmode bool
 	req.Header.Set("x-apple-music-user-token", mutoken)
 	// 创建 HTTP 客户端
 	//client := &http.Client{}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := runv3HTTP.Do(req)
 	// 发送请求
 	//resp, err := client.Do(req)
 	if err != nil {
@@ -252,7 +260,7 @@ func extsong(ctx context.Context, b string, progress ProgressFunc) bytes.Buffer 
 		fmt.Printf("创建请求失败: %v\n", err)
 		return bytes.Buffer{}
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := runv3HTTP.Do(req)
 	if err != nil {
 		fmt.Printf("下载文件失败: %v\n", err)
 	}
@@ -319,6 +327,7 @@ func Run(ctx context.Context, adamId string, trackpath string, authtoken string,
 		"x-apple-music-user-token": mutoken,
 	}
 	client := resty.New()
+	client.SetTimeout(90 * time.Second) // bound the license request (was unbounded)
 	client.SetHeaders(headers)
 	key := key.Key{
 		ReqCli:        client,
@@ -482,7 +491,7 @@ func ExtMvData(ctx context.Context, keyAndUrls string, savePath string, progress
 	const maxConcurrency = 10
 	// --- 新增代码: 创建带缓冲的 Channel 作为信号量 ---
 	limiter := make(chan struct{}, maxConcurrency)
-	client := &http.Client{}
+	client := &http.Client{Timeout: 180 * time.Second} // bound per-segment fetch (was unbounded)
 
 	// 初始化进度条。When the bot supplies a progress callback, feed byte counts to
 	// the status board (total is unknown for the concatenated HLS segments, so it

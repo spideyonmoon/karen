@@ -141,6 +141,16 @@ func probeAudioFormat(ctx context.Context, path string) string {
 	if path == "" {
 		return ""
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// Hard cap: ffprobe on a local file returns in well under a second, but this runs
+	// in EVERY track's completion path on the hours-long rip context. An unbounded
+	// call that ever stalls would wedge that track — and a wedged track blocks the
+	// per-release drain + the 20 GB mid-rip flush, stalling the whole batch rip
+	// (observed: artist rips stuck at N-1/N and ballooning past the flush threshold).
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	out, err := exec.CommandContext(ctx, "ffprobe",
 		"-v", "error",
 		"-select_streams", "a:0",
@@ -1057,7 +1067,25 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 		// stream. runv3 talks to Apple with the local CDM and never touches the
 		// wrapper pool, so this can't affect concurrent rips.
 		fmt.Println("No FairPlay key; trying Widevine (runv3) fallback:", track.Name)
-		if _, werr := runv3.Run(ctx, track.ID, trackPath, token, Config.MediaUserToken, false, "", runv3.ProgressFunc(trackProgress)); werr != nil {
+		// Bound the fallback. runv3 has unbounded internal HTTP clients (GetWebplayback
+		// uses http.DefaultClient with no timeout and no ctx), so a stalled webplayback/
+		// license/segment fetch could hang this track forever — which blocks the
+		// per-release drain and the 20 GB mid-rip flush, wedging the entire batch rip.
+		// Run it off-goroutine and abandon it on timeout so the rip always progresses.
+		wvCtx, wvCancel := context.WithTimeout(ctx, 6*time.Minute)
+		done := make(chan error, 1)
+		go func() {
+			_, e := runv3.Run(wvCtx, track.ID, trackPath, token, Config.MediaUserToken, false, "", runv3.ProgressFunc(trackProgress))
+			done <- e
+		}()
+		var werr error
+		select {
+		case werr = <-done:
+		case <-wvCtx.Done():
+			werr = fmt.Errorf("widevine fallback timed out (or cancelled) after 6m")
+		}
+		wvCancel()
+		if werr != nil {
 			fmt.Println("Widevine fallback failed:", werr)
 			recordDownloadFailure(ctx, "%s: no FairPlay key; Widevine fallback failed: %v", track.Name, werr)
 			ctr.Inc(&ctr.Unavailable)
