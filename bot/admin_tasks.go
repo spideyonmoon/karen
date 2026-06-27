@@ -537,18 +537,52 @@ func (b *TelegramBot) donorStar(userID int64, username string) string {
 	return ""
 }
 
-// countPendingScheduled returns how many of a user's scheduled (not-yet-released)
-// jobs match the given kind ("artist" | "playlist"). Used to enforce the per-user
-// heavy-job caps. Takes stateMu — a leaf lock, never call while holding queueMu.
-func (b *TelegramBot) countPendingScheduled(userID int64, kind string) int {
-	b.stateMu.Lock()
-	defer b.stateMu.Unlock()
+// countUserHeavyRips counts a user's heavy rips of the given kind ("artist" |
+// "playlist") across EVERY committed state: scheduled for a later window, waiting in
+// the download queue, actively downloading (head or sticky borrower), or uploading.
+//
+// This is the PROFILE-bound quota. The old countPendingScheduled only counted the
+// scheduled list, but inside the sleeptime window heavy rips bypass the scheduler
+// and go straight to the queue (scheduleOrRun → releaseJob), so that count stayed ~0
+// and the per-user cap never fired — letting one user flood the queue with dozens of
+// discographies overnight. Counting the queue/active/uploading states too closes
+// that hole regardless of which path a rip took.
+//
+// Lock discipline: stateMu and queueMu are taken in SEPARATE critical sections (never
+// nested), so this is safe to call from anywhere (stateMu is a leaf lock).
+func (b *TelegramBot) countUserHeavyRips(userID int64, kind string) int {
+	if userID == 0 {
+		return 0
+	}
+	match := func(albumID string) bool { return strings.HasPrefix(albumID, "artist:") }
+	if kind == "playlist" {
+		match = func(albumID string) bool { return strings.HasPrefix(albumID, "pl.") }
+	}
+
 	n := 0
+	b.stateMu.Lock()
 	for _, j := range b.scheduledJobs {
 		if j.UserID == userID && j.Kind == kind {
 			n++
 		}
 	}
+	b.stateMu.Unlock()
+
+	b.queueMu.Lock()
+	countReq := func(r *downloadRequest) {
+		if r != nil && r.userID == userID && match(r.albumID) {
+			n++
+		}
+	}
+	for _, r := range b.queuedReqs {
+		countReq(r)
+	}
+	for _, r := range b.uploadingReqs {
+		countReq(r)
+	}
+	countReq(b.activeReq)
+	countReq(b.schedBorrowReq)
+	b.queueMu.Unlock()
 	return n
 }
 
@@ -725,9 +759,12 @@ func (b *TelegramBot) scheduleOrRun(j *scheduledJob) {
 	} else if donor { // "artist" discography
 		limit = 2
 	}
-	if j.UserID != 0 && b.countPendingScheduled(j.UserID, j.Kind) >= limit {
+	// Count every in-flight state (scheduled + queued + active + uploading), not just
+	// the scheduled list — otherwise the cap is bypassed entirely inside the sleeptime
+	// window, where heavy rips skip the scheduler and go straight to the queue.
+	if j.UserID != 0 && b.countUserHeavyRips(j.UserID, j.Kind) >= limit {
 		_ = b.sendMessageWithReply(j.ChatID, fmt.Sprintf(
-			"You already have %d %s rip(s) scheduled — the max for your tier. Cancel one with /scheduled or wait for it to run.",
+			"You already have %d %s rip(s) in progress or queued — the max for your tier. Wait for one to finish (track them with /scheduled), or cancel with /stop.",
 			limit, capLabel), nil, j.ReplyToID)
 		return
 	}
