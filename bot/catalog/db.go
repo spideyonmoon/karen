@@ -98,6 +98,23 @@ var migrations = []string{
 	`create index if not exists tracks_isrc_kind_var on tracks (isrc, kind, variant)`,
 	`create index if not exists tracks_title_artist on tracks (lower(title), lower(artist))`,
 	`create index if not exists tracks_funiq on tracks (file_unique_id)`,
+	// Per-day heavy-rip quota (charge-at-submit / refund-on-failure). The bot keeps an
+	// in-memory authoritative copy; these rows are write-through + boot-restore only, so
+	// a DB blip never lifts the quota (enforcement stays in memory). quota_day is the
+	// 1PM-Dhaka day key the bot computes; state walks open→committed|refunded.
+	`create table if not exists quota_charges (
+		charge_id      text primary key,
+		user_id        bigint not null,
+		kind           text   not null,
+		quota_day      date   not null,
+		state          text   not null default 'open',
+		releases_total int    not null default 0,
+		delivered      int    not null default 0,
+		created_at     timestamptz not null default now(),
+		finalized_at   timestamptz
+	)`,
+	`create index if not exists quota_charges_day_state on quota_charges (quota_day, state)`,
+	`create index if not exists quota_charges_user_day on quota_charges (user_id, quota_day, kind)`,
 }
 
 // Migrate applies the schema. Idempotent; safe to call on every boot. No-op when

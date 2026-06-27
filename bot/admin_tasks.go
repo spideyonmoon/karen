@@ -43,6 +43,11 @@ type scheduledJob struct {
 	ForceFlac     bool   `json:"force_flac"`
 	ReleaseAtUnix int64  `json:"release_at_unix"`
 	CreatedAtUnix int64  `json:"created_at_unix"`
+	// QuotaChargeID ties this job to its per-day quota slot (see quota.go). Charged at
+	// submission (scheduleOrRun); refunded if the rip doesn't finish. Persisted so a
+	// deferred job's charge survives a restart and is still finalized when it runs or
+	// is cancelled. "" for admin/headless jobs that aren't charged.
+	QuotaChargeID string `json:"quota_charge_id,omitempty"`
 }
 
 func (j *scheduledJob) releaseTime() time.Time { return time.Unix(j.ReleaseAtUnix, 0) }
@@ -751,10 +756,10 @@ func (b *TelegramBot) releaseJob(j *scheduledJob) {
 	switch j.Kind {
 	case "playlist":
 		_ = b.sendMessageWithReply(j.ChatID, "🌙 Sleeptime reached — starting your scheduled playlist rip (Gofile ZIP).", nil, j.ReplyToID)
-		b.enqueuePlaylistDownload(j.ChatID, j.ResourceID, j.ReplyToID, 0, transferModeGofileZip, j.ForceAAC, j.ForceAtmos, j.ForceFlac, false, j.UserID, j.Username)
+		b.enqueuePlaylistDownload(j.ChatID, j.ResourceID, j.ReplyToID, 0, transferModeGofileZip, j.ForceAAC, j.ForceAtmos, j.ForceFlac, false, j.UserID, j.Username, j.QuotaChargeID)
 	case "artist":
 		_ = b.sendMessageWithReply(j.ChatID, "🌙 Sleeptime reached — starting your scheduled artist rip (Gofile ZIP).", nil, j.ReplyToID)
-		b.runArtistRipScoped(j.ChatID, j.UserID, j.Username, j.Storefront, j.ResourceID, j.Section, j.ReplyToID, j.ForceAAC, j.ForceAtmos, j.ForceFlac)
+		b.runArtistRipScoped(j.ChatID, j.UserID, j.Username, j.Storefront, j.ResourceID, j.Section, j.ReplyToID, j.ForceAAC, j.ForceAtmos, j.ForceFlac, j.QuotaChargeID)
 	}
 }
 
@@ -782,25 +787,29 @@ func (b *TelegramBot) scheduleJob(j *scheduledJob, donor bool) {
 func (b *TelegramBot) scheduleOrRun(j *scheduledJob) {
 	now := time.Now()
 
-	// Per-user heavy-job cap: how many rips of this kind a user may have waiting in
-	// the scheduled queue at once. Donors get a higher ceiling. Discography (artist)
-	// and huge playlists are tracked separately. Admins never reach here (they
-	// bypass scheduling entirely), so this only ever gates non-admins.
+	// Per-user heavy-job cap: how many rips of this kind a user may start PER DAY.
+	// Donors get a higher ceiling. Discography (artist) and huge playlists are tracked
+	// separately. Admins never reach here (they bypass scheduling entirely), so this
+	// only ever gates non-admins.
 	donor := b.isUserDonor(j.UserID, j.Username)
 	limit := heavyRipLimit(j.Kind, donor)
 	capLabel := "discography"
 	if j.Kind == "playlist" {
 		capLabel = "huge playlist"
 	}
-	// Count every in-flight state (scheduled + queued + active + uploading), not just
-	// the scheduled list — otherwise the cap is bypassed entirely inside the sleeptime
-	// window, where heavy rips skip the scheduler and go straight to the queue.
-	if j.UserID != 0 && b.countUserHeavyRips(j.UserID, j.Kind) >= limit {
+	// Per-DAY quota: charge a slot at submission (refunded later if the rip doesn't
+	// finish). This replaces the old in-flight count, which a user could bypass inside
+	// the sleeptime window by chaining rips as each one finished. quotaCheckAndCharge
+	// is the single gate for BOTH the immediate and deferred paths; the chargeID rides
+	// on the job so every terminal path can finalize it.
+	chargeID, ok := b.quotaCheckAndCharge(j.UserID, j.Username, j.Kind)
+	if !ok {
 		_ = b.sendMessageWithReply(j.ChatID, fmt.Sprintf(
-			"You already have %d %s rip(s) in progress or queued — the max for your tier. Wait for one to finish (track them with /scheduled), or cancel with /stop.",
+			"You've reached your daily limit of %d %s rip(s) for your tier. It resets at 1 PM Dhaka. Failed or cancelled rips don't count, so /stop and resubmit if one stalled.",
 			limit, capLabel), nil, j.ReplyToID)
 		return
 	}
+	j.QuotaChargeID = chargeID
 
 	if inSleepWindow(now) {
 		b.releaseJob(j)
@@ -891,7 +900,10 @@ func (b *TelegramBot) cancelScheduledJob(chatID, userID int64, jobID string, rep
 	}
 	b.scheduledJobs = append(b.scheduledJobs[:idx], b.scheduledJobs[idx+1:]...)
 	b.saveScheduleLocked()
+	chargeID := job.QuotaChargeID
 	b.stateMu.Unlock()
+	// Deferred job was never enqueued, so nothing delivered → return the quota slot.
+	b.quotaRefund(chargeID, 0)
 	b.bumpStats(userID, func(s *UserStats) { s.Cancels++ })
 	_ = b.sendMessageWithReply(chatID, fmt.Sprintf("❌ Cancelled scheduled task %s.", jobID), nil, replyToID)
 }
@@ -1015,7 +1027,7 @@ func artistScopeFor(key string) (artistScope, bool) {
 //
 // Blocks on network (section enumeration) — call in a goroutine from the update
 // loop.
-func (b *TelegramBot) runArtistRipScoped(chatID, userID int64, username, storefront, artistID, sectionKey string, replyToID int, forceAAC, forceAtmos, forceFlac bool) {
+func (b *TelegramBot) runArtistRipScoped(chatID, userID int64, username, storefront, artistID, sectionKey string, replyToID int, forceAAC, forceAtmos, forceFlac bool, quotaChargeID string) {
 	if storefront == "" {
 		storefront = Config.Storefront
 	}
@@ -1026,15 +1038,20 @@ func (b *TelegramBot) runArtistRipScoped(chatID, userID int64, username, storefr
 
 	items, err := ampapi.ListArtistSection(storefront, artistID, scope.apiPath, b.searchLanguage(), b.appleToken)
 	if err != nil {
+		b.quotaRefund(quotaChargeID, 0) // never enqueued → return the slot
 		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("Failed to load this artist's %s: %v", scope.label, err), nil, replyToID)
 		return
 	}
 	if len(items) == 0 {
+		b.quotaRefund(quotaChargeID, 0)
 		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("No %s found for this artist.", scope.label), nil, replyToID)
 		return
 	}
 
 	if scope.isMV {
+		// MVs are queued as separate per-item jobs, not covered by this heavy charge —
+		// release the slot so a music-videos section doesn't burn the artist quota.
+		b.quotaRefund(quotaChargeID, 0)
 		b.runArtistMusicVideos(chatID, userID, storefront, items, replyToID)
 		return
 	}
@@ -1044,7 +1061,7 @@ func (b *TelegramBot) runArtistRipScoped(chatID, userID int64, username, storefr
 	// ArtistZip pref now only picks the delivery shape: "combined" = one ZIP for the
 	// whole discography; anything else (the default) = one ZIP per release.
 	perRelease := !(userID != 0 && b.getPrefs(userID).ArtistZip == "combined")
-	b.runArtistRip(chatID, userID, username, storefront, artistID, items, replyToID, forceAAC, forceAtmos, forceFlac, scope.label, perRelease)
+	b.runArtistRip(chatID, userID, username, storefront, artistID, items, replyToID, forceAAC, forceAtmos, forceFlac, scope.label, perRelease, quotaChargeID)
 }
 
 // runArtistMusicVideos queues each of an artist's music videos as a direct
@@ -1074,11 +1091,24 @@ func (b *TelegramBot) runArtistMusicVideos(chatID, userID int64, storefront stri
 // whole discography when combined) is flushed in "Part N" chunks mid-rip so disk never
 // spikes. If task-concurrency is off (rs == nil) flushing is unavailable, so
 // per-release degrades to one final combined ZIP.
-func (b *TelegramBot) runArtistRip(chatID, userID int64, username, storefront, artistID string, albums []ampapi.ArtistSectionItem, replyToID int, forceAAC, forceAtmos, forceFlac bool, label string, perRelease bool) {
+func (b *TelegramBot) runArtistRip(chatID, userID int64, username, storefront, artistID string, albums []ampapi.ArtistSectionItem, replyToID int, forceAAC, forceAtmos, forceFlac bool, label string, perRelease bool, quotaChargeID string) {
 	format := b.resolveFormat(chatID, forceFlac)
 	artistName := ampapi.GetArtistName(storefront, artistID, b.searchLanguage(), b.appleToken)
+	// Capture the rip state, ctx, and a "ripped at least one release" signal so the
+	// after() closure can settle the per-day quota. fn swallows per-release errors and
+	// returns nil even if every release failed, so releasesOK (not the fn error) is the
+	// success signal here. fn runs synchronously inside runDownload, which returns
+	// before after() fires in the SAME goroutine, so these need no extra locking.
+	var (
+		sharedRS   *RipState
+		sharedCtx  context.Context
+		releasesOK int
+	)
+	total := len(albums)
 	ok := b.enqueueDownloadWithAfter(chatID, userID, username, replyToID, 0, false, format, transferModeGofileZip, "artist:"+artistID, false, func(ctx context.Context) error {
+		sharedCtx = ctx
 		rs := ripStateFrom(ctx)
+		sharedRS = rs
 		rs.setFlushName(artistName) // name the Gofile ZIP parts after the artist, not the "ALAC" folder
 		if forceAtmos {
 			if rs != nil {
@@ -1096,6 +1126,8 @@ func (b *TelegramBot) runArtistRip(chatID, userID int64, username, storefront, a
 			}
 			if err := ripAlbum(alb.ID, b.appleToken, storefront, "", forceAAC, ctx); err != nil {
 				fmt.Printf("Artist rip: release %d/%d (%s) failed: %v\n", i+1, len(albums), alb.ID, err)
+			} else {
+				releasesOK++
 			}
 			if perRelease {
 				// Ship this release as its own ZIP and reclaim its disk before the next.
@@ -1109,8 +1141,11 @@ func (b *TelegramBot) runArtistRip(chatID, userID int64, username, storefront, a
 			}
 		}
 		return nil
-	}, nil)
+	}, func() {
+		b.finalizeHeavyQuota(quotaChargeID, sharedRS, sharedCtx, releasesOK > 0, total, perRelease)
+	}, quotaChargeID)
 	if !ok {
+		b.quotaRefund(quotaChargeID, 0) // never enqueued (queue full)
 		return
 	}
 	if perRelease {
@@ -1157,7 +1192,7 @@ func (b *TelegramBot) routePlaylistNonAdmin(chatID, userID int64, username, stor
 // when a delivery flag was given, otherwise the delivery-mode keyboard prompt.
 func (b *TelegramBot) dispatchPlaylistNormal(chatID, userID int64, playlistID string, replyToID int, headlessMode string, forceAAC, forceAtmos, forceFlac, noCache bool) {
 	if headlessMode != "" {
-		b.enqueuePlaylistDownload(chatID, playlistID, replyToID, 0, headlessMode, forceAAC, forceAtmos, forceFlac, noCache, userID, "")
+		b.enqueuePlaylistDownload(chatID, playlistID, replyToID, 0, headlessMode, forceAAC, forceAtmos, forceFlac, noCache, userID, "", "")
 	} else {
 		b.queueDownloadPlaylistWithReply(chatID, userID, playlistID, replyToID, forceAAC, forceAtmos, forceFlac, noCache)
 	}

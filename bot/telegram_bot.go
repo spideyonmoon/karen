@@ -226,6 +226,16 @@ type TelegramBot struct {
 	profileMu     sync.Mutex
 	profileOwners map[string]int64
 
+	// Per-day heavy-rip quota (see quota.go). quotaUsage is the AUTHORITATIVE tally
+	// the admission gate checks; quotaCharges holds each live charge so refunds are
+	// idempotent (CAS on state). Both are guarded by quotaMu, a strict LEAF lock:
+	// never take queueMu/stateMu while holding it, and never hold it across DB I/O or
+	// a send. The catalog rows are a best-effort mirror only — the quota stays enforced
+	// from these maps even when the DB is down, so a blip can never lift it.
+	quotaMu      sync.Mutex
+	quotaUsage   map[quotaKey]int       // (userID, day, kind) → non-refunded charge count
+	quotaCharges map[string]*quotaCharge // chargeID → live charge record
+
 	// bootTime is when this process started; used for the bot-uptime line in /sys.
 	// Immutable after construction (no lock needed).
 	bootTime time.Time
@@ -305,6 +315,13 @@ type downloadRequest struct {
 	cancel          context.CancelFunc
 	statusMessageID int
 	startedAt       time.Time
+
+	// quotaChargeID ties this request to its per-day heavy-rip quota slot (see
+	// quota.go); "" for non-heavy or admin/headless rips. The after() closure and the
+	// cancel paths use it to commit/refund the slot. The who-cancelled signal (for the
+	// user-only >50%/Part-sent refund exemption) lives on rip (RipState) so after()
+	// can read it without the request.
+	quotaChargeID string
 
 	// Task-concurrency scheduling (only set when Config.TaskConcurrency is on).
 	// rip is the per-rip state the scheduler builds up front so it can read this
@@ -596,6 +613,13 @@ func runTelegramBot(appleToken string) {
 		}
 	}
 
+	// Restore today's heavy-rip quota from the catalog (best-effort; enforcement is
+	// in-memory regardless) and start the 1 PM Dhaka daily reset/announce routine.
+	// Runs after bot.catalog is wired and after loadSchedule (newTelegramBot) so the
+	// boot-load can tell which open charges belong to live deferred jobs.
+	bot.quotaLoadBoot()
+	bot.startQuotaResetRoutine()
+
 	bot.fetchUsername()
 	fmt.Println("Telegram bot started. Waiting for updates...")
 	bot.loop()
@@ -722,6 +746,8 @@ func newTelegramBot(token, appleToken string) *TelegramBot {
 		blockedUserIDs:   make(map[int64]bool),
 		blockedUsernames: make(map[string]bool),
 		blockNotified:    make(map[int64]bool),
+		quotaUsage:       make(map[quotaKey]int),
+		quotaCharges:     make(map[string]*quotaCharge),
 		bootTime:         time.Now(),
 		bandwidth:        newBandwidthTracker(bandwidthFile),
 	}
@@ -2350,7 +2376,7 @@ func (b *TelegramBot) handleTransferMode(chatID int64, messageID int, mode strin
 			return ripSong(pending.SongID, b.appleToken, Config.Storefront, pending.ForceAAC, ctx)
 		})
 	} else if pending.PlaylistID != "" {
-		b.enqueuePlaylistDownload(chatID, pending.PlaylistID, replyToID, messageID, mode, pending.ForceAAC, pending.ForceAtmos, pending.ForceFlac, pending.NoCache, userID, username)
+		b.enqueuePlaylistDownload(chatID, pending.PlaylistID, replyToID, messageID, mode, pending.ForceAAC, pending.ForceAtmos, pending.ForceFlac, pending.NoCache, userID, username, "")
 	} else if pending.StationID != "" {
 		b.enqueueStationDownload(chatID, pending.StationID, replyToID, messageID, mode, pending.ForceAAC, pending.ForceAtmos, pending.ForceFlac, pending.NoCache, userID, username)
 	} else if pending.AlbumID != "" {
@@ -2477,7 +2503,7 @@ func (b *TelegramBot) queueInlineSongDownload(chatID int64, songID string, inlin
 	}
 	ok := b.enqueueDownloadWithAfter(uploadChatID, 0, "", 0, 0, true, format, transferModeOneByOne, "", false, func(ctx context.Context) error {
 		return ripSong(songID, b.appleToken, Config.Storefront, false, ctx)
-	}, after)
+	}, after, "")
 	if !ok && inlineMessageID != "" {
 		_ = b.editInlineMessageText(inlineMessageID, "Download queue is full. Please try again later.")
 	}
@@ -2822,7 +2848,7 @@ func (b *TelegramBot) handleArtistScope(cb *CallbackQuery, choice string, clicke
 // sleeptime window (non-admin). Blocks on enumeration → call in a goroutine.
 func (b *TelegramBot) startArtistScope(sel *pendingArtistSel, section string) {
 	if b.isAdmin(sel.userID) {
-		b.runArtistRipScoped(sel.chatID, sel.userID, sel.username, sel.storefront, sel.artistID, section, sel.replyToID, sel.forceAAC, sel.forceAtmos, sel.forceFlac)
+		b.runArtistRipScoped(sel.chatID, sel.userID, sel.username, sel.storefront, sel.artistID, section, sel.replyToID, sel.forceAAC, sel.forceAtmos, sel.forceFlac, "")
 		return
 	}
 	b.scheduleOrRun(&scheduledJob{
@@ -2890,26 +2916,45 @@ func (b *TelegramBot) enqueueAlbumDownload(chatID int64, albumID string, replyTo
 	})
 }
 
-func (b *TelegramBot) enqueuePlaylistDownload(chatID int64, playlistID string, replyToID int, statusMessageID int, transferMode string, forceAAC bool, forceAtmos bool, forceFlac bool, noCache bool, userID int64, username string) {
+func (b *TelegramBot) enqueuePlaylistDownload(chatID int64, playlistID string, replyToID int, statusMessageID int, transferMode string, forceAAC bool, forceAtmos bool, forceFlac bool, noCache bool, userID int64, username string, quotaChargeID string) {
 	if playlistID == "" {
+		b.quotaRefund(quotaChargeID, 0)
 		_ = b.sendMessage(chatID, "Playlist ID is empty.", nil)
 		return
 	}
 	format := b.resolveFormat(chatID, forceFlac)
 	// D9 read-through (same as albums): deliver cached tracks, rip only the gaps.
 	if b.catalogServeCollection(chatID, "playlist", playlistID, replyToID, statusMessageID, transferMode, format, forceAAC, forceAtmos, forceFlac, noCache, userID, username) {
+		// The catalog serves it under its own worker task, so this request's after()
+		// never fires — consume the charge here (the user got their playlist).
+		b.quotaCommit(quotaChargeID, 0)
 		return
 	}
-	b.enqueueDownload(chatID, userID, username, replyToID, statusMessageID, false, format, transferMode, playlistID, noCache, func(ctx context.Context) error {
+	// Capture the rip state, ctx, and ripPlaylist's error so the after() closure can
+	// decide commit vs refund for the per-day quota (no-op when quotaChargeID == "").
+	var (
+		sharedRS  *RipState
+		sharedCtx context.Context
+		fnErr     error
+	)
+	ok := b.enqueueDownloadWithAfter(chatID, userID, username, replyToID, statusMessageID, false, format, transferMode, playlistID, noCache, func(ctx context.Context) error {
+		sharedCtx = ctx
+		sharedRS = ripStateFrom(ctx)
 		if forceAtmos {
-			if rs := ripStateFrom(ctx); rs != nil {
-				rs.Atmos = true
+			if sharedRS != nil {
+				sharedRS.Atmos = true
 			} else {
 				dl_atmos = true
 			}
 		}
-		return ripPlaylist(playlistID, b.appleToken, Config.Storefront, forceAAC, ctx)
-	})
+		fnErr = ripPlaylist(playlistID, b.appleToken, Config.Storefront, forceAAC, ctx)
+		return fnErr
+	}, func() {
+		b.finalizeHeavyQuota(quotaChargeID, sharedRS, sharedCtx, fnErr == nil, 0, false)
+	}, quotaChargeID)
+	if !ok {
+		b.quotaRefund(quotaChargeID, 0) // never enqueued (queue full)
+	}
 }
 
 // enqueueStationDownload queues an Apple Music radio/station rip. ripStation reads
@@ -2959,10 +3004,10 @@ func (b *TelegramBot) queueDownloadArtwork(chatID int64, link string, replyToID 
 }
 
 func (b *TelegramBot) enqueueDownload(chatID int64, userID int64, username string, replyToID int, statusMessageID int, single bool, format string, transferMode string, albumID string, noCache bool, fn func(ctx context.Context) error) {
-	_ = b.enqueueDownloadWithAfter(chatID, userID, username, replyToID, statusMessageID, single, format, transferMode, albumID, noCache, fn, nil)
+	_ = b.enqueueDownloadWithAfter(chatID, userID, username, replyToID, statusMessageID, single, format, transferMode, albumID, noCache, fn, nil, "")
 }
 
-func (b *TelegramBot) enqueueDownloadWithAfter(chatID int64, userID int64, username string, replyToID int, statusMessageID int, single bool, format string, transferMode string, albumID string, noCache bool, fn func(ctx context.Context) error, after func()) bool {
+func (b *TelegramBot) enqueueDownloadWithAfter(chatID int64, userID int64, username string, replyToID int, statusMessageID int, single bool, format string, transferMode string, albumID string, noCache bool, fn func(ctx context.Context) error, after func(), quotaChargeID string) bool {
 	// Accept all valid transfer modes
 	taskID := generateTaskID()
 	ctx, cancelFn := context.WithCancel(context.Background())
@@ -2982,6 +3027,7 @@ func (b *TelegramBot) enqueueDownloadWithAfter(chatID int64, userID int64, usern
 		ctx:             ctx,
 		cancel:          cancelFn,
 		statusMessageID: statusMessageID,
+		quotaChargeID:   quotaChargeID,
 	}
 	b.queueMu.Lock()
 	inProgress := b.inProgress
@@ -8213,6 +8259,9 @@ func (b *TelegramBot) cancelTask(chatID int64, issuerID int64, taskID string, re
 			_ = b.sendMessageWithReply(chatID, notYours, nil, replyToID)
 			return
 		}
+		if b.activeReq.userID != 0 && issuerID == b.activeReq.userID {
+			b.activeReq.rip.markQuotaOwnerCancel() // user-cancel → eligible for the >50%/Part quota exemption
+		}
 		if b.activeReq.cancel != nil {
 			b.activeReq.cancel()
 		}
@@ -8228,6 +8277,9 @@ func (b *TelegramBot) cancelTask(chatID int64, issuerID int64, taskID string, re
 			b.queueMu.Unlock()
 			_ = b.sendMessageWithReply(chatID, notYours, nil, replyToID)
 			return
+		}
+		if b.schedBorrowReq.userID != 0 && issuerID == b.schedBorrowReq.userID {
+			b.schedBorrowReq.rip.markQuotaOwnerCancel()
 		}
 		if b.schedBorrowReq.cancel != nil {
 			b.schedBorrowReq.cancel()
@@ -8246,6 +8298,9 @@ func (b *TelegramBot) cancelTask(chatID int64, issuerID int64, taskID string, re
 			b.queueMu.Unlock()
 			_ = b.sendMessageWithReply(chatID, notYours, nil, replyToID)
 			return
+		}
+		if req.userID != 0 && issuerID == req.userID {
+			req.rip.markQuotaOwnerCancel()
 		}
 		if req.cancel != nil {
 			req.cancel()
@@ -8281,6 +8336,10 @@ drain:
 				if req.userID != 0 && b.userTaskCount[req.userID] > 0 {
 					b.userTaskCount[req.userID]--
 				}
+				// Likewise its after() never fires (the worker never runs it), and it
+				// delivered nothing → return the per-day quota slot. quotaRefund only
+				// touches quotaMu (a leaf below queueMu) and defers the DB write.
+				b.quotaRefund(req.quotaChargeID, 0)
 				found = true
 			}
 		default:
@@ -8307,23 +8366,38 @@ drain:
 // cancelTask it does NO ownership check (admin-only) and emits no per-task message.
 // Scheduled (deferred sleeptime) jobs are intentionally left alone — they aren't
 // "running" and have their own /cancel_<id>.
-func (b *TelegramBot) cancelAllTasksLocked() int {
+// syncDB picks how the quota refunds are persisted: synchronous (the /restart path,
+// which os.Exit's right after — the DB row MUST flip to refunded before exit or
+// boot-load would restore the charge as committed) vs. async fire-and-forget
+// (/stopall, which keeps running). A restart/stopall is never the requester, so these
+// always refund (no >50%/Part exemption); the refund is idempotent, so any after()
+// that still fires for an active/uploading task before exit just no-ops.
+func (b *TelegramBot) cancelAllTasksLocked(syncDB bool) int {
 	n := 0
+	refund := b.quotaRefund
+	if syncDB {
+		refund = b.quotaRefundSync
+	}
 	if b.activeReq != nil {
 		if b.activeReq.cancel != nil {
 			b.activeReq.cancel()
 		}
+		refund(b.activeReq.quotaChargeID, 0)
 		n++
 	}
 	if b.schedBorrowReq != nil {
 		if b.schedBorrowReq.cancel != nil {
 			b.schedBorrowReq.cancel()
 		}
+		refund(b.schedBorrowReq.quotaChargeID, 0)
 		n++
 	}
 	for _, req := range b.uploadingReqs {
-		if req != nil && req.cancel != nil {
-			req.cancel()
+		if req != nil {
+			if req.cancel != nil {
+				req.cancel()
+			}
+			refund(req.quotaChargeID, 0)
 		}
 		n++
 	}
@@ -8342,6 +8416,7 @@ drainAll:
 			if req.userID != 0 && b.userTaskCount[req.userID] > 0 {
 				b.userTaskCount[req.userID]--
 			}
+			refund(req.quotaChargeID, 0)
 			n++
 		default:
 			break drainAll
@@ -8354,7 +8429,7 @@ drainAll:
 // and queued tasks, with a single summary reply.
 func (b *TelegramBot) cancelAllTasks(chatID int64, replyToID int) {
 	b.queueMu.Lock()
-	n := b.cancelAllTasksLocked()
+	n := b.cancelAllTasksLocked(false)
 	b.queueMu.Unlock()
 	if n == 0 {
 		_ = b.sendMessageWithReply(chatID, "No active or queued tasks to stop.", nil, replyToID)
@@ -8380,7 +8455,7 @@ func (b *TelegramBot) adminRestart(chatID int64, replyToID int) {
 	// self-skips on its busy / anyInUse() guards) and no rip is mid-decrypt on a
 	// wrapper we're about to cycle.
 	b.queueMu.Lock()
-	b.cancelAllTasksLocked()
+	b.cancelAllTasksLocked(true) // synchronous quota refunds — must hit the DB before os.Exit
 	b.queueMu.Unlock()
 
 	// Best-effort: the periodic purge ticker and the startup purge are backstops if a

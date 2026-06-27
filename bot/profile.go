@@ -85,10 +85,12 @@ func (b *TelegramBot) handleProfileCommand(chatID int64, userID int64, replyToID
 	b.profileMu.Unlock()
 }
 
-// userQuota returns a user's CONCURRENT usage: pending tasks vs their cap
-// (donor-aware) and heavy rips currently in flight per kind. Karen has no DAILY
-// quota — the limit is concurrent in-flight tasks. Reads userTaskCount under
-// queueMu, then calls countUserHeavyRips (which takes its own locks) — never nested.
+// userQuota returns a user's usage: concurrent pending tasks vs their cap (the
+// separate in-flight limit), plus today's PER-DAY heavy-rip tally per kind (artist
+// discographies / huge playlists) vs their donor-aware limit. The heavy-rip counts
+// come from the in-memory per-day quota (quota.go), which resets at 1 PM Dhaka.
+// Reads userTaskCount under queueMu, then quotaUsageFor (which takes quotaMu) — never
+// nested.
 func (b *TelegramBot) userQuota(userID int64, username string) (tasks, maxTasks, artist, artistMax, playlist, playlistMax int) {
 	donor := b.isUserDonor(userID, username)
 	b.queueMu.Lock()
@@ -98,20 +100,20 @@ func (b *TelegramBot) userQuota(userID int64, username string) (tasks, maxTasks,
 	if donor {
 		maxTasks = 5
 	}
-	artist = b.countUserHeavyRips(userID, "artist")
-	playlist = b.countUserHeavyRips(userID, "playlist")
+	artist = b.quotaUsageFor(userID, "artist")
+	playlist = b.quotaUsageFor(userID, "playlist")
 	artistMax = heavyRipLimit("artist", donor)
 	playlistMax = heavyRipLimit("playlist", donor)
 	return
 }
 
 func quotaLineRich(tasks, maxTasks, artist, artistMax, playlist, playlistMax int) string {
-	return fmt.Sprintf("\n📊 **Quota**: tasks %d/%d · artist %d/%d · huge-playlist %d/%d (in flight)\n",
+	return fmt.Sprintf("\n📊 **Quota**: tasks %d/%d in flight · today: artist %d/%d · huge-playlist %d/%d (resets 1 PM Dhaka)\n",
 		tasks, maxTasks, artist, artistMax, playlist, playlistMax)
 }
 
 func quotaLinePlain(tasks, maxTasks, artist, artistMax, playlist, playlistMax int) string {
-	return fmt.Sprintf("\n📊 Quota: tasks %d/%d · artist %d/%d · huge-playlist %d/%d (in flight)\n",
+	return fmt.Sprintf("\n📊 Quota: tasks %d/%d in flight · today: artist %d/%d · huge-playlist %d/%d (resets 1 PM Dhaka)\n",
 		tasks, maxTasks, artist, artistMax, playlist, playlistMax)
 }
 

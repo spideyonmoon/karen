@@ -114,6 +114,14 @@ type RipState struct {
 	// fully-cached collection rips nothing, runDownload uses this to report success
 	// instead of "No files were downloaded".
 	cacheDelivered atomic.Int64
+
+	// quotaOwnerCancel records that THIS rip was cancelled by its own requester
+	// (not an admin or a /restart). The per-day quota refund logic reads it to apply
+	// the user-only exemption: a user who bails after >50% of releases (or after a
+	// ~20 GB "Part" already went out) keeps the charge. Set by cancelTask before it
+	// cancels the context; read in the after() finalize closure. Default false →
+	// admin/restart/failure always refunds.
+	quotaOwnerCancel atomic.Bool
 }
 
 func newRipState() *RipState {
@@ -599,6 +607,33 @@ func (rs *RipState) flushedSomething() bool {
 		return false
 	}
 	return rs.flushedAny.Load()
+}
+
+// deliveredReleases returns how many chunks this rip has flushed+delivered so far
+// (flushSeq). In per-release artist mode each released album increments it, so it
+// doubles as the delivered-release count for the quota >50% exemption; for other
+// rips it is the number of ~20 GB "Part N" valve flushes. 0 on a nil receiver.
+func (rs *RipState) deliveredReleases() int {
+	if rs == nil {
+		return 0
+	}
+	rs.flushMu.Lock()
+	defer rs.flushMu.Unlock()
+	return rs.flushSeq
+}
+
+// markQuotaOwnerCancel flags that this rip was cancelled by its own requester (see
+// quotaOwnerCancel). No-op on a nil receiver.
+func (rs *RipState) markQuotaOwnerCancel() {
+	if rs != nil {
+		rs.quotaOwnerCancel.Store(true)
+	}
+}
+
+// quotaCancelledByOwner reports whether the requester (not an admin / restart)
+// cancelled this rip. False on a nil receiver.
+func (rs *RipState) quotaCancelledByOwner() bool {
+	return rs != nil && rs.quotaOwnerCancel.Load()
 }
 
 // markCacheDelivered records that n tracks were delivered from the dump by the D9
