@@ -115,6 +115,27 @@ var migrations = []string{
 	)`,
 	`create index if not exists quota_charges_day_state on quota_charges (quota_day, state)`,
 	`create index if not exists quota_charges_user_day on quota_charges (user_id, quota_day, kind)`,
+	// Gofile re-rip dedup. One row per Gofile link we deliver for a collection rip
+	// (album/playlist/artist); a multi-part heavy rip writes several rows sharing one
+	// content_key. A re-request within the 7-day window (Gofile links live ~7 days)
+	// is served the existing link(s) instead of re-ripping + re-uploading, which the
+	// VPS's capped bandwidth can't afford. expires_at gates lookups; rows are pruned
+	// at the daily reset. Best-effort like the rest of the catalog: a DB blip fails
+	// OPEN (the rip just proceeds), so this never blocks a legitimate request.
+	`create table if not exists gofile_deliveries (
+		id          bigserial primary key,
+		content_key text not null,
+		kind        text not null,
+		content_id  text not null,
+		variant     text not null,
+		label       text not null default '',
+		gofile_link text not null,
+		user_id     bigint not null,
+		username    text,
+		created_at  timestamptz not null default now(),
+		expires_at  timestamptz not null
+	)`,
+	`create index if not exists gofile_deliveries_key_exp on gofile_deliveries (content_key, expires_at)`,
 }
 
 // Migrate applies the schema. Idempotent; safe to call on every boot. No-op when

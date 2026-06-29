@@ -236,6 +236,13 @@ type TelegramBot struct {
 	quotaUsage   map[quotaKey]int       // (userID, day, kind) → non-refunded charge count
 	quotaCharges map[string]*quotaCharge // chargeID → live charge record
 
+	// pendingReports holds an awaited "report a problem" reason after a user taps the
+	// 🚩 Report button on a Gofile re-rip dedup notice (see dedup.go). Keyed by
+	// (chatID, userID); the next non-command message from that user supplies the
+	// reason, which is DM'd to all admins. Guarded by pendingReportsMu (a LEAF lock).
+	pendingReportsMu sync.Mutex
+	pendingReports   map[reportKey]*pendingReport
+
 	// bootTime is when this process started; used for the bot-uptime line in /sys.
 	// Immutable after construction (no lock needed).
 	bootTime time.Time
@@ -322,6 +329,11 @@ type downloadRequest struct {
 	// user-only >50%/Part-sent refund exemption) lives on rip (RipState) so after()
 	// can read it without the request.
 	quotaChargeID string
+
+	// dedup carries the Gofile re-rip identity (see dedup.go) for collection rips
+	// (album/playlist/artist) delivered to Gofile, so each delivered link is recorded
+	// under the same content key the admission check used. nil for every other path.
+	dedup *gofileDedupInfo
 
 	// Task-concurrency scheduling (only set when Config.TaskConcurrency is on).
 	// rip is the per-rip state the scheduler builds up front so it can read this
@@ -748,6 +760,7 @@ func newTelegramBot(token, appleToken string) *TelegramBot {
 		blockNotified:    make(map[int64]bool),
 		quotaUsage:       make(map[quotaKey]int),
 		quotaCharges:     make(map[string]*quotaCharge),
+		pendingReports:   make(map[reportKey]*pendingReport),
 		bootTime:         time.Now(),
 		bandwidth:        newBandwidthTracker(bandwidthFile),
 	}
@@ -1513,6 +1526,12 @@ func (b *TelegramBot) handleMessage(msg *Message) {
 		return
 	}
 	text := strings.TrimSpace(msg.Text)
+	// A user who tapped 🚩 Report on a dedup notice supplies the reason as their next
+	// (non-command) message; consume it here before normal command parsing. A command
+	// is left alone so the user can still run one without losing the pending report.
+	if !strings.HasPrefix(text, "/") && b.consumeReportReason(msg.Chat.ID, userID, username, text, msg.MessageID) {
+		return
+	}
 	if cmd, mention, args, ok := parseCommand(text); ok {
 		// In a group, "/help@OtherBot" is addressed to a different bot — ignore it.
 		// We only act on a bare command or one mentioning us. If getMe never resolved
@@ -1587,6 +1606,8 @@ func (b *TelegramBot) handleCallback(cb *CallbackQuery) {
 		alert = b.handleProfileCallback(cb, data, clickerID)
 	} else if strings.HasPrefix(data, "artsel:") {
 		alert = b.handleArtistScope(cb, strings.TrimPrefix(data, "artsel:"), clickerID)
+	} else if strings.HasPrefix(data, "report:") {
+		alert = b.handleReportButton(cb, strings.TrimPrefix(data, "report:"), clickerID, username)
 	}
 	if alert != "" {
 		_ = b.answerCallbackAlert(cb.ID, alert)
@@ -2503,7 +2524,7 @@ func (b *TelegramBot) queueInlineSongDownload(chatID int64, songID string, inlin
 	}
 	ok := b.enqueueDownloadWithAfter(uploadChatID, 0, "", 0, 0, true, format, transferModeOneByOne, "", false, func(ctx context.Context) error {
 		return ripSong(songID, b.appleToken, Config.Storefront, false, ctx)
-	}, after, "")
+	}, after, "", nil)
 	if !ok && inlineMessageID != "" {
 		_ = b.editInlineMessageText(inlineMessageID, "Download queue is full. Please try again later.")
 	}
@@ -2898,13 +2919,24 @@ func (b *TelegramBot) enqueueAlbumDownload(chatID int64, albumID string, replyTo
 		return
 	}
 	format := b.resolveFormat(chatID, forceFlac)
+	// Gofile re-rip dedup: a repeat request for this (album, tier) within the link's
+	// ~7-day life gets the existing Gofile link(s) instead of a fresh rip. Gofile mode
+	// only (Telegram has its own file_id cache), and skipped under -nc.
+	variant := gofileDedupVariant(format, forceAAC, forceAtmos)
+	if transferMode == transferModeGofileZip && !noCache && b.checkGofileDedup(chatID, replyToID, "album", albumID, variant) {
+		return
+	}
 	// D9 read-through: deliver cached tracks from the dump and rip only the gaps.
 	// Returns true when it has taken ownership (enqueues its own worker task), so we
 	// must not also enqueue the whole-album rip below.
 	if b.catalogServeCollection(chatID, "album", albumID, replyToID, statusMessageID, transferMode, format, forceAAC, forceAtmos, forceFlac, noCache, userID, username) {
 		return
 	}
-	b.enqueueDownload(chatID, userID, username, replyToID, statusMessageID, false, format, transferMode, albumID, noCache, func(ctx context.Context) error {
+	var dedup *gofileDedupInfo
+	if transferMode == transferModeGofileZip {
+		dedup = newGofileDedupInfo("album", albumID, format, "", forceAAC, forceAtmos, userID)
+	}
+	b.enqueueDownloadWithAfter(chatID, userID, username, replyToID, statusMessageID, false, format, transferMode, albumID, noCache, func(ctx context.Context) error {
 		if forceAtmos {
 			if rs := ripStateFrom(ctx); rs != nil {
 				rs.Atmos = true
@@ -2913,7 +2945,7 @@ func (b *TelegramBot) enqueueAlbumDownload(chatID int64, albumID string, replyTo
 			}
 		}
 		return ripAlbum(albumID, b.appleToken, Config.Storefront, "", forceAAC, ctx)
-	})
+	}, nil, "", dedup)
 }
 
 func (b *TelegramBot) enqueuePlaylistDownload(chatID int64, playlistID string, replyToID int, statusMessageID int, transferMode string, forceAAC bool, forceAtmos bool, forceFlac bool, noCache bool, userID int64, username string, quotaChargeID string) {
@@ -2923,12 +2955,28 @@ func (b *TelegramBot) enqueuePlaylistDownload(chatID int64, playlistID string, r
 		return
 	}
 	format := b.resolveFormat(chatID, forceFlac)
+	// Gofile re-rip dedup: if this exact (playlist, tier) was delivered to Gofile in
+	// the last 7 days, hand back the existing link(s) instead of ripping again. Only
+	// for Gofile mode (Telegram has its own file_id cache) and only when not bypassed
+	// with -nc. A hit means nothing was enqueued, so return the (possibly charged)
+	// quota slot.
+	variant := gofileDedupVariant(format, forceAAC, forceAtmos)
+	if transferMode == transferModeGofileZip && !noCache && b.checkGofileDedup(chatID, replyToID, "playlist", playlistID, variant) {
+		b.quotaRefund(quotaChargeID, 0)
+		return
+	}
 	// D9 read-through (same as albums): deliver cached tracks, rip only the gaps.
 	if b.catalogServeCollection(chatID, "playlist", playlistID, replyToID, statusMessageID, transferMode, format, forceAAC, forceAtmos, forceFlac, noCache, userID, username) {
 		// The catalog serves it under its own worker task, so this request's after()
 		// never fires — consume the charge here (the user got their playlist).
 		b.quotaCommit(quotaChargeID, 0)
 		return
+	}
+	// Recorded label comes from the actual delivery name (deliverGofileZipFromPath /
+	// flushChunkToGofile pass it as partLabel); "" here is just an unused fallback.
+	var dedup *gofileDedupInfo
+	if transferMode == transferModeGofileZip {
+		dedup = newGofileDedupInfo("playlist", playlistID, format, "", forceAAC, forceAtmos, userID)
 	}
 	// Capture the rip state, ctx, and ripPlaylist's error so the after() closure can
 	// decide commit vs refund for the per-day quota (no-op when quotaChargeID == "").
@@ -2951,7 +2999,7 @@ func (b *TelegramBot) enqueuePlaylistDownload(chatID int64, playlistID string, r
 		return fnErr
 	}, func() {
 		b.finalizeHeavyQuota(quotaChargeID, sharedRS, sharedCtx, fnErr == nil, 0, false)
-	}, quotaChargeID)
+	}, quotaChargeID, dedup)
 	if !ok {
 		b.quotaRefund(quotaChargeID, 0) // never enqueued (queue full)
 	}
@@ -3004,10 +3052,10 @@ func (b *TelegramBot) queueDownloadArtwork(chatID int64, link string, replyToID 
 }
 
 func (b *TelegramBot) enqueueDownload(chatID int64, userID int64, username string, replyToID int, statusMessageID int, single bool, format string, transferMode string, albumID string, noCache bool, fn func(ctx context.Context) error) {
-	_ = b.enqueueDownloadWithAfter(chatID, userID, username, replyToID, statusMessageID, single, format, transferMode, albumID, noCache, fn, nil, "")
+	_ = b.enqueueDownloadWithAfter(chatID, userID, username, replyToID, statusMessageID, single, format, transferMode, albumID, noCache, fn, nil, "", nil)
 }
 
-func (b *TelegramBot) enqueueDownloadWithAfter(chatID int64, userID int64, username string, replyToID int, statusMessageID int, single bool, format string, transferMode string, albumID string, noCache bool, fn func(ctx context.Context) error, after func(), quotaChargeID string) bool {
+func (b *TelegramBot) enqueueDownloadWithAfter(chatID int64, userID int64, username string, replyToID int, statusMessageID int, single bool, format string, transferMode string, albumID string, noCache bool, fn func(ctx context.Context) error, after func(), quotaChargeID string, dedup *gofileDedupInfo) bool {
 	// Accept all valid transfer modes
 	taskID := generateTaskID()
 	ctx, cancelFn := context.WithCancel(context.Background())
@@ -3028,6 +3076,7 @@ func (b *TelegramBot) enqueueDownloadWithAfter(chatID int64, userID int64, usern
 		cancel:          cancelFn,
 		statusMessageID: statusMessageID,
 		quotaChargeID:   quotaChargeID,
+		dedup:           dedup,
 	}
 	b.queueMu.Lock()
 	inProgress := b.inProgress
@@ -3580,6 +3629,7 @@ func (b *TelegramBot) runDownload(req *downloadRequest) {
 				rs.Prefs = &p
 			}
 		}
+		rs.setDedup(req.dedup)
 		rctx = withRipState(req.ctx, rs)
 		// Release this rip's in-use file refs once delivery returns. Registered after
 		// the cleanupDownloadsIfNeeded defer above so LIFO order runs it FIRST: this
@@ -4438,6 +4488,8 @@ func (b *TelegramBot) flushChunkToGofile(chatID int64, paths []string, replyToID
 	if err != nil {
 		return err
 	}
+	// Record this part for the 7-day Gofile re-rip dedup (no-op for non-tracked rips).
+	b.recordGofileDelivery(ctx, link, strings.TrimSuffix(name, ".zip"))
 	_ = b.sendMessageWithReply(chatID, fmt.Sprintf("%s\nDownload Link: %s", announce, link), nil, replyToID)
 	return nil
 }
@@ -4517,6 +4569,8 @@ func (b *TelegramBot) deliverGofileZipFromPath(chatID int64, zipPath string, dis
 		return
 	}
 
+	// Record for the 7-day Gofile re-rip dedup (no-op for non-tracked rips).
+	b.recordGofileDelivery(ctx, downloadLink, strings.TrimSuffix(displayName, ".zip"))
 	_ = b.sendMessageWithReply(chatID, formatGofileDelivery(displayName, downloadLink, zipSize, status), nil, replyToID)
 
 	status.Stop()

@@ -797,6 +797,21 @@ func (b *TelegramBot) scheduleOrRun(j *scheduledJob) {
 	if j.Kind == "playlist" {
 		capLabel = "huge playlist"
 	}
+
+	// Gofile re-rip dedup, BEFORE charging the quota or scheduling: heavy rips always
+	// deliver as Gofile ZIP, so a repeat of the same (content, tier) within 7 days is
+	// answered with the existing link(s) here at submit — never charged, never queued
+	// for the sleeptime window. dedupID folds the artist scope in so sections stay
+	// distinct.
+	format := b.resolveFormat(j.ChatID, j.ForceFlac)
+	variant := gofileDedupVariant(format, j.ForceAAC, j.ForceAtmos)
+	dedupID := j.ResourceID
+	if j.Kind == "artist" {
+		dedupID = artistDedupID(j.ResourceID, j.Section)
+	}
+	if b.checkGofileDedup(j.ChatID, j.ReplyToID, j.Kind, dedupID, variant) {
+		return
+	}
 	// Per-DAY quota: charge a slot at submission (refunded later if the rip doesn't
 	// finish). This replaces the old in-flight count, which a user could bypass inside
 	// the sleeptime window by chaining rips as each one finished. quotaCheckAndCharge
@@ -1061,7 +1076,7 @@ func (b *TelegramBot) runArtistRipScoped(chatID, userID int64, username, storefr
 	// ArtistZip pref now only picks the delivery shape: "combined" = one ZIP for the
 	// whole discography; anything else (the default) = one ZIP per release.
 	perRelease := !(userID != 0 && b.getPrefs(userID).ArtistZip == "combined")
-	b.runArtistRip(chatID, userID, username, storefront, artistID, items, replyToID, forceAAC, forceAtmos, forceFlac, scope.label, perRelease, quotaChargeID)
+	b.runArtistRip(chatID, userID, username, storefront, artistID, sectionKey, items, replyToID, forceAAC, forceAtmos, forceFlac, scope.label, perRelease, quotaChargeID)
 }
 
 // runArtistMusicVideos queues each of an artist's music videos as a direct
@@ -1091,9 +1106,13 @@ func (b *TelegramBot) runArtistMusicVideos(chatID, userID int64, storefront stri
 // whole discography when combined) is flushed in "Part N" chunks mid-rip so disk never
 // spikes. If task-concurrency is off (rs == nil) flushing is unavailable, so
 // per-release degrades to one final combined ZIP.
-func (b *TelegramBot) runArtistRip(chatID, userID int64, username, storefront, artistID string, albums []ampapi.ArtistSectionItem, replyToID int, forceAAC, forceAtmos, forceFlac bool, label string, perRelease bool, quotaChargeID string) {
+func (b *TelegramBot) runArtistRip(chatID, userID int64, username, storefront, artistID, section string, albums []ampapi.ArtistSectionItem, replyToID int, forceAAC, forceAtmos, forceFlac bool, label string, perRelease bool, quotaChargeID string) {
 	format := b.resolveFormat(chatID, forceFlac)
 	artistName := ampapi.GetArtistName(storefront, artistID, b.searchLanguage(), b.appleToken)
+	// Gofile re-rip dedup identity. Section is part of the content id so a "full-albums"
+	// rip never dedups against a "singles" rip of the same artist. Artist rips are always
+	// Gofile ZIP, so this is always set (when the tier is cacheable).
+	dedup := newGofileDedupInfo("artist", artistDedupID(artistID, section), format, artistName, forceAAC, forceAtmos, userID)
 	// Capture the rip state, ctx, and a "ripped at least one release" signal so the
 	// after() closure can settle the per-day quota. fn swallows per-release errors and
 	// returns nil even if every release failed, so releasesOK (not the fn error) is the
@@ -1143,7 +1162,7 @@ func (b *TelegramBot) runArtistRip(chatID, userID int64, username, storefront, a
 		return nil
 	}, func() {
 		b.finalizeHeavyQuota(quotaChargeID, sharedRS, sharedCtx, releasesOK > 0, total, perRelease)
-	}, quotaChargeID)
+	}, quotaChargeID, dedup)
 	if !ok {
 		b.quotaRefund(quotaChargeID, 0) // never enqueued (queue full)
 		return

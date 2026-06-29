@@ -295,6 +295,7 @@ func (b *TelegramBot) startQuotaResetRoutine() {
 		for {
 			time.Sleep(time.Until(nextDailyAt(time.Now(), quotaResetHourDhaka, 0)))
 			b.quotaPrune()
+			b.pruneGofileDeliveries()
 			b.announceQuotaReset()
 		}
 	}()

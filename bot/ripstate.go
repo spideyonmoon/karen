@@ -115,6 +115,12 @@ type RipState struct {
 	// instead of "No files were downloaded".
 	cacheDelivered atomic.Int64
 
+	// dedup carries this rip's Gofile re-rip identity (see dedup.go) so each Gofile
+	// delivery can be recorded under the same content key the admission check used.
+	// nil when the rip isn't a dedup-tracked Gofile collection (single song, Telegram
+	// delivery, artwork, etc.), in which case recordGofileDelivery is a no-op.
+	dedup *gofileDedupInfo
+
 	// quotaOwnerCancel records that THIS rip was cancelled by its own requester
 	// (not an admin or a /restart). The per-day quota refund logic reads it to apply
 	// the user-only exemption: a user who bails after >50% of releases (or after a
@@ -620,6 +626,24 @@ func (rs *RipState) deliveredReleases() int {
 	rs.flushMu.Lock()
 	defer rs.flushMu.Unlock()
 	return rs.flushSeq
+}
+
+// setDedup records this rip's Gofile dedup identity (see dedup.go). No-op on a nil
+// receiver or nil info.
+func (rs *RipState) setDedup(info *gofileDedupInfo) {
+	if rs == nil || info == nil {
+		return
+	}
+	rs.dedup = info
+}
+
+// dedupInfo returns this rip's Gofile dedup identity, or nil if untracked / nil
+// receiver. recordGofileDelivery treats nil as "don't record".
+func (rs *RipState) dedupInfo() *gofileDedupInfo {
+	if rs == nil {
+		return nil
+	}
+	return rs.dedup
 }
 
 // markQuotaOwnerCancel flags that this rip was cancelled by its own requester (see
