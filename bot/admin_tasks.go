@@ -107,6 +107,7 @@ type telegramStateFile struct {
 	Version          int                  `json:"version"`
 	AdminLock        bool                 `json:"admin_lock"`
 	LockReason       string               `json:"lock_reason,omitempty"`
+	ArtistRipsOff    bool                 `json:"artist_rips_off,omitempty"`
 	ScheduledJobs    []*scheduledJob      `json:"scheduled_jobs,omitempty"`
 	UserPrefs        map[int64]*UserPrefs `json:"user_prefs"`
 	UserStats        map[int64]*UserStats `json:"user_stats,omitempty"`
@@ -122,11 +123,12 @@ type telegramStateFile struct {
 // are stored as sorted-free slices; key order is irrelevant on reload.
 func (b *TelegramBot) stateFilePayloadLocked() telegramStateFile {
 	payload := telegramStateFile{
-		Version:    1,
-		AdminLock:  b.adminLock,
-		LockReason: b.lockReason,
-		UserPrefs:  b.userPrefs,
-		UserStats:  b.userStats,
+		Version:       1,
+		AdminLock:     b.adminLock,
+		LockReason:    b.lockReason,
+		ArtistRipsOff: b.artistRipsOff,
+		UserPrefs:     b.userPrefs,
+		UserStats:     b.userStats,
 	}
 	for id := range b.blockedUserIDs {
 		payload.BlockedUserIDs = append(payload.BlockedUserIDs, id)
@@ -158,6 +160,7 @@ func (b *TelegramBot) loadState() {
 	defer b.stateMu.Unlock()
 	b.adminLock = false
 	b.lockReason = ""
+	b.artistRipsOff = false
 	b.scheduledJobs = nil
 	b.userPrefs = make(map[int64]*UserPrefs)
 	b.userStats = make(map[int64]*UserStats)
@@ -187,6 +190,7 @@ func (b *TelegramBot) loadState() {
 	}
 	b.adminLock = payload.AdminLock
 	b.lockReason = payload.LockReason
+	b.artistRipsOff = payload.ArtistRipsOff
 	b.scheduledJobs = payload.ScheduledJobs
 	if payload.UserPrefs != nil {
 		b.userPrefs = payload.UserPrefs
@@ -448,6 +452,25 @@ func (b *TelegramBot) lockedReason() string {
 	b.stateMu.Lock()
 	defer b.stateMu.Unlock()
 	return b.lockReason
+}
+
+// artistRipsDisabled reports whether artist (whole-discography) rips are turned
+// off bot-wide. Album/song/playlist rips are unaffected. Toggled from /configure
+// or /artistrips; persisted in telegram-state.json.
+func (b *TelegramBot) artistRipsDisabled() bool {
+	b.stateMu.Lock()
+	defer b.stateMu.Unlock()
+	return b.artistRipsOff
+}
+
+// setArtistRipsDisabled flips the artist-rip gate and persists it. Returns the
+// new state so callers can report it.
+func (b *TelegramBot) setArtistRipsDisabled(off bool) bool {
+	b.stateMu.Lock()
+	b.artistRipsOff = off
+	b.saveStateLocked()
+	b.stateMu.Unlock()
+	return off
 }
 
 // isBlockedUser reports whether a user has been banned via /unauth <id>. A user

@@ -201,6 +201,7 @@ type TelegramBot struct {
 	scheduleFile  string               // pending sleeptime rips (persisted, NOT backed up)
 	adminLock     bool                 // true => only admins may use the bot (persisted)
 	lockReason    string               // optional reason shown to users while locked (set via /unauth <reason>, persisted)
+	artistRipsOff bool                 // true => artist (discography) rips are disabled bot-wide (persisted; toggled via /configure or /artistrips)
 	scheduledJobs []*scheduledJob      // pending sleeptime rips (persisted)
 	userPrefs     map[int64]*UserPrefs // saved per-user rip profiles (persisted, keyed by user ID)
 	userStats     map[int64]*UserStats // per-user lifetime usage tally (persisted, keyed by user ID)
@@ -225,6 +226,17 @@ type TelegramBot struct {
 	// → userID) so only that user may operate its buttons. Guarded by profileMu.
 	profileMu     sync.Mutex
 	profileOwners map[string]int64
+
+	// configSessions tracks who opened each live /configure panel ("chatID:messageID"
+	// → *configSession) so only that admin may operate its buttons and drive its
+	// text-input steps. Guarded by configMu. See configure.go.
+	configMu       sync.Mutex
+	configSessions map[string]*configSession
+
+	// pendingInputs implements the "press a button → bot waits for your next text
+	// message" primitive that /configure (accounts, value edits) needs. Keyed by
+	// chatID; only the owner's next message is captured. See configure.go.
+	pendingInputs sync.Map // chatID(int64) → *inputWaiter
 
 	// Per-day heavy-rip quota (see quota.go). quotaUsage is the AUTHORITATIVE tally
 	// the admission gate checks; quotaCharges holds each live charge so refunds are
@@ -732,6 +744,7 @@ func newTelegramBot(token, appleToken string) *TelegramBot {
 		chatFormats:      make(map[int64]string),
 		pending:          make(map[int64]*PendingSelection),
 		pendingTransfers: make(map[int64]*PendingTransfer),
+		configSessions:   make(map[string]*configSession),
 		downloadQueue:    make(chan *downloadRequest, defaultQueueSize),
 		userTaskCount:    make(map[int64]int),
 		activeBoards:     make(map[string]*DownloadStatus),
@@ -1513,6 +1526,12 @@ func (b *TelegramBot) handleMessage(msg *Message) {
 		return
 	}
 	text := strings.TrimSpace(msg.Text)
+	// Text-input-wait primitive: if a /configure step is blocking on this chat's
+	// next message from this same user, hand the text to the waiter and stop —
+	// don't treat it as a command. (configure.go, Phase 1.)
+	if b.deliverPendingInput(msg.Chat.ID, userID, text, msg.MessageID) {
+		return
+	}
 	if cmd, mention, args, ok := parseCommand(text); ok {
 		// In a group, "/help@OtherBot" is addressed to a different bot — ignore it.
 		// We only act on a bare command or one mentioning us. If getMe never resolved
@@ -1585,6 +1604,8 @@ func (b *TelegramBot) handleCallback(cb *CallbackQuery) {
 		alert = b.handleHelpCallback(cb, data)
 	} else if strings.HasPrefix(data, "pf:") {
 		alert = b.handleProfileCallback(cb, data, clickerID)
+	} else if strings.HasPrefix(data, "cfg:") {
+		alert = b.handleConfigCallback(cb, data, clickerID)
 	} else if strings.HasPrefix(data, "artsel:") {
 		alert = b.handleArtistScope(cb, strings.TrimPrefix(data, "artsel:"), clickerID)
 	}
@@ -1962,6 +1983,10 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, username string,
 
 		artistStorefront, artistID := checkUrlArtist(link)
 		if artistID != "" {
+			if b.artistRipsDisabled() && !b.isAdmin(userID) {
+				_ = b.sendMessageWithReply(chatID, "🚫 Artist (full-discography) rips are currently disabled. You can still rip individual albums and songs.", nil, replyToID)
+				return
+			}
 			b.bumpStats(userID, func(s *UserStats) { s.ArtistRips++ })
 			sel := &pendingArtistSel{
 				chatID:     chatID,
@@ -2105,6 +2130,16 @@ func (b *TelegramBot) handleCommand(chatID int64, userID int64, username string,
 		// Runs off the update loop: it sends a reply, frees in-flight work, purges,
 		// then os.Exit(0) — Docker's restart policy brings the bot back.
 		go b.adminRestart(chatID, replyToID)
+	case "configure", "config":
+		if !b.isAdmin(userID) {
+			return // hidden admin command
+		}
+		b.handleConfigureCommand(chatID, userID, replyToID)
+	case "artistrips":
+		if !b.isAdmin(userID) {
+			return // hidden admin command
+		}
+		b.handleArtistRipsCommand(chatID, args, replyToID)
 	default:
 		// Silently ignore unknown commands
 	}
@@ -2819,6 +2854,11 @@ func (b *TelegramBot) handleArtistScope(cb *CallbackQuery, choice string, clicke
 	}
 	if sel.userID != 0 && clickerID != sel.userID {
 		return "This isn't your selection."
+	}
+	// Re-check the gate at tap time: artist rips may have been disabled after the
+	// scope selector was shown. Admins bypass so they can still test.
+	if b.artistRipsDisabled() && !b.isAdmin(clickerID) {
+		return "Artist rips are currently disabled."
 	}
 
 	b.artistSelMu.Lock()
