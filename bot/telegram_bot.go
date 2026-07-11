@@ -201,7 +201,6 @@ type TelegramBot struct {
 	scheduleFile  string               // pending sleeptime rips (persisted, NOT backed up)
 	adminLock     bool                 // true => only admins may use the bot (persisted)
 	lockReason    string               // optional reason shown to users while locked (set via /unauth <reason>, persisted)
-	artistRipsOff bool                 // true => artist (discography) rips are disabled bot-wide (persisted; toggled via /configure or /artistrips)
 	scheduledJobs []*scheduledJob      // pending sleeptime rips (persisted)
 	userPrefs     map[int64]*UserPrefs // saved per-user rip profiles (persisted, keyed by user ID)
 	userStats     map[int64]*UserStats // per-user lifetime usage tally (persisted, keyed by user ID)
@@ -606,6 +605,10 @@ func runTelegramBot(appleToken string) {
 	}
 	bot.catalog = cat
 
+	// Load the /configure live-settings overlay from the same catalog. Empty/disabled
+	// ⇒ empty overlay ⇒ the bot runs on its boot config unchanged (no clobber).
+	initSettings(cat)
+
 	// Wire the catalog HIT path to the pool's DropAuthor copy, and register the dump
 	// row (the FK target for inline indexing) once at startup with its real
 	// access_hash. Without a pool there is no dump to copy from, so deliverFromDump
@@ -646,7 +649,7 @@ func normalizeTelegramAPIBase(raw string) string {
 }
 
 func telegramDownloadMaxBytes() int64 {
-	gb := Config.TelegramDownloadMaxGB
+	gb := settingInt(seTelegramMaxGB, Config.TelegramDownloadMaxGB)
 	if gb <= 0 {
 		gb = defaultTelegramDownloadMaxGB
 	}
@@ -657,9 +660,9 @@ func telegramDownloadMaxBytes() int64 {
 // paused to zip+upload the accumulated tracks to Gofile and reclaim disk before
 // continuing. An unset value (0) falls back to the 20 GB default; a negative value
 // disables mid-rip flushing entirely (the whole rip lands on disk before delivery,
-// the historical behavior).
+// the historical behavior). A /configure override wins over the boot config.
 func ripFlushThresholdBytes() int64 {
-	gb := Config.RipFlushThresholdGB
+	gb := settingInt(seRipFlushGB, Config.RipFlushThresholdGB)
 	if gb < 0 {
 		return -1
 	}
@@ -4435,7 +4438,7 @@ func (b *TelegramBot) flushChunkToGofile(chatID int64, paths []string, replyToID
 		if label != "" {
 			status.UpdateSync(fmt.Sprintf("Zipping %s…", label), 0, 0)
 		} else {
-			thresholdGB := Config.RipFlushThresholdGB
+			thresholdGB := settingInt(seRipFlushGB, Config.RipFlushThresholdGB)
 			if thresholdGB <= 0 {
 				thresholdGB = defaultRipFlushThresholdGB
 			}

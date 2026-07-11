@@ -115,6 +115,15 @@ var migrations = []string{
 	)`,
 	`create index if not exists quota_charges_day_state on quota_charges (quota_day, state)`,
 	`create index if not exists quota_charges_user_day on quota_charges (user_id, quota_day, kind)`,
+	// /configure live-settings overlay: one row per setting the admin explicitly
+	// changed from Telegram. Empty table = the bot runs on its boot config unchanged
+	// (this feature never clobbers the operator's .env). value is text; the main
+	// package types it (int/bool/enum) in its effective getters.
+	`create table if not exists bot_settings (
+		key        text primary key,
+		value      text not null,
+		updated_at timestamptz not null default now()
+	)`,
 }
 
 // Migrate applies the schema. Idempotent; safe to call on every boot. No-op when

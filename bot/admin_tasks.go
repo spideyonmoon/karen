@@ -107,7 +107,6 @@ type telegramStateFile struct {
 	Version          int                  `json:"version"`
 	AdminLock        bool                 `json:"admin_lock"`
 	LockReason       string               `json:"lock_reason,omitempty"`
-	ArtistRipsOff    bool                 `json:"artist_rips_off,omitempty"`
 	ScheduledJobs    []*scheduledJob      `json:"scheduled_jobs,omitempty"`
 	UserPrefs        map[int64]*UserPrefs `json:"user_prefs"`
 	UserStats        map[int64]*UserStats `json:"user_stats,omitempty"`
@@ -126,7 +125,6 @@ func (b *TelegramBot) stateFilePayloadLocked() telegramStateFile {
 		Version:       1,
 		AdminLock:     b.adminLock,
 		LockReason:    b.lockReason,
-		ArtistRipsOff: b.artistRipsOff,
 		UserPrefs:     b.userPrefs,
 		UserStats:     b.userStats,
 	}
@@ -160,7 +158,6 @@ func (b *TelegramBot) loadState() {
 	defer b.stateMu.Unlock()
 	b.adminLock = false
 	b.lockReason = ""
-	b.artistRipsOff = false
 	b.scheduledJobs = nil
 	b.userPrefs = make(map[int64]*UserPrefs)
 	b.userStats = make(map[int64]*UserStats)
@@ -190,7 +187,6 @@ func (b *TelegramBot) loadState() {
 	}
 	b.adminLock = payload.AdminLock
 	b.lockReason = payload.LockReason
-	b.artistRipsOff = payload.ArtistRipsOff
 	b.scheduledJobs = payload.ScheduledJobs
 	if payload.UserPrefs != nil {
 		b.userPrefs = payload.UserPrefs
@@ -455,21 +451,16 @@ func (b *TelegramBot) lockedReason() string {
 }
 
 // artistRipsDisabled reports whether artist (whole-discography) rips are turned
-// off bot-wide. Album/song/playlist rips are unaffected. Toggled from /configure
-// or /artistrips; persisted in telegram-state.json.
+// off bot-wide. Album/song/playlist rips are unaffected. Backed by the /configure
+// settings overlay (key seArtistRipsOff); default false = enabled = current behavior.
 func (b *TelegramBot) artistRipsDisabled() bool {
-	b.stateMu.Lock()
-	defer b.stateMu.Unlock()
-	return b.artistRipsOff
+	return artistRipsDisabledEff()
 }
 
-// setArtistRipsDisabled flips the artist-rip gate and persists it. Returns the
-// new state so callers can report it.
+// setArtistRipsDisabled flips the artist-rip gate (overlay write-through). Returns
+// the new state so callers can report it.
 func (b *TelegramBot) setArtistRipsDisabled(off bool) bool {
-	b.stateMu.Lock()
-	b.artistRipsOff = off
-	b.saveStateLocked()
-	b.stateMu.Unlock()
+	setSettingBool(seArtistRipsOff, off)
 	return off
 }
 
@@ -588,8 +579,33 @@ func (b *TelegramBot) donorStar(userID int64, username string) string {
 // 1 artist / 2 huge-playlist for regular users, 2 / 3 for donors. Because non-admin
 // heavy rips defer to the nightly sleeptime window, this works out to ~that many per
 // day. Single source of truth for the cap (scheduleOrRun) and the /profile readout —
-// keep them from drifting.
+// keep them from drifting. A /configure override (heavy_limit_*) wins when set;
+// otherwise the built-in default below applies unchanged.
 func heavyRipLimit(kind string, donor bool) int {
+	def := heavyRipLimitDefault(kind, donor)
+	n := settingInt(heavyLimitKey(kind, donor), def)
+	if n < 0 {
+		return def // guard against a bad stored value re-enabling nothing
+	}
+	return n
+}
+
+// heavyLimitKey maps (kind, donor) to its overlay setting key.
+func heavyLimitKey(kind string, donor bool) string {
+	if kind == "playlist" {
+		if donor {
+			return seHeavyLimitPlDonor
+		}
+		return seHeavyLimitPlaylist
+	}
+	if donor { // artist
+		return seHeavyLimitArtistDon
+	}
+	return seHeavyLimitArtist
+}
+
+// heavyRipLimitDefault is the built-in cap before any /configure override.
+func heavyRipLimitDefault(kind string, donor bool) int {
 	if kind == "playlist" {
 		if donor {
 			return 3
@@ -1079,12 +1095,17 @@ func (b *TelegramBot) runArtistRipScoped(chatID, userID int64, username, storefr
 		return
 	}
 
-	// Always ONE job (one queue slot / board row / /stop) — never a per-release queue
-	// fan-out, which was the source of the 02:30 flood + silent drops. The user's
-	// ArtistZip pref now only picks the delivery shape: "combined" = one ZIP for the
-	// whole discography; anything else (the default) = one ZIP per release.
+	// Delivery: artist rips default to Gofile ZIP(s). A /configure override can send
+	// them to Telegram individually instead. Per-release ZIP flushing is a Gofile
+	// mechanism, so it only applies in the Gofile path; the 20 GB mid-rip disk valve
+	// still forces oversized remainders to Gofile in either mode (safety, not choice).
+	transferMode := transferModeGofileZip
 	perRelease := !(userID != 0 && b.getPrefs(userID).ArtistZip == "combined")
-	b.runArtistRip(chatID, userID, username, storefront, artistID, items, replyToID, forceAAC, forceAtmos, forceFlac, scope.label, perRelease, quotaChargeID)
+	if artistDeliveryOverride() == artistDeliveryTelegram {
+		transferMode = transferModeTelegramIndividual
+		perRelease = false
+	}
+	b.runArtistRip(chatID, userID, username, storefront, artistID, items, replyToID, forceAAC, forceAtmos, forceFlac, scope.label, transferMode, perRelease, quotaChargeID)
 }
 
 // runArtistMusicVideos queues each of an artist's music videos as a direct
@@ -1114,7 +1135,7 @@ func (b *TelegramBot) runArtistMusicVideos(chatID, userID int64, storefront stri
 // whole discography when combined) is flushed in "Part N" chunks mid-rip so disk never
 // spikes. If task-concurrency is off (rs == nil) flushing is unavailable, so
 // per-release degrades to one final combined ZIP.
-func (b *TelegramBot) runArtistRip(chatID, userID int64, username, storefront, artistID string, albums []ampapi.ArtistSectionItem, replyToID int, forceAAC, forceAtmos, forceFlac bool, label string, perRelease bool, quotaChargeID string) {
+func (b *TelegramBot) runArtistRip(chatID, userID int64, username, storefront, artistID string, albums []ampapi.ArtistSectionItem, replyToID int, forceAAC, forceAtmos, forceFlac bool, label, transferMode string, perRelease bool, quotaChargeID string) {
 	format := b.resolveFormat(chatID, forceFlac)
 	artistName := ampapi.GetArtistName(storefront, artistID, b.searchLanguage(), b.appleToken)
 	// Capture the rip state, ctx, and a "ripped at least one release" signal so the
@@ -1128,7 +1149,7 @@ func (b *TelegramBot) runArtistRip(chatID, userID int64, username, storefront, a
 		releasesOK int
 	)
 	total := len(albums)
-	ok := b.enqueueDownloadWithAfter(chatID, userID, username, replyToID, 0, false, format, transferModeGofileZip, "artist:"+artistID, false, func(ctx context.Context) error {
+	ok := b.enqueueDownloadWithAfter(chatID, userID, username, replyToID, 0, false, format, transferMode, "artist:"+artistID, false, func(ctx context.Context) error {
 		sharedCtx = ctx
 		rs := ripStateFrom(ctx)
 		sharedRS = rs
@@ -1173,6 +1194,8 @@ func (b *TelegramBot) runArtistRip(chatID, userID int64, username, storefront, a
 	}
 	if perRelease {
 		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("📀 Queued %s (%d releases → one Gofile ZIP per album).", label, len(albums)), nil, replyToID)
+	} else if transferMode == transferModeTelegramIndividual {
+		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("📀 Queued %s (%d releases → tracks delivered individually to Telegram).", label, len(albums)), nil, replyToID)
 	} else {
 		_ = b.sendMessageWithReply(chatID, fmt.Sprintf("📀 Queued %s (%d releases → one combined Gofile ZIP).", label, len(albums)), nil, replyToID)
 	}
