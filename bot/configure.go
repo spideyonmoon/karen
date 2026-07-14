@@ -822,7 +822,7 @@ func (b *TelegramBot) askAccountField(chatID, userID int64, prompt string) (stri
 }
 
 // toggleAccountStatus flips active <-> disabled (shut-down) and re-renders the detail.
-func (b *TelegramBot) toggleAccountStatus(chatID int64, messageID, id int64) {
+func (b *TelegramBot) toggleAccountStatus(chatID int64, messageID int, id int64) {
 	acc, ok := b.findAccount(id)
 	if !ok {
 		b.renderAccountsList(chatID, messageID)
@@ -841,7 +841,7 @@ func (b *TelegramBot) toggleAccountStatus(chatID int64, messageID, id int64) {
 }
 
 // deleteAccount removes an account and returns to the list.
-func (b *TelegramBot) deleteAccount(chatID int64, messageID, id int64) {
+func (b *TelegramBot) deleteAccount(chatID int64, messageID int, id int64) {
 	ctx, cancel := context.WithTimeout(context.Background(), accountsDBTimeout)
 	defer cancel()
 	if err := b.catalog.AccountDelete(ctx, id); err != nil {
