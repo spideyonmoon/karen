@@ -1,10 +1,13 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
+
+	"main/catalog"
 )
 
 // =============================================================================
@@ -37,11 +40,12 @@ const (
 // "chatID:messageID" in b.configSessions. Only Owner may tap its buttons or
 // satisfy its input steps.
 type configSession struct {
-	Owner     int64
-	ChatID    int64
-	MessageID int
-	Panel     string // which sub-panel is currently shown ("root" | section key)
-	CreatedAt time.Time
+	Owner      int64
+	ChatID     int64
+	MessageID  int
+	Panel      string // which sub-panel is currently shown ("root" | section key)
+	SelAccount int64  // account id in focus on the account-detail panel (0 = none)
+	CreatedAt  time.Time
 }
 
 // inputWaiter is one outstanding "next text message" capture (Phase 1). The
@@ -231,6 +235,23 @@ func (b *TelegramBot) handleConfigCallback(cb *CallbackQuery, data string, click
 		if len(parts) >= 2 {
 			panel = parts[1]
 		}
+		// The accounts panel reads the DB, so it's rendered off the update loop.
+		if panel == "accounts" {
+			s.Panel = "accounts"
+			s.SelAccount = 0
+			go b.renderAccountsList(chatID, messageID)
+			return ""
+		}
+	case "acct":
+		// Account CRUD (all DB-backed → run off the update loop). Forms:
+		//   cfg:acct:new                 → multi-step add (ID then password)
+		//   cfg:acct:view:<id>           → account detail
+		//   cfg:acct:change:<id>         → multi-step edit creds
+		//   cfg:acct:status:<id>         → toggle active/disabled (shut-down)
+		//   cfg:acct:del:<id>            → ask to confirm
+		//   cfg:acct:delyes:<id>         → confirmed delete
+		go b.handleAccountAction(chatID, clickerID, messageID, parts)
+		return ""
 	case "toggle":
 		if len(parts) >= 2 {
 			b.applyConfigToggle(parts[1])
@@ -467,14 +488,6 @@ func (b *TelegramBot) renderConfig(panel string) (rich, plain string) {
 			fmt.Fprintf(&pb, "%s: %s%s\n", f.label, f.display(val), marker)
 		}
 		rb.WriteString("\n_* = overridden. Others follow your .env / built-in defaults._\n")
-	case "accounts":
-		writeConfigStub(&rb, &pb, "🍏 Accounts",
-			"Add, change, disable or remove Apple-Music accounts.",
-			[]string{
-				"Each account = one wrapper container (needs a deploy to apply)",
-				"[new] asks for ID then password",
-				"[change] · [delete] · [shut-down] per account",
-			})
 	case "deploy":
 		writeConfigStub(&rb, &pb, "🚀 Deploy",
 			"Apply structural changes (accounts, DB) by recreating containers.",
@@ -555,7 +568,7 @@ func (b *TelegramBot) configMarkup(panel string) InlineKeyboardMarkup {
 		}
 		rows = append(rows, []InlineKeyboardButton{{Text: "‹ Back", CallbackData: "cfg:nav:settings"}})
 		return InlineKeyboardMarkup{InlineKeyboard: rows}
-	case "accounts", "deploy":
+	case "deploy":
 		return InlineKeyboardMarkup{InlineKeyboard: [][]InlineKeyboardButton{
 			{{Text: "‹ Back", CallbackData: "cfg:nav:root"}},
 		}}
@@ -567,4 +580,294 @@ func (b *TelegramBot) configMarkup(panel string) InlineKeyboardMarkup {
 			{{Text: "✓ Done", CallbackData: "cfg:done", Style: "success"}},
 		}}
 	}
+}
+
+// =============================================================================
+// Accounts (Phase 3) — DB-backed CRUD. All handlers run off the update loop (the
+// callback router dispatches them with `go`) because they do Supabase I/O. Every
+// path re-renders the panel in place at the end. Edits only PERSIST here; they take
+// effect when the operator runs the [deploy] button (Phase 4), which recreates the
+// wrapper containers.
+// =============================================================================
+
+const accountsDBTimeout = 10 * time.Second
+
+// accountsAvailable reports whether account management can run (needs the catalog).
+func (b *TelegramBot) accountsAvailable() bool {
+	return b.catalog != nil && b.catalog.Enabled()
+}
+
+// loadAccounts fetches all accounts with a bounded timeout.
+func (b *TelegramBot) loadAccounts() ([]catalog.Account, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), accountsDBTimeout)
+	defer cancel()
+	return b.catalog.AccountsLoadAll(ctx)
+}
+
+// renderAccountsList paints the account list panel: acc 1..N + [new]. Requires a
+// live session at (chatID, messageID).
+func (b *TelegramBot) renderAccountsList(chatID int64, messageID int) {
+	if _, ok := b.getConfigSession(chatID, messageID); !ok {
+		return
+	}
+	if !b.accountsAvailable() {
+		rich := "# 🍏 Accounts\n\n_Account management needs a database (DATABASE\\_URL). It's currently disabled, so accounts stay in `.env`._\n"
+		plain := "🍏 Accounts\n\nAccount management needs a database (DATABASE_URL); it's currently disabled."
+		markup := InlineKeyboardMarkup{InlineKeyboard: [][]InlineKeyboardButton{{{Text: "‹ Back", CallbackData: "cfg:nav:root"}}}}
+		_, _ = b.editMessageRich(chatID, messageID, rich, plain, markup)
+		return
+	}
+	accounts, err := b.loadAccounts()
+	if err != nil {
+		fmt.Printf("configure: load accounts: %v\n", err)
+		_, _ = b.editMessageRich(chatID, messageID, "# 🍏 Accounts\n\n_Couldn't load accounts (DB error). Try again._",
+			"Couldn't load accounts (DB error). Try again.",
+			InlineKeyboardMarkup{InlineKeyboard: [][]InlineKeyboardButton{{{Text: "‹ Back", CallbackData: "cfg:nav:root"}}}})
+		return
+	}
+
+	var rb, pb strings.Builder
+	rb.WriteString("# 🍏 Accounts\n")
+	rb.WriteString("Apple-Music credentials. Changes are saved but only take effect after a Deploy.\n\n")
+	pb.WriteString("🍏 Accounts\n\n")
+	if len(accounts) == 0 {
+		rb.WriteString("_No accounts yet. Tap ➕ to add one._\n")
+		pb.WriteString("No accounts yet.\n")
+	}
+	var rows [][]InlineKeyboardButton
+	for i, a := range accounts {
+		tag := ""
+		if a.Status == catalog.AccountDisabled {
+			tag = " · ⏸ shut down"
+		}
+		fmt.Fprintf(&rb, "**acc %d** — %s%s\n", i+1, escapeRichMD(a.AppleID), tag)
+		fmt.Fprintf(&pb, "acc %d — %s%s\n", i+1, a.AppleID, tag)
+		label := fmt.Sprintf("acc %d — %s", i+1, shortID(a.AppleID))
+		if a.Status == catalog.AccountDisabled {
+			label = "⏸ " + label
+		}
+		rows = append(rows, []InlineKeyboardButton{{Text: label, CallbackData: "cfg:acct:view:" + strconv.FormatInt(a.ID, 10)}})
+	}
+	rows = append(rows, []InlineKeyboardButton{{Text: "➕ New account", CallbackData: "cfg:acct:new", Style: "success"}})
+	rows = append(rows, []InlineKeyboardButton{{Text: "‹ Back", CallbackData: "cfg:nav:root"}})
+	_, _ = b.editMessageRich(chatID, messageID, rb.String(), pb.String(), InlineKeyboardMarkup{InlineKeyboard: rows})
+}
+
+// handleAccountAction dispatches a cfg:acct:* callback. parts is the colon-split of
+// the data after "cfg:" (parts[0] == "acct").
+func (b *TelegramBot) handleAccountAction(chatID, userID int64, messageID int, parts []string) {
+	if _, ok := b.getConfigSession(chatID, messageID); !ok {
+		return
+	}
+	if !b.accountsAvailable() {
+		b.renderAccountsList(chatID, messageID) // shows the "needs DB" notice
+		return
+	}
+	if len(parts) < 2 {
+		return
+	}
+	sub := parts[1]
+	var id int64
+	if len(parts) >= 3 {
+		id, _ = strconv.ParseInt(parts[2], 10, 64)
+	}
+	switch sub {
+	case "new":
+		b.beginNewAccount(chatID, userID, messageID)
+	case "view":
+		b.showAccountDetail(chatID, messageID, id, false)
+	case "change":
+		b.beginChangeAccount(chatID, userID, messageID, id)
+	case "status":
+		b.toggleAccountStatus(chatID, messageID, id)
+	case "del":
+		b.showAccountDetail(chatID, messageID, id, true) // detail with confirm buttons
+	case "delyes":
+		b.deleteAccount(chatID, messageID, id)
+	}
+}
+
+// showAccountDetail paints one account. confirmDelete swaps the action row for a
+// delete confirmation.
+func (b *TelegramBot) showAccountDetail(chatID int64, messageID int, id int64, confirmDelete bool) {
+	s, ok := b.getConfigSession(chatID, messageID)
+	if !ok {
+		return
+	}
+	acc, ok := b.findAccount(id)
+	if !ok {
+		b.renderAccountsList(chatID, messageID)
+		return
+	}
+	b.configMu.Lock()
+	s.Panel = "account"
+	s.SelAccount = id
+	b.configMu.Unlock()
+
+	statusLabel := "✅ active"
+	if acc.Status == catalog.AccountDisabled {
+		statusLabel = "⏸ shut down"
+	}
+	var rb, pb strings.Builder
+	fmt.Fprintf(&rb, "# 🍏 Account\n\n**Apple ID**: %s\n**Password**: %s\n**Status**: %s\n",
+		escapeRichMD(acc.AppleID), escapeRichMD(maskSecret(acc.ApplePass)), statusLabel)
+	fmt.Fprintf(&pb, "🍏 Account\n\nApple ID: %s\nPassword: %s\nStatus: %s\n",
+		acc.AppleID, maskSecret(acc.ApplePass), statusLabel)
+
+	idStr := strconv.FormatInt(id, 10)
+	var rows [][]InlineKeyboardButton
+	if confirmDelete {
+		rb.WriteString("\n⚠️ _Delete this account? This can't be undone._\n")
+		pb.WriteString("\nDelete this account? This can't be undone.\n")
+		rows = append(rows,
+			[]InlineKeyboardButton{{Text: "⚠️ Confirm delete", CallbackData: "cfg:acct:delyes:" + idStr, Style: "danger"}},
+			[]InlineKeyboardButton{{Text: "‹ Cancel", CallbackData: "cfg:acct:view:" + idStr}},
+		)
+	} else {
+		shutLabel := "⏸ Shut down"
+		if acc.Status == catalog.AccountDisabled {
+			shutLabel = "▶ Enable"
+		}
+		rows = append(rows,
+			[]InlineKeyboardButton{{Text: "✎ Change creds", CallbackData: "cfg:acct:change:" + idStr}},
+			[]InlineKeyboardButton{{Text: shutLabel, CallbackData: "cfg:acct:status:" + idStr}},
+			[]InlineKeyboardButton{{Text: "🗑 Delete", CallbackData: "cfg:acct:del:" + idStr, Style: "danger"}},
+			[]InlineKeyboardButton{{Text: "‹ Back", CallbackData: "cfg:nav:accounts"}},
+		)
+	}
+	_, _ = b.editMessageRich(chatID, messageID, rb.String(), pb.String(), InlineKeyboardMarkup{InlineKeyboard: rows})
+}
+
+// findAccount loads a single account by id (small table; a full load is fine).
+func (b *TelegramBot) findAccount(id int64) (catalog.Account, bool) {
+	accounts, err := b.loadAccounts()
+	if err != nil {
+		return catalog.Account{}, false
+	}
+	for _, a := range accounts {
+		if a.ID == id {
+			return a, true
+		}
+	}
+	return catalog.Account{}, false
+}
+
+// beginNewAccount runs the two-step add (Apple ID, then password) via awaitInput.
+func (b *TelegramBot) beginNewAccount(chatID, userID int64, messageID int) {
+	appleID, ok := b.askAccountField(chatID, userID, "New account — send the Apple ID (email). Send /cancel to abort.")
+	if !ok {
+		b.renderAccountsList(chatID, messageID)
+		return
+	}
+	pass, ok := b.askAccountField(chatID, userID, "Now send the password for that account. Send /cancel to abort.")
+	if !ok {
+		b.renderAccountsList(chatID, messageID)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), accountsDBTimeout)
+	defer cancel()
+	if _, err := b.catalog.AccountInsert(ctx, appleID, pass); err != nil {
+		fmt.Printf("configure: account insert: %v\n", err)
+		_ = b.sendMessage(chatID, "Couldn't save the account (DB error).", nil)
+	} else {
+		_ = b.sendMessage(chatID, "✅ Account saved. Run Deploy to bring it online.", nil)
+	}
+	b.renderAccountsList(chatID, messageID)
+}
+
+// beginChangeAccount re-enters both credentials for an existing account.
+func (b *TelegramBot) beginChangeAccount(chatID, userID int64, messageID int, id int64) {
+	acc, ok := b.findAccount(id)
+	if !ok {
+		b.renderAccountsList(chatID, messageID)
+		return
+	}
+	appleID, ok := b.askAccountField(chatID, userID, fmt.Sprintf("Changing acc (%s) — send the new Apple ID. Send /cancel to keep it.", acc.AppleID))
+	if !ok {
+		b.showAccountDetail(chatID, messageID, id, false)
+		return
+	}
+	pass, ok := b.askAccountField(chatID, userID, "Now send the new password. Send /cancel to keep it.")
+	if !ok {
+		b.showAccountDetail(chatID, messageID, id, false)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), accountsDBTimeout)
+	defer cancel()
+	if err := b.catalog.AccountUpdateCreds(ctx, id, appleID, pass); err != nil {
+		fmt.Printf("configure: account update: %v\n", err)
+		_ = b.sendMessage(chatID, "Couldn't update the account (DB error).", nil)
+	} else {
+		_ = b.sendMessage(chatID, "✅ Account updated. Run Deploy to apply.", nil)
+	}
+	b.showAccountDetail(chatID, messageID, id, false)
+}
+
+// askAccountField prompts, waits for the next message (Phase 1), tidies the prompt,
+// and returns the trimmed value. ok=false on timeout / empty / /cancel.
+func (b *TelegramBot) askAccountField(chatID, userID int64, prompt string) (string, bool) {
+	promptID, _ := b.sendMessageWithReplyReturn(chatID, prompt, nil, 0)
+	text, got := b.awaitInput(chatID, userID)
+	if promptID != 0 {
+		_ = b.deleteMessage(chatID, promptID)
+	}
+	if !got {
+		return "", false
+	}
+	text = strings.TrimSpace(text)
+	if text == "" || strings.EqualFold(text, "/cancel") {
+		return "", false
+	}
+	return text, true
+}
+
+// toggleAccountStatus flips active <-> disabled (shut-down) and re-renders the detail.
+func (b *TelegramBot) toggleAccountStatus(chatID int64, messageID, id int64) {
+	acc, ok := b.findAccount(id)
+	if !ok {
+		b.renderAccountsList(chatID, messageID)
+		return
+	}
+	next := catalog.AccountDisabled
+	if acc.Status == catalog.AccountDisabled {
+		next = catalog.AccountActive
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), accountsDBTimeout)
+	defer cancel()
+	if err := b.catalog.AccountSetStatus(ctx, id, next); err != nil {
+		fmt.Printf("configure: account status: %v\n", err)
+	}
+	b.showAccountDetail(chatID, messageID, id, false)
+}
+
+// deleteAccount removes an account and returns to the list.
+func (b *TelegramBot) deleteAccount(chatID int64, messageID, id int64) {
+	ctx, cancel := context.WithTimeout(context.Background(), accountsDBTimeout)
+	defer cancel()
+	if err := b.catalog.AccountDelete(ctx, id); err != nil {
+		fmt.Printf("configure: account delete: %v\n", err)
+		_ = b.sendMessage(chatID, "Couldn't delete the account (DB error).", nil)
+	} else {
+		_ = b.sendMessage(chatID, "🗑 Account removed. Run Deploy to recreate the wrapper set.", nil)
+	}
+	b.renderAccountsList(chatID, messageID)
+}
+
+// maskSecret shows only enough of a password to recognise it, never the whole thing.
+func maskSecret(s string) string {
+	if s == "" {
+		return "—"
+	}
+	if len(s) <= 2 {
+		return "••"
+	}
+	return s[:1] + strings.Repeat("•", len(s)-1)
+}
+
+// shortID trims a long Apple ID (email) for a button label.
+func shortID(s string) string {
+	if len(s) <= 22 {
+		return s
+	}
+	return s[:21] + "…"
 }

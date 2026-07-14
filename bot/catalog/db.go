@@ -124,6 +124,17 @@ var migrations = []string{
 		value      text not null,
 		updated_at timestamptz not null default now()
 	)`,
+	// Apple-Music accounts, source of truth for /configure account management and the
+	// deploy renderer. id is a stable surrogate (NOT the wrapper slot number — slots
+	// are derived from active-account order at render time). Creds are plaintext, same
+	// trust level as the .env they replace.
+	`create table if not exists accounts (
+		id         bigserial primary key,
+		apple_id   text not null,
+		apple_pass text not null,
+		status     text not null default 'active',
+		created_at timestamptz not null default now()
+	)`,
 }
 
 // Migrate applies the schema. Idempotent; safe to call on every boot. No-op when
