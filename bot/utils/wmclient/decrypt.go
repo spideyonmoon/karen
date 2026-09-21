@@ -331,6 +331,8 @@ func DownloadAndDecrypt(ctx context.Context, wm *Client, adamID string, playlist
 	if progress != nil {
 		progress("Downloading", int64(len(initData)), totalBytes)
 	}
+	decryptor := wm.NewDecryptSession(adamID)
+	defer decryptor.Close()
 
 	// Download all segments in parallel
 	type segResult struct {
@@ -457,7 +459,7 @@ func DownloadAndDecrypt(ctx context.Context, wm *Client, adamID string, playlist
 			for j := range samples {
 				encrypted[j] = samples[j].Data
 			}
-			decrypted, err := wm.DecryptSamples(ctx, adamID, seg.keyForSample, encrypted)
+			decrypted, err := decryptor.DecryptSamples(ctx, seg.keyForSample, encrypted)
 			if err != nil {
 				return fmt.Errorf("decrypt segment %d: %w", segIdx, err)
 			}

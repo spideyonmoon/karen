@@ -33,8 +33,8 @@ type Client struct {
 	http    *http.Client
 	lib     *temari.Library
 
-	templatesMu sync.Mutex
-	templates   map[string]*temari.Temari
+	prefetchMu sync.Mutex
+	prefetch   *temari.Temari
 }
 
 func NewClient(addr, temariLibraryPath string) (*Client, error) {
@@ -61,19 +61,18 @@ func NewClient(addr, temariLibraryPath string) (*Client, error) {
 	}
 
 	return &Client{
-		baseURL:  strings.TrimRight(parsed.String(), "/"),
-		http:     &http.Client{Timeout: 45 * time.Second},
-		lib:      lib,
-		templates: make(map[string]*temari.Temari),
+		baseURL: strings.TrimRight(parsed.String(), "/"),
+		http:    &http.Client{Timeout: 45 * time.Second},
+		lib:     lib,
 	}, nil
 }
 
 func (c *Client) Close() error {
-	c.templatesMu.Lock()
-	defer c.templatesMu.Unlock()
-	for key, template := range c.templates {
-		template.Close()
-		delete(c.templates, key)
+	c.prefetchMu.Lock()
+	defer c.prefetchMu.Unlock()
+	if c.prefetch != nil {
+		c.prefetch.Close()
+		c.prefetch = nil
 	}
 	c.http.CloseIdleConnections()
 	return nil
@@ -190,19 +189,9 @@ func (c *Client) getString(ctx context.Context, path string, query url.Values, f
 	return value, nil
 }
 
-func (c *Client) template(ctx context.Context, adamID, keyURI string) (*temari.Temari, error) {
-	requestID := adamID
-	if keyURI == prefetchKey {
-		requestID = "0"
-	}
-	cacheKey := requestID + "\x00" + keyURI
-	c.templatesMu.Lock()
-	defer c.templatesMu.Unlock()
-	if template := c.templates[cacheKey]; template != nil {
-		return template, nil
-	}
+func (c *Client) loadTemplate(ctx context.Context, adamID, keyURI string) (*temari.Temari, error) {
 	data, err := c.request(ctx, http.MethodGet, "/key", url.Values{
-		"adamId": {requestID},
+		"adamId": {adamID},
 		"uri":     {keyURI},
 	}, nil)
 	if err != nil {
@@ -212,12 +201,64 @@ func (c *Client) template(ctx context.Context, adamID, keyURI string) (*temari.T
 	if err != nil {
 		return nil, fmt.Errorf("create Temari template for %s: %w", adamID, err)
 	}
-	c.templates[cacheKey] = template
 	return template, nil
 }
 
-func (c *Client) DecryptSamples(ctx context.Context, adamID, keyURI string, samples [][]byte) ([][]byte, error) {
-	template, err := c.template(ctx, adamID, keyURI)
+func (c *Client) prefetchTemplate(ctx context.Context) (*temari.Temari, error) {
+	c.prefetchMu.Lock()
+	defer c.prefetchMu.Unlock()
+	if c.prefetch != nil {
+		return c.prefetch, nil
+	}
+	template, err := c.loadTemplate(ctx, "0", prefetchKey)
+	if err != nil {
+		return nil, err
+	}
+	c.prefetch = template
+	return c.prefetch, nil
+}
+
+// DecryptSession owns the per-track Temari templates. Track-specific templates
+// must not live for the lifetime of this daemon: an unbounded global cache would
+// retain one native handle for every song Karen ever downloads.
+type DecryptSession struct {
+	client    *Client
+	adamID    string
+	templates map[string]*temari.Temari
+}
+
+func (c *Client) NewDecryptSession(adamID string) *DecryptSession {
+	return &DecryptSession{
+		client:    c,
+		adamID:    adamID,
+		templates: make(map[string]*temari.Temari),
+	}
+}
+
+func (s *DecryptSession) Close() {
+	for key, template := range s.templates {
+		template.Close()
+		delete(s.templates, key)
+	}
+}
+
+func (s *DecryptSession) template(ctx context.Context, keyURI string) (*temari.Temari, error) {
+	if keyURI == prefetchKey {
+		return s.client.prefetchTemplate(ctx)
+	}
+	if template := s.templates[keyURI]; template != nil {
+		return template, nil
+	}
+	template, err := s.client.loadTemplate(ctx, s.adamID, keyURI)
+	if err != nil {
+		return nil, err
+	}
+	s.templates[keyURI] = template
+	return template, nil
+}
+
+func (s *DecryptSession) DecryptSamples(ctx context.Context, keyURI string, samples [][]byte) ([][]byte, error) {
+	template, err := s.template(ctx, keyURI)
 	if err != nil {
 		return nil, err
 	}
