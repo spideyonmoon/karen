@@ -40,3 +40,9 @@ jobs:
 
       - name: validate login helper
         run: python -m py_compile login/login.py
+
+      - name: build bot image through Temari packaging stage
+        run: docker build --target builder -t karen-bot-builder-check ./bot
+
+      - name: build pinned wrapper-manager image
+        run: docker build -t karen-wrapper-manager-check ./wrapper-manager
