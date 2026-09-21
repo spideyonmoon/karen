@@ -2,7 +2,7 @@
 
 ## Project structure
 - `bot/` — Go binary (module `main`, Go 1.25.5), entrypoint `main.go`
-- `bot/utils/wmgrpc/` — gRPC client for wrapper-manager (decryption backend)
+- `bot/utils/wmclient/` — HTTP client for wrapper-manager v2 + local Temari decryption
 - `wrapper-manager/` — Dockerfile to build [WorldObservationLog/wrapper-manager](https://github.com/WorldObservationLog/wrapper-manager)
 
 ## Quick start
@@ -14,10 +14,10 @@ cp .env.example .env
 
 ## Config — .env is the single source of truth
 - Edit `.env` only. `./generate.sh` reads it and writes `bot/config.yaml` + `docker-compose.override.yml`; both are GENERATED — never hand-edit.
-- The count of `APPLE_ID_N`/`APPLE_PASS_N` pairs in `.env` drives instance count: wrapper services, volumes, ports (`8080+N`), and the `wrapper-manager-addrs` list all follow from it.
+- All `APPLE_ID_N`/`APPLE_PASS_N` pairs are logged into one wrapper-manager v2 gateway at `karen-wrapper-manager:8080`; its account count drives Karen's track concurrency.
 - `storefront` is fixed to `us` in the generator (not in `.env`). Authoritative non-secret config values live in `generate.sh`'s heredoc, NOT `bot/config.yaml.example` (kept only as human reference and may drift).
-- `setup.sh` = full bootstrap (generate + clone AMD login client + build + per-account login + start). Re-run it only when the account list changes.
-- Gitignored: `.env`, `docker-compose.override.yml`, `bot/config.yaml`, `bot/state/`, `bot/downloads/`, `.logins/wm-*.toml`.
+- `setup.sh` = full bootstrap (generate + build + HTTP account reconciliation/login + start). Re-run it when the account list changes; 2FA is prompted interactively when required.
+- Gitignored: `.env`, `docker-compose.override.yml`, `bot/config.yaml`, `bot/state/`, `bot/downloads/`, `.logins/v3-accounts.txt`.
 
 ## Day-2 operations (steady state)
 | Goal | Action |
@@ -26,11 +26,10 @@ cp .env.example .env
 | Add / remove Apple accounts | edit `.env` on the VPS, then `./setup.sh` (logs in only NEW accounts) |
 | Force fresh login of all accounts | `RELOGIN=1 ./setup.sh` |
 
-- **No manual `git pull` on the VPS, ever.** The deploy's `git reset --hard origin/main` syncs all tracked files (incl. the `*.sh` scripts) on every push to `main`. So when you next run `./setup.sh` to add accounts, it's already the latest version. `.env` / `docker-compose.override.yml` / `.logins/wm-*.toml` are gitignored, so the reset never touches them.
-- **Login is idempotent.** `setup.sh` skips any wrapper whose volume already has `/root/data/instances.json` (a token). Re-authing an already-logged-in account FAILS — that's what made wm-1 fail on a second run. Only ever log in new/failed accounts.
+- **No manual `git pull` on the VPS, ever.** The deploy's `git reset --hard origin/main` syncs tracked files. `.env`, the generated Compose override, manager data volume, and `.logins/v3-accounts.txt` survive it.
+- **Login is idempotent.** `setup.sh` submits every configured username; wrapper-manager's `already login` response is treated as success. Removed usernames recorded in `.logins/v3-accounts.txt` are logged out. `RELOGIN=1` explicitly logs current accounts out first.
 - **`.env` is parsed literally, never `source`d.** A password with `$`/backtick/`\` would be shell-expanded and break under `set -u`. `generate.sh`/`setup.sh` have a `load_env()` that strips only outer quotes and takes the value verbatim. Proven on a `$`-containing password (wm-2).
 - **Compose runs with `--env-file /dev/null`** (in `setup.sh` and `deploy.yml`) so it doesn't parse the secrets `.env` for `${VAR}` interpolation (a `$` in a password warned "variable is not set"). Our compose files use literal values only.
-- **OPEN THREAD (unverified):** the idempotency skip assumes the token path is `/root/data/instances.json`. Never confirmed on the box. If wrong, the skip silently no-ops and `setup.sh` re-logs ALL accounts (no worse than before, but risks the re-auth failure). Confirm with `docker compose --env-file /dev/null exec -T wrapper-manager-2 sh -c 'ls -la /root/data'`; fix the one path in `setup.sh` step 4 if the filename differs.
 
 ## CLI flags (binary has two modes)
 - `--bot` — Telegram bot mode (production)
@@ -44,8 +43,8 @@ cp .env.example .env
 
 ## Architecture
 - **Single sequential download worker** — `startDownloadWorker()` reads from a buffered chan (cap 20). One download at a time due to package-level globals.
-- **Decryption via wrapper-manager gRPC** — `bot/utils/wmgrpc/client.go` dials wrapper-manager instances. `DownloadAndDecrypt()` in `decrypt.go` downloads fMP4 segments via HLS, decrypts via a persistent bidirectional `Decrypt` gRPC stream, and remuxes with `ffmpeg -c copy`.
-- **Multi-account pool** — `bot/utils/wmgrpc/pool.go` implements a channel-based FIFO client pool. `wmPool.Acquire()` / `wmPool.Release()` distributes load across wrapper-manager instances. Each instance runs its own Android emulator.
+- **HTTP + local Temari decryption** — `bot/utils/wmclient/client.go` calls wrapper-manager v2's JSON endpoints. `DownloadAndDecrypt()` downloads fMP4 segments via HLS, obtains `/key` templates, decrypts sample batches locally through Temari's Go binding, and remuxes with `ffmpeg -c copy`.
+- **Multi-account gateway** — one wrapper-manager supervises one lightweight `wrapper-lite-rootless` process per Apple account and routes requests by region. Karen reads `/status.clientCount` to retain its account-sized concurrent track budget.
 - **Three delivery modes** (user picks via inline keyboard):
   1. Telegram Bot API — single tracks <50MB
   2. MTProto (`gotd/td`) — ZIP up to 2GB; session in `mtproto-session.json`
@@ -69,27 +68,23 @@ cp .env.example .env
 - Legacy orphans: old `bot/telegram-cache.json` / `bot/telegram-state.json` host files (pre-dir-mount) are unused; harmless, can be `rm`'d on the VPS.
 
 ## Docker services
-- `docker-compose.yml` (tracked) — base, defines only the `bot` service. No `depends_on` (wrappers aren't in this file; bot reaches them via gRPC at runtime).
-- `docker-compose.override.yml` (generated, gitignored) — `wrapper-manager-N` services + `wm-data-N` volumes, one per account. Compose auto-merges both files.
-- Instance `N`: container `karen-wm-N`, port `8080+N` bound to `127.0.0.1`, volume `wm-data-N`.
+- `docker-compose.yml` (tracked) defines the bot. `docker-compose.override.yml` (generated, gitignored) adds `karen-wrapper-manager`, port `127.0.0.1:8080`, and the fresh `wm-data-v3` volume.
+- The old `wm-data-N` volumes are intentionally not deleted during migration and can be retained for rollback.
 
 ## Wrapper-manager setup (handled by setup.sh)
-- `./setup.sh` builds the shared `karen-wrapper-manager:local` image + the `karen-login:local` login image, boots the wrappers, and logs in each account via the gRPC `Login` RPC (through `do-login.sh`).
-- **The login client is containerized (`login/`).** It used to run on the host (`pip install` + `python3 /tmp/AppleMusicDecrypt/tools/login.py`), which forced host assumptions that broke on a fresh VPS — Python ≥3.11 (stdlib `tomllib`), a pip new enough for `--break-system-packages`, ~13 host pip packages. Now `do-login.sh` does `docker run --rm -i --network <wm-net> -v .logins/<wm-n>.toml:/app/config.toml karen-login:local`, feeding creds on stdin. **The host needs only Docker + git — no Python.** The token is stored by the wrapper-manager in its own volume over gRPC; the login container is ephemeral.
-  - `setup.sh` points each `.logins/wm-N.toml` at the wrapper's **container DNS name** `karen-wm-N:808N` (not `127.0.0.1`) so the login container reaches it over the compose network. `do-login.sh` auto-detects that network from `docker inspect karen-wm-N`.
-  - Deps are pinned in `login/requirements.txt`; the image clones AppleMusicDecrypt at build time.
-- There is NO login CLI flag — the upstream `-L "id:pass"` shortcut was removed and now errors `flag provided but not defined: -L`. gRPC only.
-- 2FA is not handled (accounts in use have it disabled); creds are fed on a non-interactive stdin pipe.
-- Wrapper-manager needs `--privileged` (Frida hooks inside Android emulator).
+- `./setup.sh` builds the pinned manager and a tiny stdlib-only `karen-login:local` helper, starts the gateway, reconciles removed accounts, and uses `POST /login` for every configured account. Credentials are read from a read-only `.env` mount and never placed in argv/Compose.
+- `.logins/v3-accounts.txt` stores only the previously managed usernames so setup can call `/logout` for removed accounts. It is gitignored.
+- 2FA is handled by the manager's two-phase login flow; the helper prompts on stdin only when Apple requests a code.
+- Wrapper-manager needs `--privileged` because `wrapper-lite-rootless` uses user namespaces and chroot.
 
 ## Required external binaries (bundled in Docker)
 - `ffmpeg` — fMP4 to flat MP4 remuxing, format conversion
 - GPAC base image provides additional tooling
 
 ## Gotchas
-- `bot/utils/wmgrpc/` — gRPC stubs imported from `github.com/WorldObservationLog/wrapper-manager/proto` (no local proto generation)
-- AAC-LC uses `WebPlayback` RPC (patched `wrapper-manager/webplay.go` with nil-safe checks — upstream crashes on some responses)
-- ALAC/Atmos uses `M3U8` RPC + bidirectional `Decrypt` streaming RPC (one stream per track)
+- Temari's native `libtemari.so` is copied explicitly from its Go module into the final bot image and loaded from `/usr/local/lib/libtemari.so`.
+- AAC-LC uses the manager's HTTP `/webplayback` endpoint.
+- ALAC/Atmos uses HTTP `/m3u8` + `/key`; Temari decrypts locally in parallel sample batches.
 - MTProto peer cache is in-memory only; lost on restart
 - `bot/utils/gofile.go` hardcodes `upload-ap-sgp.gofile.io`
 - Fork of [moeleak/apple-music-downloader-bot](https://github.com/moeleak/apple-music-downloader-bot); upstream commits may be relevant for porting
@@ -97,7 +92,6 @@ cp .env.example .env
 ## Known issues
 - Progress bar is cosmetic (estimate-based, not accurate). Known display bug FIXED 2026-06-20 (commit `46b747b`): the upload board collapsed to "7.00MB / 7.00MB" for multi-tens-of-MB tracks because `finishedSizes` took the latest reported per-track `total`, which the HLS-segment download path leaves at 0 and the post-download phases (`Decrypting`/`Converting`/`Remuxing`, 0/1 sentinels) clobber. Fixed with a per-track `maxBytes` high-water mark in `trackProgressState` (`telegram_bot.go`). Files always delivered correctly — it was purely the gauge, so treat any pre-fix board speed/size numbers as unreliable.
 - No retry logic on failed segment downloads
-- `wrapper-manager/webplay.go` `GetLicense()` has unsafe type assertion (line 106) that can panic
 - **MTProto upload sawtooth on DC5 — DIAGNOSED + MITIGATED (stable at `uploadThreads = 16`), but still single-connection-bound.** Large uploads were dropping with `engine forcibly closed: context canceled`. Root cause (confirmed via gotd's zap logger): `pingLoop: disconnect (pong missed): write tcp …91.108.56.112:443: i/o timeout` — the in-flight upload window saturates the single-connection TCP send buffer to DC5 (Singapore, ~176 ms RTT, near its bandwidth-delay product), so gotd's keepalive ping write times out → engine torn down → in-flight parts canceled. The resumable uploader + `withUploadRetryN` rides it out (each retry resumes at a higher part number), so files **do** deliver. Ruled out: not FloodWait (no 429/FLOOD_WAIT), not bandwidth (39↑/72↓ MB/s measured), not MTU/routing, not resources, not duplicate sessions, not the bot token.
   - **Fix deployed (2026-06-19):** raised the per-socket send buffer via `net.ipv4.tcp_wmem=4096 262144 16777216` (16MB max) — set in `docker-compose.yml`'s `sysctls:` on the `bot` service (it's net-namespaced, so a host sysctl won't reach the container; this deploys via the normal push→main pipeline). Verified live in the container.
   - **Thread experiment CONCLUDED (2026-06-19):** with the 16MB buffer, `uploadThreads = 16` (8 MB in flight) is the **stable ceiling** — clean log over a full 168 MB upload. `20` (10 MB in flight) RE-INTRODUCED the teardown (`dc_id=5 … forcibly closed` on part 197), so it was reverted to `16` (commit `6b64899`). gotd serializes RPC writes over ONE TCP connection, so it's **protocol-saturated at 16** — more threads re-starve the keepalive without buying speed. **Do NOT raise `uploadThreads` above 16** without a further buffer increase AND a re-test for `pong missed` / `forcibly closed`.
@@ -126,7 +120,8 @@ Everything runs in containers, so the host only needs Docker + git — nothing e
 Two key relationships not to conflate: **Actions→VPS** (secret `VPS_SSH_KEY`, pubkey in VPS `authorized_keys`) vs **VPS→GitHub** (deploy key on the repo, private key on the VPS — needed because the repo is private and the deploy fetches on the box).
 
 ## Branches
-- `main` — current development (post-wrapper-manager overhaul, "v2")
+- `main` — production branch
+- `v3` — wrapper-manager v2 HTTP + local Temari migration branch
 - `v1-stable` — frozen snapshot of the pre-overhaul code (single-account wrapper, MP4Box remux, serial downloads). The legendary v1. Preserved for reference; do not target new work here.
 - `v1.0.0` — git tag pointing at the same commit as `v1-stable`, visible on the GitHub Releases page.
 - See `SESSION_HISTORY.md` for the full migration log.

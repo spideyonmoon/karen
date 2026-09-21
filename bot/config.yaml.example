@@ -73,10 +73,10 @@ telegram-api-id: 0            # Get from https://my.telegram.org/apps
 telegram-api-hash: ""         # Get from https://my.telegram.org/apps
 gofile-token: "YOUR_GOFILE_TOKEN_HERE"
 media-user-token: "your_media_user_token" # Apple Music API token (required for lyrics, stations; get from browser devtools)
-# wrapper-manager gRPC addresses (one per Apple Music account/container)
-wrapper-manager-addrs:
-  - "karen-wm-1:8081"
-  - "karen-wm-2:8082"
+# wrapper-manager v2 HTTP gateway (all Apple accounts live behind this service)
+wrapper-manager-url: "karen-wrapper-manager:8080"
+# Temari native library copied into the production bot image
+temari-library-path: "/usr/local/lib/libtemari.so"
 # Task concurrency: run two queued rips at once. A "head" task downloads with the
 # full wrapper pool; while it runs, ONE eligible queued Gofile task may "borrow" a
 # few wrappers. A finished rip's upload runs detached so the next download starts

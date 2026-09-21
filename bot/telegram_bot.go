@@ -5666,7 +5666,7 @@ func newDownloadStatus(bot *TelegramBot, chatID int64, req *downloadRequest) *Do
 		username:       req.username,
 		tracks:         make(map[string]trackProgressState),
 		finishedSizes:  nil,
-		workerLimit:    len(Config.WrapperManagerAddrs),
+		workerLimit:    poolSize(),
 		single:         req.single,
 	}
 	if status.workerLimit < 1 {

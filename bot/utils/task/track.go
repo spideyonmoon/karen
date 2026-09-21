@@ -23,7 +23,7 @@ type Track struct {
 	Quality    string
 	CoverPath  string
 
-	WorkerID string // wrapper-manager instance handling this track (e.g. "wm-3")
+	WorkerID string // decryption worker label shown on the live status board
 
 	Resp         ampapi.TrackRespData
 	PreType      string // 上级类型 专辑或者歌单

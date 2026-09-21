@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 )
 
@@ -52,23 +54,26 @@ func restartContainer(ctx context.Context, cli *http.Client, name string) error 
 	return nil
 }
 
-// wrapperContainerNames derives the wrapper-manager container names from the
-// configured gRPC addresses (generate.sh emits "karen-wm-1:8081", …), de-duplicated
-// and in config order.
+// wrapperContainerNames derives the single v2 manager container name from its
+// configured HTTP URL. It returns a slice to preserve the restart caller's
+// best-effort reporting interface.
 func wrapperContainerNames() []string {
-	var names []string
-	seen := map[string]bool{}
-	for _, addr := range Config.WrapperManagerAddrs {
-		host := addr
-		if h, _, err := net.SplitHostPort(addr); err == nil {
-			host = h
-		}
-		if host != "" && !seen[host] {
-			seen[host] = true
-			names = append(names, host)
-		}
+	addr := strings.TrimSpace(Config.WrapperManagerURL)
+	if addr == "" {
+		return nil
 	}
-	return names
+	if !strings.Contains(addr, "://") {
+		addr = "http://" + addr
+	}
+	parsed, err := url.Parse(addr)
+	if err != nil {
+		return nil
+	}
+	host := parsed.Hostname()
+	if host == "" {
+		return nil
+	}
+	return []string{host}
 }
 
 // restartAllWrappers restarts every configured wrapper-manager container via the

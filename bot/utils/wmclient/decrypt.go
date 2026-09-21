@@ -1,4 +1,4 @@
-package wmgrpc
+package wmclient
 
 import (
 	"bufio"
@@ -332,13 +332,6 @@ func DownloadAndDecrypt(ctx context.Context, wm *Client, adamID string, playlist
 		progress("Downloading", int64(len(initData)), totalBytes)
 	}
 
-	// Open ONE decrypt stream for all segments
-	ds, err := wm.NewDecryptionStream(ctx, adamID)
-	if err != nil {
-		return fmt.Errorf("open decrypt stream: %w", err)
-	}
-	defer ds.Close()
-
 	// Download all segments in parallel
 	type segResult struct {
 		index  int
@@ -460,13 +453,17 @@ func DownloadAndDecrypt(ctx context.Context, wm *Client, adamID string, playlist
 			if err != nil {
 				return fmt.Errorf("get samples segment %d: %w", segIdx, err)
 			}
+			encrypted := make([][]byte, len(samples))
 			for j := range samples {
-				decrypted, err := ds.Decrypt(seg.keyForSample, samples[j].Data, int32(j))
-				if err != nil {
-					return fmt.Errorf("decrypt sample %d/%d: %w", segIdx, j, err)
-				}
-				samples[j].Data = decrypted
-				totalDecrypted += int64(len(decrypted))
+				encrypted[j] = samples[j].Data
+			}
+			decrypted, err := wm.DecryptSamples(ctx, adamID, seg.keyForSample, encrypted)
+			if err != nil {
+				return fmt.Errorf("decrypt segment %d: %w", segIdx, err)
+			}
+			for j := range samples {
+				samples[j].Data = decrypted[j]
+				totalDecrypted += int64(len(decrypted[j]))
 				if progress != nil {
 					progress("Decrypting", totalDecrypted, totalBytes)
 				}

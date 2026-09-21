@@ -27,7 +27,7 @@ import (
 	"main/utils/runv3"
 	"main/utils/structs"
 	"main/utils/task"
-	"main/utils/wmgrpc"
+	"main/utils/wmclient"
 
 	"github.com/fatih/color"
 	"github.com/grafov/m3u8"
@@ -48,7 +48,7 @@ var (
 	// Set per-request from downloadRequest.noCache in runDownload (serial worker),
 	// reset there before each rip — mirrors how dl_atmos/dl_aac are managed.
 	dl_noCache            bool
-	wmPool                *wmgrpc.Pool
+	wmClient              *wmclient.Client
 	artist_select         bool
 	debug_mode            bool
 	alac_max              *int
@@ -769,31 +769,28 @@ func stripLrcTimestamps(s string) string {
 	return strings.Join(lines, "\n")
 }
 
-// isTransientWrapperErr reports whether err is a transient wrapper-pool condition —
-// an instance restarting, a dropped gRPC stream, backpressure — that is worth
-// retrying on another instance after a backoff, rather than a permanent per-track
-// failure. These are exactly the errors a crashing/recovering wrapper produces, and
-// the symptoms that silently dropped tracks from healthy albums under the old
-// 2-attempt retry.
+// isTransientWrapperErr reports whether the manager or one of its account
+// instances is temporarily unavailable. The v2 manager performs account routing;
+// Karen retries the shared HTTP gateway after a backoff.
 func isTransientWrapperErr(err error) bool {
 	if err == nil {
 		return false
 	}
 	s := err.Error()
 	return strings.Contains(s, "no available instance") ||
+		strings.Contains(s, "instance") && strings.Contains(s, "busy") ||
+		strings.Contains(s, "connection refused") ||
+		strings.Contains(s, "Client.Timeout") ||
+		strings.Contains(s, "context deadline exceeded") ||
+		strings.Contains(s, "upstream error") ||
 		strings.Contains(s, "connection reset by peer") ||
 		strings.Contains(s, "EOF") ||
-		strings.Contains(s, "engine was closed") ||
-		strings.Contains(s, "engine forcibly closed") ||
-		strings.Contains(s, "transport is closing")
+		strings.Contains(s, "server closed idle connection")
 }
 
-// withWrapperRetry runs fn against a freshly-acquired wrapper client, retrying on
-// transient pool errors with exponential backoff. It returns early on success, on a
-// permanent unsupported-encryption error (which must NEVER be retried — a non-FairPlay
-// key crashes the wrapper), or when ctx is cancelled. Acquire/Release (and the
-// panic-safe token return) are handled here so a leaked token can't shrink the pool.
-func withWrapperRetry(ctx context.Context, op string, fn func(wm *wmgrpc.Client) error) error {
+// withWrapperRetry retries transient calls to the shared HTTP manager. Permanent
+// playlist/decryption failures return immediately.
+func withWrapperRetry(ctx context.Context, op string, fn func(wm *wmclient.Client) error) error {
 	const maxAttempts = 5
 	backoff := 2 * time.Second
 	var err error
@@ -801,30 +798,24 @@ func withWrapperRetry(ctx context.Context, op string, fn func(wm *wmgrpc.Client)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		func() {
-			wm := wmPool.Acquire()
-			defer wmPool.Release(wm)
-			err = fn(wm)
-		}()
+		err = fn(wmClient)
 		if err == nil {
 			return nil
 		}
-		if errors.Is(err, wmgrpc.ErrNoFairPlayKey) {
-			return err // permanent: don't retry, don't feed another wrapper a bad key
+		if errors.Is(err, wmclient.ErrNoFairPlayKey) || !isTransientWrapperErr(err) {
+			return err
 		}
 		if attempt == maxAttempts {
 			break
 		}
-		fmt.Printf("%s attempt %d/%d failed (%v); retrying with different instance...\n", op, attempt, maxAttempts, err)
-		if isTransientWrapperErr(err) {
-			select {
-			case <-time.After(backoff):
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-			if backoff < 16*time.Second {
-				backoff *= 2
-			}
+		fmt.Printf("%s attempt %d/%d failed (%v); waiting for wrapper-manager...\n", op, attempt, maxAttempts, err)
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		if backoff < 16*time.Second {
+			backoff *= 2
 		}
 	}
 	return err
@@ -883,7 +874,7 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 	// If AAC-LC, get M3U8 via WebPlayback; otherwise use track.M3u8
 	var downloadM3u8 string
 	if needDlAacLc {
-		err = withWrapperRetry(ctx, "WebPlayback", func(wm *wmgrpc.Client) error {
+		err = withWrapperRetry(ctx, "WebPlayback", func(wm *wmclient.Client) error {
 			var e error
 			downloadM3u8, e = wm.WebPlayback(ctx, track.ID)
 			return e
@@ -895,7 +886,7 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 			return
 		}
 	} else {
-		err = withWrapperRetry(ctx, "M3U8", func(wm *wmgrpc.Client) error {
+		err = withWrapperRetry(ctx, "M3U8", func(wm *wmclient.Client) error {
 			var e error
 			downloadM3u8, e = wm.M3U8(ctx, track.ID)
 			return e
@@ -1049,15 +1040,13 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 		}
 	}
 
-	// Retry on a different pool client for transient wrapper errors (an instance
-	// restarting, connection reset). A permanent ErrNoFairPlayKey is NOT retried —
-	// it never reaches the wrapper, so it can't crash one. withWrapperRetry handles
-	// Acquire/Release in a panic-safe closure so a leaked token can't shrink the pool.
-	err = withWrapperRetry(ctx, "DownloadAndDecrypt", func(wm *wmgrpc.Client) error {
-		track.WorkerID = wm.ID()
-		return wmgrpc.DownloadAndDecrypt(ctx, wm, track.ID, downloadM3u8, trackPath, rs.atmos(), wmgrpc.ProgressFunc(trackProgress))
+	// The manager supplies playlist/key context over HTTP. Temari decrypts samples
+	// locally in Karen, in parallel batches, while later segments keep downloading.
+	err = withWrapperRetry(ctx, "DownloadAndDecrypt", func(wm *wmclient.Client) error {
+		track.WorkerID = "temari"
+		return wmclient.DownloadAndDecrypt(ctx, wm, track.ID, downloadM3u8, trackPath, rs.atmos(), wmclient.ProgressFunc(trackProgress))
 	})
-	if err != nil && errors.Is(err, wmgrpc.ErrNoFairPlayKey) {
+	if err != nil && errors.Is(err, wmclient.ErrNoFairPlayKey) {
 		// No FairPlay key for this track — Widevine/PlayReady-only content the
 		// FairPlay wrapper can't license. Fall back to karen's bundled Widevine CDM
 		// (runv3, the same path music videos use): it acquires a Widevine license
@@ -1065,7 +1054,7 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 		// so the rest of the pipeline (remux → tag → deliver) is unchanged. Output is
 		// AAC — the best available when there's no FairPlay (hence no lossless)
 		// stream. runv3 talks to Apple with the local CDM and never touches the
-		// wrapper pool, so this can't affect concurrent rips.
+		// wrapper manager, so this can't affect concurrent rips.
 		fmt.Println("No FairPlay key; trying Widevine (runv3) fallback:", track.Name)
 		// Bound the fallback. runv3 has unbounded internal HTTP clients (GetWebplayback
 		// uses http.DefaultClient with no timeout and no ctx), so a stalled webplayback/
@@ -1303,11 +1292,7 @@ func ripStation(albumId string, token string, storefront string, ctx context.Con
 			return err
 		}
 		trackM3U8 := strings.ReplaceAll(assetsUrl, "index.m3u8", "256/prog_index.m3u8")
-		func() {
-			wm := wmPool.Acquire()
-			defer wmPool.Release(wm)
-			err = wmgrpc.DownloadAndDecrypt(ctx, wm, station.ID, trackM3U8, trackPath, false, nil)
-		}()
+		err = wmclient.DownloadAndDecrypt(ctx, wmClient, station.ID, trackM3U8, trackPath, false, nil)
 		if err != nil {
 			fmt.Println("Failed to download station stream.", err)
 			ctr.Error++
@@ -2198,11 +2183,28 @@ func main() {
 	Config.MVMax = *mv_max
 
 	var initErr error
-	wmPool, initErr = wmgrpc.NewPool(Config.WrapperManagerAddrs)
+	wmClient, initErr = wmclient.NewClient(Config.WrapperManagerURL, Config.TemariLibraryPath)
 	if initErr != nil {
-		log.Fatalf("Failed to connect to wrapper-manager: %v", initErr)
+		log.Fatalf("Failed to initialize wrapper-manager/Temari: %v", initErr)
 	}
-	defer wmPool.Close()
+	defer wmClient.Close()
+	readyCtx, readyCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer readyCancel()
+	for {
+		status, statusErr := wmClient.Status(readyCtx)
+		if statusErr == nil && status.Ready && status.ClientCount > 0 {
+			setWrapperCapacity(status.ClientCount)
+			fmt.Printf("wrapper-manager ready: %d account(s), regions=%v\n", status.ClientCount, status.Regions)
+			break
+		}
+		if readyCtx.Err() != nil {
+			if statusErr != nil {
+				log.Fatalf("wrapper-manager did not become ready: %v", statusErr)
+			}
+			log.Fatal("wrapper-manager is ready but has no logged-in Apple accounts")
+		}
+		time.Sleep(2 * time.Second)
+	}
 
 	if bot_mode {
 		runTelegramBot(token)
@@ -2420,7 +2422,7 @@ func mvDownloader(ctx context.Context, adamID string, saveDir string, token stri
 
 	// Music videos are Widevine-encrypted (PSSH keys), not FairPlay (skd://).
 	// wrapper-manager only decrypts FairPlay, so MV uses the bundled Widevine CDM
-	// (runv3) + mp4decrypt path instead of the wmgrpc decrypt stream.
+	// (runv3) + mp4decrypt path instead of the Temari audio path.
 	mvm3u8url, _, _, _ := runv3.GetWebplayback(adamID, token, Config.MediaUserToken, true)
 	if mvm3u8url == "" {
 		return errors.New("media-user-token may be wrong or expired")
@@ -2610,14 +2612,12 @@ func extractMvAudio(c string) (string, error) {
 }
 
 func checkM3u8(b string, f string) (string, error) {
-	if wmPool == nil {
-		return "", errors.New("wrapper-manager pool not initialized")
+	if wmClient == nil {
+		return "", errors.New("wrapper-manager client not initialized")
 	}
-	wm := wmPool.Acquire()
-	defer wmPool.Release(wm)
-	m3u8URL, err := wm.M3U8(context.Background(), b)
+	m3u8URL, err := wmClient.M3U8(context.Background(), b)
 	if err != nil {
-		return "none", fmt.Errorf("M3U8 RPC failed for %s: %w", b, err)
+		return "none", fmt.Errorf("M3U8 HTTP request failed for %s: %w", b, err)
 	}
 	if f == "song" {
 		fmt.Println("Received URL:", m3u8URL)

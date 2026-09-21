@@ -1,8 +1,7 @@
 #!/bin/bash
-# One-time bootstrap for a fresh VPS (and whenever you add/remove accounts).
-# Reads .env, generates config + compose override, builds images, logs in every
-# Apple account, and starts the bot. After this, GitHub Actions handles deploys;
-# re-run this only when the account list in .env changes (new logins needed).
+# Bootstrap for wrapper-manager v2. One HTTP gateway owns all Apple accounts;
+# Temari decrypts locally inside the Go bot. Re-run after changing the account
+# list. Login is idempotent and supports an interactive 2FA prompt when needed.
 set -euo pipefail
 
 KAREN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -44,10 +43,7 @@ while :; do
   [[ -n "${!id_var:-}" ]] && N=$next || break
 done
 
-# 2. Build the containerized login client. This replaces the old host-side
-#    AppleMusicDecrypt clone + `pip install` — the login client now runs in a
-#    pinned python:3.11 image (see login/), so the HOST needs only Docker. No
-#    host Python, no pip flags, no Python-version assumptions.
+# 2. Build the tiny stdlib-only HTTP login helper. The host needs no Python.
 echo "Building login client image (karen-login:local) ..."
 docker build -t karen-login:local ./login
 
@@ -56,32 +52,42 @@ docker build -t karen-login:local ./login
 # parsing of secrets. Our compose files use literal values only.
 DC=(docker compose --env-file /dev/null)
 
-# 3. Build the shared wrapper image and boot all wrapper-managers
-"${DC[@]}" build wrapper-manager-1
-"${DC[@]}" up -d $(for ((i=1;i<=N;i++)); do echo "wrapper-manager-$i"; done)
+# 3. Build and boot the one multi-account manager. --remove-orphans removes the
+# old karen-wm-N containers during the v3 migration but deliberately preserves
+# their named volumes for rollback.
+"${DC[@]}" build wrapper-manager
+"${DC[@]}" up -d --remove-orphans wrapper-manager
+./do-login.sh wait
 
-echo "Waiting 20s for wrapper-manager gRPC servers to come up ..."
-sleep 20
+# 4. Reconcile accounts removed from .env, then idempotently log in every current
+# account. The local registry contains usernames only; credentials remain solely
+# in .env. RELOGIN=1 logs current accounts out before signing them in again.
+mkdir -p .logins
+ACCOUNT_REGISTRY=".logins/v3-accounts.txt"
+if [[ -f "$ACCOUNT_REGISTRY" ]]; then
+  while IFS= read -r old_id || [[ -n "$old_id" ]]; do
+    [[ -z "$old_id" ]] && continue
+    still_present=0
+    for ((i = 1; i <= N; i++)); do
+      id_var="APPLE_ID_${i}"
+      [[ "${!id_var}" == "$old_id" ]] && still_present=1
+    done
+    if [[ "$still_present" -eq 0 ]]; then
+      echo "=== Logging out removed account: $old_id ==="
+      ./do-login.sh logout "$old_id"
+    fi
+  done < "$ACCOUNT_REGISTRY"
+fi
 
-# 4. Log in each account. Idempotent: an account that already has a token
-#    (instances.json in its volume) is skipped, so re-running setup.sh after
-#    adding accounts only logs in the NEW ones — re-authing a live account
-#    fails. Force a fresh login for all with: RELOGIN=1 ./setup.sh
+REGISTRY_TMP="${ACCOUNT_REGISTRY}.tmp"
+: > "$REGISTRY_TMP"
 for ((i = 1; i <= N; i++)); do
-  port=$((8080 + i))
-  id_var="APPLE_ID_${i}"; pass_var="APPLE_PASS_${i}"
-  if [[ "${RELOGIN:-0}" != "1" ]] && \
-     "${DC[@]}" exec -T "wrapper-manager-$i" sh -c 'test -s /root/data/instances.json' 2>/dev/null; then
-    echo "=== wrapper-manager-$i already logged in — skipping (RELOGIN=1 to force) ==="
-    continue
-  fi
-  echo "=== Login wrapper-manager-$i (port $port) ==="
-  cp .logins/wm-1.toml.example ".logins/wm-${i}.toml"
-  # Point the login client at the wrapper's container DNS name on the compose
-  # network (the login container can't reach the host's 127.0.0.1 ports).
-  sed -i "s|127.0.0.1:8081|karen-wm-${i}:${port}|" ".logins/wm-${i}.toml"
-  ./do-login.sh "wm-${i}" "${!id_var}" "${!pass_var}"
+  id_var="APPLE_ID_${i}"
+  echo "=== Login Apple account $i/$N ==="
+  ./do-login.sh login "$i"
+  printf '%s\n' "${!id_var}" >> "$REGISTRY_TMP"
 done
+mv "$REGISTRY_TMP" "$ACCOUNT_REGISTRY"
 
 # 5. Start the bot
 "${DC[@]}" up -d --build bot

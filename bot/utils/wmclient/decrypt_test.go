@@ -1,4 +1,4 @@
-package wmgrpc
+package wmclient
 
 import (
 	"testing"

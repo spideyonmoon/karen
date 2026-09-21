@@ -60,7 +60,8 @@ type ConfigSet struct {
 	TelegramApiHash               string `yaml:"telegram-api-hash"`
 	GofileToken                   string  `yaml:"gofile-token"`
 	MediaUserToken                string  `yaml:"media-user-token"`
-	WrapperManagerAddrs           []string `yaml:"wrapper-manager-addrs"`
+	WrapperManagerURL             string `yaml:"wrapper-manager-url"`
+	TemariLibraryPath             string `yaml:"temari-library-path"`
 
 	// DatabaseURL is the Supabase (Singapore) pooled Postgres connection string for
 	// the Phase 2 read-through catalog. Empty → catalog runs disabled (every request

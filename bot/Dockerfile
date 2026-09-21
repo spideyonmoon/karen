@@ -10,6 +10,9 @@ COPY . .
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg/mod \
     go mod tidy && \
+    TEMARI_DIR="$(go list -m -f '{{.Dir}}' github.com/WorldObservationLog/Temari/bindings/go)" && \
+    case "${TARGETARCH}" in amd64) TEMARI_ARCH=x86_64 ;; arm64) TEMARI_ARCH=arm64 ;; *) echo "Unsupported Temari architecture: ${TARGETARCH}" >&2; exit 1 ;; esac && \
+    cp "${TEMARI_DIR}/lib/linux-${TEMARI_ARCH}/libtemari.so" /bin/libtemari.so && \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /bin/apple-music-dl .
 
 # Build mp4decrypt (Bento4) from source so it works on whatever arch the image targets.
@@ -32,6 +35,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 COPY --from=bento4 /bento4/cmakebuild/mp4decrypt /usr/local/bin/mp4decrypt
 COPY --from=builder /bin/apple-music-dl /usr/local/bin/apple-music-dl
+COPY --from=builder /bin/libtemari.so /usr/local/lib/libtemari.so
 WORKDIR /app
 COPY config.yaml ./
 RUN echo 'alac-save-folder: "/downloads/ALAC"' >> config.yaml \

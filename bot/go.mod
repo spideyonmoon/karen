@@ -3,6 +3,7 @@ module main
 go 1.25.5
 
 require (
+	github.com/WorldObservationLog/Temari/bindings/go v0.5.1
 	github.com/aead/cmac v0.0.0-20160719120800-7af84192f0b1
 	github.com/go-resty/resty/v2 v2.16.5
 	github.com/gotd/td v0.144.0
@@ -67,12 +68,10 @@ require (
 
 require (
 	github.com/AlecAivazis/survey/v2 v2.3.7
-	github.com/WorldObservationLog/wrapper-manager v0.0.0-20260612145326-d40d2046fead
 	github.com/beevik/etree v1.3.0
 	github.com/fatih/color v1.18.0
 	github.com/itouakirai/mp4ff v0.0.0-20250930132656-98812935a1c7
 	github.com/olekukonko/tablewriter v0.0.5
 	github.com/zhaarey/go-mp4tag v0.0.0-20251021234435-2c70f6b1bf76
-	google.golang.org/grpc v1.81.1
 	gopkg.in/yaml.v2 v2.4.0
 )

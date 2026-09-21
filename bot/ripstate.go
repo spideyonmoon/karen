@@ -67,10 +67,9 @@ type RipState struct {
 	failMu   sync.Mutex
 	failures []string
 
-	// WrapperBudget caps how many wrapper-manager clients this rip may hold
-	// concurrently — its slice of the shared wmgrpc.Pool. The head runs with the
-	// full pool; a borrower is granted a small k. A value <= 0 (or above the pool
-	// size) means "no per-rip cap" → use the full pool. Set by the scheduler.
+	// WrapperBudget caps concurrent tracks for this rip. The value is derived from
+	// the account count reported by the shared v2 wrapper-manager. The head uses all
+	// account slots; a borrower is granted a smaller share by the scheduler.
 	WrapperBudget int
 
 	// Live track accounting the scheduler reads to make its lend decision (head
@@ -437,9 +436,19 @@ func applyPrefsToConfig(cfg *structs.ConfigSet, p *UserPrefs) {
 
 // --- wrapper budget + track accounting -------------------------------------
 
-// poolSize returns the configured wrapper-manager pool size (>= 1).
+var managerCapacity atomic.Int64
+
+func setWrapperCapacity(n int) {
+	if n < 1 {
+		n = 1
+	}
+	managerCapacity.Store(int64(n))
+}
+
+// poolSize returns the account capacity reported by wrapper-manager (>= 1).
+// The historical name remains because it is used throughout the scheduler.
 func poolSize() int {
-	n := len(Config.WrapperManagerAddrs)
+	n := int(managerCapacity.Load())
 	if n < 1 {
 		return 1
 	}

@@ -8,7 +8,7 @@ A docs site is on the way. Until then this readme is the short version — enoug
 
 - **Lossless and then some** — ALAC up to 192 kHz, Dolby Atmos, AAC-LC, optional FLAC conversion. Music videos too.
 - **Ripped once, served forever** — a catalog backed by a private Telegram dump channel. The first request for a track rips it; every request after that copies the stored file straight back, no re-ripping. A half-cached album only fetches the tracks it's missing.
-- **Parallel everything** — multiple Apple Music accounts rip concurrently across emulator backends, and a pool of helper bot accounts uploads in parallel. Telegram throttles per account, so spreading an album's tracks across several bots cuts upload time roughly proportionally and spreads out the rate limits.
+- **Parallel everything** — wrapper-manager routes work across multiple Apple Music accounts while Temari decrypts locally across CPU cores, and a pool of helper bot accounts uploads in parallel.
 - **Delivery that fits** — files arrive as clean copies (no "forwarded from" header). Tracks, a zip, or a Gofile link depending on size; huge discographies are flushed to Gofile in numbered parts mid-rip, so a rip never has to fit on disk all at once.
 - **Per-user profiles** — save your codec, quality, and delivery preferences once and `/dl` runs with zero flags and zero prompts.
 - **Made to run unattended** — concurrent download scheduler, live per-task status boards, a queue, bulk `/dl`, inline search, and a full admin/sudo toolkit (bans, usage stats, restart, system status).
@@ -34,22 +34,22 @@ The pieces behind that flow:
                        rip + decrypt        upload in parallel
                                 │              │
                      ┌──────────▼─────┐  ┌─────▼──────────────┐
-                     │ wrapper-mgr ×N │  │  helper-bot pool   │
-                     │ gRPC, 1 Apple  │  │  → dump channel    │
-                     │ account each   │  │  (stores the bytes)│
+                     │ wrapper-mgr v2 │  │  helper-bot pool   │
+                     │ HTTP gateway   │  │  → dump channel    │
+                     │ many accounts  │  │  (stores the bytes)│
                      └────────────────┘  └────────────────────┘
 ```
 
-- **wrapper-manager ×N** — Android emulators running a Frida-hooked Apple Music app, one account each, exposing gRPC for playlists, WebPlayback, and live DRM decryption. The rip engine for cache misses.
+- **wrapper-manager v2** — one HTTP gateway supervising lightweight `wrapper-lite` processes, one per Apple account. It supplies playlists, licenses, lyrics, and FairPlay key context and routes around unavailable regions/accounts.
 - **helper-bot pool** — extra bot accounts that upload to the dump channel in parallel, dividing both wall-time and FLOOD_WAIT pressure across accounts.
 - **catalog** — Postgres (managed on Supabase) holding pointer rows keyed by Apple track ID + format tier. This is the lookup that turns repeat requests into instant copies.
-- **bot** (Go) — fetches the playlist, downloads HLS segments in parallel, decrypts over a gRPC stream, remuxes with ffmpeg, and copies the result to you with no trace of the dump.
+- **bot** (Go) — fetches playlists over HTTP, downloads HLS segments in parallel, decrypts them locally through Temari's Go binding, remuxes with ffmpeg, and copies the result to you with no trace of the dump.
 
 The catalog and helper pool are optional. With neither configured, Karen falls back to the original behavior: rip on demand and upload directly.
 
 ## Quick start
 
-You'll need a Linux host with Docker, a Telegram bot token, and at least one Apple Music account (2FA off — the login path doesn't prompt).
+You'll need a Linux host with Docker, a Telegram bot token, and at least one Apple Music account. Two-factor login is supported interactively during setup.
 
 ```bash
 git clone https://github.com/spideyonmoon/karen.git ~/karen
@@ -58,7 +58,9 @@ cp .env.example .env   # fill in tokens + one APPLE_ID_N / APPLE_PASS_N per acco
 ./setup.sh
 ```
 
-`.env` is the single source of truth: the number of account pairs in it decides how many backend instances get built. `setup.sh` does the rest — generates the config and compose file, builds the images, logs each account in once (the session persists in a volume, so you never log in again), and starts everything. After that, pushing to `main` redeploys via GitHub Actions; `.env` stays untouched on the host.
+`.env` is the single source of truth. `setup.sh` generates config, builds one multi-account manager and the Temari-enabled bot, reconciles the account list, logs in new accounts, and starts everything. Sessions persist in the `wm-data-v3` volume. Removed accounts are logged out on the next setup run; `RELOGIN=1 ./setup.sh` refreshes every current account.
+
+The v3 migration intentionally uses a new volume. Old `wm-data-N` volumes are not deleted, so the previous backend remains recoverable until you deliberately remove those volumes.
 
 The catalog and parallel-upload pool are opt-in: add `HELPER_BOT_TOKENS`, `DUMP_CHANNEL_ID`, and `DATABASE_URL` to `.env` to turn them on (channel setup details will live in the docs site).
 
@@ -85,8 +87,8 @@ Common flags: `-aac`, `-atmos`, `-flac`, `-art`, plus delivery overrides `-tgu` 
 bot/               Go service — orchestration, delivery, profiles, admin
   catalog/         Postgres read-through catalog (pointer rows) + indexer
   pool.go          helper-bot upload pool → dump channel
-  utils/wmgrpc/    gRPC client + parallel download/decrypt across rip backends
-wrapper-manager/   upstream emulator backend + patches
+  utils/wmclient/  wrapper-manager HTTP client + local Temari decryption
+wrapper-manager/   pinned upstream v2 HTTP gateway image
 setup.sh           one-shot bootstrap: generate → build → login → start
 generate.sh        renders config.yaml + docker-compose from .env
 ```
@@ -96,7 +98,8 @@ generate.sh        renders config.yaml + docker-compose from .env
 Karen wouldn't exist without the work of others. Standing on, forked from, and inspired by:
 
 - [WorldObservationLog/wrapper-manager](https://github.com/WorldObservationLog/wrapper-manager) and [/wrapper](https://github.com/WorldObservationLog/wrapper) — the hooked Apple Music backend
-- [WorldObservationLog/AppleMusicDecrypt](https://github.com/WorldObservationLog/AppleMusicDecrypt) — login + decrypt tooling
+- [WorldObservationLog/Temari](https://github.com/WorldObservationLog/Temari) — local FairPlay decryption library and Go binding
+- [WorldObservationLog/AppleMusicDecrypt](https://github.com/WorldObservationLog/AppleMusicDecrypt) — reference implementation for the modern HTTP/Temari architecture
 - [zhaarey/apple-music-downloader](https://github.com/zhaarey/apple-music-downloader) — the original downloader
 - [moeleak/apple-music-downloader-bot](https://github.com/moeleak/apple-music-downloader-bot) — Telegram bot groundwork
 - [irisXDR/NEO-WZML](https://github.com/irisXDR/NEO-WZML) — bot UX inspiration
