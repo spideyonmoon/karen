@@ -41,8 +41,12 @@ jobs:
       - name: validate login helper
         run: python -m py_compile login/login.py
 
-      - name: build bot image through Temari packaging stage
-        run: docker build --target builder -t karen-bot-builder-check ./bot
+      - name: build and validate runnable bot image
+        run: |
+          cp bot/config.yaml.example bot/config.yaml
+          docker build -t karen-bot-check ./bot
+          docker run --rm --entrypoint /bin/sh karen-bot-check -c \
+            'set -e; test -x /usr/local/bin/apple-music-dl; for f in /usr/local/bin/apple-music-dl /usr/local/lib/libtemari.so; do deps="$(ldd "$f")"; echo "$deps"; ! echo "$deps" | grep -q "not found"; done'
 
       - name: build pinned wrapper-manager image
         run: docker build -t karen-wrapper-manager-check ./wrapper-manager

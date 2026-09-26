@@ -1,11 +1,17 @@
 ARG GOVERSION=1.25.5
 
-FROM --platform=$BUILDPLATFORM golang:${GOVERSION}-alpine AS builder
+# Temari's Go binding uses purego/dlopen. That makes the otherwise CGO-free Go
+# executable dynamically depend on the builder's libc loader. Build on glibc so
+# the executable is compatible with the Ubuntu runtime below; an Alpine (musl)
+# build fails at container start with the misleading "no such file or directory".
+FROM --platform=$BUILDPLATFORM golang:${GOVERSION}-bookworm AS builder
 ARG TARGETOS
 ARG TARGETARCH
 WORKDIR /app
 COPY go.mod go.sum ./
-RUN apk add --no-cache git
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends git ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 COPY . .
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg/mod \
