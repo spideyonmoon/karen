@@ -67,6 +67,13 @@ type RipState struct {
 	failMu   sync.Mutex
 	failures []string
 
+	// releaseWarnings contains only the FINAL result of the cheap post-release
+	// reconciliation pass. Attempt-level failures live in failures above; keeping
+	// this separate means a track that succeeds on retry does not produce a false
+	// "incomplete release" warning to the user.
+	releaseWarnMu sync.Mutex
+	releaseWarnings []string
+
 	// WrapperBudget caps concurrent tracks for this rip. The value is derived from
 	// the account count reported by the shared v2 wrapper-manager. The head uses all
 	// account slots; a borrower is granted a smaller share by the scheduler.
@@ -955,4 +962,31 @@ func (rs *RipState) failureSummary() string {
 	rs.failMu.Lock()
 	defer rs.failMu.Unlock()
 	return summarizeFailures(rs.failures)
+}
+
+func (rs *RipState) recordReleaseWarning(msg string) {
+	msg = strings.TrimSpace(msg)
+	if msg == "" {
+		return
+	}
+	if rs == nil {
+		releaseWarningMu.Lock()
+		defer releaseWarningMu.Unlock()
+		lastReleaseWarnings = append(lastReleaseWarnings, msg)
+		return
+	}
+	rs.releaseWarnMu.Lock()
+	rs.releaseWarnings = append(rs.releaseWarnings, msg)
+	rs.releaseWarnMu.Unlock()
+}
+
+func (rs *RipState) releaseWarningSummary() string {
+	if rs == nil {
+		releaseWarningMu.Lock()
+		defer releaseWarningMu.Unlock()
+		return summarizeFailures(lastReleaseWarnings)
+	}
+	rs.releaseWarnMu.Lock()
+	defer rs.releaseWarnMu.Unlock()
+	return summarizeFailures(rs.releaseWarnings)
 }

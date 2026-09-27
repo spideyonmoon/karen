@@ -69,6 +69,8 @@ var (
 	searchMetaByID        = make(map[string]AudioMeta)
 	downloadFailureMu     sync.Mutex
 	lastDownloadFailures  []string
+	releaseWarningMu      sync.Mutex
+	lastReleaseWarnings   []string
 )
 
 type AudioMeta struct {
@@ -247,6 +249,9 @@ func resetDownloadFailures() {
 	downloadFailureMu.Lock()
 	lastDownloadFailures = nil
 	downloadFailureMu.Unlock()
+	releaseWarningMu.Lock()
+	lastReleaseWarnings = nil
+	releaseWarningMu.Unlock()
 }
 
 func recordDownloadFailure(ctx context.Context, format string, args ...any) {
@@ -821,12 +826,151 @@ func withWrapperRetry(ctx context.Context, op string, fn func(wm *wmclient.Clien
 	return err
 }
 
-func ripTrack(track *task.Track, token string, ctx context.Context) {
+type trackOutcome uint8
+
+const (
+	trackNotAttempted trackOutcome = iota
+	trackSucceeded
+	trackRetryableFailure
+	trackUnavailable
+	trackCancelled
+)
+
+// runTrackAttempt contains an unforeseen per-track panic and turns it into a
+// retryable result. Callers can therefore reconcile a release without a panic in
+// one malformed track taking down the whole bot.
+func runTrackAttempt(track *task.Track, token string, ctx context.Context) (outcome trackOutcome) {
+	outcome = trackRetryableFailure
+	defer func() {
+		if r := recover(); r != nil {
+			recordDownloadFailure(ctx, "%s: internal error: %v", track.Name, r)
+			ctr := ripStateFrom(ctx).ctr()
+			ctr.Inc(&ctr.Error)
+		}
+	}()
+	return ripTrack(track, token, ctx)
+}
+
+// prepareTrackRetry removes an incomplete first-attempt output so ripTrack cannot
+// mistake a partial fMP4/remux/tag failure for a valid cached track. A completed
+// file held by another concurrent rip is left alone and can be reused safely.
+func prepareTrackRetry(track *task.Track, cfg structs.ConfigSet) {
+	if track == nil || track.SaveDir == "" || track.SaveName == "" {
+		return
+	}
+	trackPath := filepath.Join(track.SaveDir, track.SaveName)
+	if !isInUse(trackPath) {
+		_ = os.Remove(trackPath)
+		_ = os.Remove(trackPath + ".remux.m4a")
+	}
+	if cfg.ConvertAfterDownload && cfg.ConvertFormat != "" && !strings.EqualFold(cfg.ConvertFormat, "copy") {
+		convertedPath := strings.TrimSuffix(trackPath, filepath.Ext(trackPath)) + "." + strings.ToLower(cfg.ConvertFormat)
+		if !isInUse(convertedPath) {
+			_ = os.Remove(convertedPath)
+		}
+	}
+	track.SavePath = ""
+}
+
+// reconcileRelease performs a memory-only completeness check after an album's
+// first pass. Successful tracks are already recorded in okDict, including tracks
+// whose source files were uploaded and deleted by a mid-rip flush. Only ordinary
+// errors get one concurrent retry pass; known-unavailable tracks are reported but
+// not retried. The common all-success path only scans a short integer slice.
+func reconcileRelease(releaseID, releaseName string, tracks []task.Track, selected []int, outcomes []trackOutcome, token string, ctx context.Context, sem chan struct{}) {
+	if len(selected) == 0 || ctx.Err() != nil {
+		return
+	}
+	rs := ripStateFrom(ctx)
+	completed := 0
+	retryIndexes := make([]int, 0)
+	for _, taskNum := range selected {
+		if rs.isDone(releaseID, taskNum) {
+			completed++
+			continue
+		}
+		idx := taskNum - 1
+		if idx >= 0 && idx < len(outcomes) && outcomes[idx] == trackRetryableFailure {
+			retryIndexes = append(retryIndexes, idx)
+		}
+	}
+
+	if len(retryIndexes) == 0 && completed == len(selected) {
+		fmt.Printf("Release check: %d/%d tracks complete.\n", completed, len(selected))
+		return
+	}
+
+	if len(retryIndexes) > 0 {
+		fmt.Printf("Release check: %d/%d tracks complete; retrying %d failed track(s).\n", completed, len(selected), len(retryIndexes))
+		cfg := rs.ripConfig()
+		for _, idx := range retryIndexes {
+			prepareTrackRetry(&tracks[idx], cfg)
+		}
+		var retryWG sync.WaitGroup
+		for _, idx := range retryIndexes {
+			idx := idx
+			retryWG.Add(1)
+			sem <- struct{}{}
+			go func() {
+				defer retryWG.Done()
+				defer func() { <-sem }()
+				next := runTrackAttempt(&tracks[idx], token, ctx)
+				// A cancelled attempt exits before ripTrack increments Total. Keep the
+				// original failure accounting in that case; otherwise replace it with
+				// the retry's final result.
+				if next != trackCancelled {
+					rs.ctr().ReconcileErrorRetry()
+					outcomes[idx] = next
+				}
+			}()
+		}
+		retryWG.Wait()
+	}
+
+	if ctx.Err() != nil {
+		return
+	}
+	completed = 0
+	missing := make([]string, 0)
+	for _, taskNum := range selected {
+		if rs.isDone(releaseID, taskNum) {
+			completed++
+			continue
+		}
+		name := fmt.Sprintf("track %d", taskNum)
+		idx := taskNum - 1
+		if idx >= 0 && idx < len(tracks) && strings.TrimSpace(tracks[idx].Name) != "" {
+			name = fmt.Sprintf("%02d %s", taskNum, strings.TrimSpace(tracks[idx].Name))
+		}
+		missing = append(missing, name)
+	}
+	if len(missing) == 0 {
+		fmt.Printf("Release check: %d/%d tracks complete after retry.\n", completed, len(selected))
+		return
+	}
+
+	display := missing
+	if len(display) > 3 {
+		display = display[:3]
+	}
+	detail := strings.Join(display, ", ")
+	if len(missing) > len(display) {
+		detail += fmt.Sprintf(", and %d more", len(missing)-len(display))
+	}
+	if strings.TrimSpace(releaseName) == "" {
+		releaseName = releaseID
+	}
+	warning := fmt.Sprintf("%s: %d/%d track(s) missing after release check (%s)", releaseName, len(missing), len(selected), detail)
+	fmt.Println("Release incomplete:", warning)
+	rs.recordReleaseWarning(warning)
+}
+
+func ripTrack(track *task.Track, token string, ctx context.Context) trackOutcome {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if ctx.Err() != nil {
-		return
+		return trackCancelled
 	}
 	var err error
 	rs := ripStateFrom(ctx)
@@ -850,10 +994,10 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 		if err != nil {
 			fmt.Println("\u26A0 Failed to dl MV:", err)
 			ctr.Inc(&ctr.Error)
-			return
+			return trackRetryableFailure
 		}
 		ctr.Inc(&ctr.Success)
-		return
+		return trackSucceeded
 	}
 
 	needDlAacLc := false
@@ -865,7 +1009,7 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 			fmt.Println("Unavailable")
 			recordDownloadFailure(ctx, "%s: Dolby Atmos is unavailable", track.Name)
 			ctr.Inc(&ctr.Unavailable)
-			return
+			return trackUnavailable
 		}
 		fmt.Println("Unavailable, trying to dl aac-lc")
 		needDlAacLc = true
@@ -882,8 +1026,12 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 		if err != nil {
 			fmt.Println("Failed to get AAC-LC playback URL:", err)
 			recordDownloadFailure(ctx, "%s: AAC-LC WebPlayback failed: %v", track.Name, err)
+			if isTransientWrapperErr(err) {
+				ctr.Inc(&ctr.Error)
+				return trackRetryableFailure
+			}
 			ctr.Inc(&ctr.Unavailable)
-			return
+			return trackUnavailable
 		}
 	} else {
 		err = withWrapperRetry(ctx, "M3U8", func(wm *wmclient.Client) error {
@@ -894,8 +1042,12 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 		if err != nil {
 			fmt.Println("Failed to get ALAC/Atmos playback URL:", err)
 			recordDownloadFailure(ctx, "%s: ALAC/Atmos M3U8 failed: %v", track.Name, err)
+			if isTransientWrapperErr(err) {
+				ctr.Inc(&ctr.Error)
+				return trackRetryableFailure
+			}
 			ctr.Inc(&ctr.Unavailable)
-			return
+			return trackUnavailable
 		}
 	}
 
@@ -911,7 +1063,7 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 			fmt.Println("Failed to extract quality from manifest.\n", err)
 			recordDownloadFailure(ctx, "%s: failed to read quality from manifest: %v", track.Name, err)
 			ctr.Inc(&ctr.Error)
-			return
+			return trackRetryableFailure
 		}
 		if variantURL != "" {
 			downloadM3u8 = variantURL
@@ -1025,7 +1177,7 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 		recordDownloadedTrack(ctx, track)
 		ctr.Inc(&ctr.Success)
 		rs.markDone(track.PreID, track.TaskNum)
-		return
+		return trackSucceeded
 	}
 	if considerConverted {
 		existsConverted, err2 := fileExists(convertedPath)
@@ -1036,7 +1188,7 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 			recordDownloadedTrack(ctx, track)
 			ctr.Inc(&ctr.Success)
 			rs.markDone(track.PreID, track.TaskNum)
-			return
+			return trackSucceeded
 		}
 	}
 
@@ -1078,7 +1230,7 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 			fmt.Println("Widevine fallback failed:", werr)
 			recordDownloadFailure(ctx, "%s: no FairPlay key; Widevine fallback failed: %v", track.Name, werr)
 			ctr.Inc(&ctr.Unavailable)
-			return
+			return trackUnavailable
 		}
 		err = nil // Widevine rip wrote trackPath; continue the normal pipeline.
 	}
@@ -1087,10 +1239,10 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 		recordDownloadFailure(ctx, "%s: download/decrypt failed: %v", track.Name, err)
 		if strings.Contains(err.Error(), "Unavailable") {
 			ctr.Inc(&ctr.Unavailable)
-			return
+			return trackUnavailable
 		}
 		ctr.Inc(&ctr.Error)
-		return
+		return trackRetryableFailure
 	}
 
 	{
@@ -1107,13 +1259,13 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 			fmt.Printf("Failed to remux fMP4: %v. Output: %s\n", err, string(out))
 			recordDownloadFailure(ctx, "%s: ffmpeg remux failed: %v, output: %s", track.Name, err, string(out))
 			ctr.Inc(&ctr.Error)
-			return
+			return trackRetryableFailure
 		}
 		if err := os.Rename(remuxPath, trackPath); err != nil {
 			fmt.Println("Failed to replace with remuxed file:", err)
 			recordDownloadFailure(ctx, "%s: rename failed: %v", track.Name, err)
 			ctr.Inc(&ctr.Error)
-			return
+			return trackRetryableFailure
 		}
 	}
 
@@ -1132,8 +1284,8 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 	if err != nil {
 		fmt.Println("\u26A0 Failed to write tags in media:", err)
 		recordDownloadFailure(ctx, "%s: failed to write MP4 tags: %v", track.Name, err)
-		ctr.Inc(&ctr.Unavailable)
-		return
+		ctr.Inc(&ctr.Error)
+		return trackRetryableFailure
 	}
 
 	// Clean up per-track cover written above (not the shared album cover).
@@ -1146,6 +1298,7 @@ func ripTrack(track *task.Track, token string, ctx context.Context) {
 	recordDownloadedTrack(ctx, track)
 	ctr.Inc(&ctr.Success)
 	rs.markDone(track.PreID, track.TaskNum)
+	return trackSucceeded
 }
 
 func ripStation(albumId string, token string, storefront string, ctx context.Context) error {
@@ -1747,12 +1900,14 @@ func ripAlbum(albumId string, token string, storefront string, urlArg_i string, 
 	// which only makes the head marginally more willing to lend — harmless.)
 	rs.planTracks(len(selected))
 	sem := make(chan struct{}, concurrency)
+	outcomes := make([]trackOutcome, len(album.Tracks))
 	var wg sync.WaitGroup
 	for i := range album.Tracks {
 		i++
 		if rs.isDone(albumId, i) {
 			ctr.Inc(&ctr.Total)
 			ctr.Inc(&ctr.Success)
+			outcomes[i-1] = trackSucceeded
 			continue
 		}
 		if !isInArray(selected, i) {
@@ -1767,22 +1922,14 @@ func ripAlbum(albumId string, token string, storefront string, urlArg_i string, 
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(idx int) {
-			// Contain any unforeseen panic in a single track so it degrades to one
-			// failed track instead of crashing the whole process (and every other
-			// concurrent rip). Registered first so it runs after the resource defers.
-			defer func() {
-				if r := recover(); r != nil {
-					recordDownloadFailure(ctx, "%s: internal error: %v", album.Tracks[idx].Name, r)
-					ctr.Inc(&ctr.Error)
-				}
-			}()
 			defer wg.Done()
 			defer rs.trackDone()
 			defer func() { <-sem }()
-			ripTrack(&album.Tracks[idx], token, ctx)
+			outcomes[idx] = runTrackAttempt(&album.Tracks[idx], token, ctx)
 		}(trackIdx)
 	}
 	wg.Wait()
+	reconcileRelease(albumId, album.SaveName, album.Tracks, selected, outcomes, token, ctx, sem)
 	return nil
 
 }

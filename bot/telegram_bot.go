@@ -3735,6 +3735,9 @@ func (b *TelegramBot) runDownload(req *downloadRequest) {
 	}
 
 	rs.setProgressFactory(nil)
+	if warning := rs.releaseWarningSummary(); warning != "" {
+		_ = b.sendMessageWithReply(chatID, "⚠️ Release incomplete after the automatic retry:\n"+warning, nil, replyToID)
+	}
 
 	// remainderPaths is the tail not already delivered by a mid-rip flush. With no
 	// flushing it is every downloaded file, identical to before.

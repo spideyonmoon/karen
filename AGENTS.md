@@ -44,6 +44,7 @@ cp .env.example .env
 ## Architecture
 - **Single sequential download worker** — `startDownloadWorker()` reads from a buffered chan (cap 20). One download at a time due to package-level globals.
 - **HTTP + local Temari decryption** — `bot/utils/wmclient/client.go` calls wrapper-manager v2's JSON endpoints. `DownloadAndDecrypt()` downloads fMP4 segments via HLS, obtains `/key` templates, decrypts sample batches locally through Temari's Go binding, and remuxes with `ffmpeg -c copy`.
+- **Post-release reconciliation** — after every album's first pass, `reconcileRelease()` compares the selected track numbers against the per-rip in-memory completion ledger (so it still works after mid-rip Gofile flushes delete source files). The all-green path is an O(tracks) memory scan. Ordinary failures get one concurrent retry after partial outputs are removed; known-unavailable tracks are not retried. Any final gaps are reported to the user while completed files still deliver normally.
 - **Multi-account gateway** — one wrapper-manager supervises one lightweight `wrapper-lite-rootless` process per Apple account and routes requests by region. Karen reads `/status.clientCount` to retain its account-sized concurrent track budget.
 - **Three delivery modes** (user picks via inline keyboard):
   1. Telegram Bot API — single tracks <50MB
