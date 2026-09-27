@@ -89,6 +89,15 @@ for ((i = 1; i <= N; i++)); do
 done
 mv "$REGISTRY_TMP" "$ACCOUNT_REGISTRY"
 
-# 5. Start the bot
-"${DC[@]}" up -d --build bot
+# 5. Start the bot. Account-only setup runs should reuse the already-deployed
+# bot image: recompiling the large Go package is unnecessary and can take many
+# minutes on a small VPS. A fresh VPS has no bot image yet, so build it once.
+BOT_IMAGE_ID="$("${DC[@]}" images -q bot 2>/dev/null || true)"
+if [[ -n "$BOT_IMAGE_ID" ]]; then
+  echo "Recreating bot with the existing image (skipping Go rebuild) ..."
+  "${DC[@]}" up -d --no-build --force-recreate bot
+else
+  echo "No existing bot image found; building it for the first setup ..."
+  "${DC[@]}" up -d --build bot
+fi
 echo "Setup complete. Tail logs with: docker compose logs -f bot"
