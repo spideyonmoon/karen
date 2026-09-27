@@ -43,7 +43,10 @@ COPY --from=bento4 /bento4/cmakebuild/mp4decrypt /usr/local/bin/mp4decrypt
 COPY --from=builder /bin/apple-music-dl /usr/local/bin/apple-music-dl
 COPY --from=builder /bin/libtemari.so /usr/local/lib/libtemari.so
 WORKDIR /app
-COPY config.yaml ./
+# Compose bind-mounts the generated config.yaml in production. Keep a harmless
+# fallback in the image for standalone inspection/CI without making generated
+# config part of the build context (which would invalidate the Go build cache).
+COPY config.yaml.example ./config.yaml
 RUN echo 'alac-save-folder: "/downloads/ALAC"' >> config.yaml \
     && echo 'atmos-save-folder: "/downloads/Atmos"' >> config.yaml \
     && echo 'aac-save-folder: "/downloads/AAC"' >> config.yaml

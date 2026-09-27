@@ -17,6 +17,7 @@ cp .env.example .env
 - All `APPLE_ID_N`/`APPLE_PASS_N` pairs are logged into one wrapper-manager v2 gateway at `karen-wrapper-manager:8080`; its account count drives Karen's track concurrency.
 - `storefront` is fixed to `us` in the generator (not in `.env`). Authoritative non-secret config values live in `generate.sh`'s heredoc, NOT `bot/config.yaml.example` (kept only as human reference and may drift).
 - `setup.sh` = full bootstrap (generate + build + HTTP account reconciliation/login + start). Re-run it when the account list changes; 2FA is prompted interactively when required.
+- Bot rebuild detection is automatic. `setup.sh` always lets Docker inspect the tightly scoped `bot/` build context: bot-code changes rebuild, while generated config/account/runtime-state changes hit the existing compiled layer. No special build flag is needed.
 - Gitignored: `.env`, `docker-compose.override.yml`, `bot/config.yaml`, `bot/state/`, `bot/downloads/`, `.logins/v3-accounts.txt`.
 
 ## Day-2 operations (steady state)

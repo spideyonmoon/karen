@@ -28,4 +28,4 @@ jobs:
             # manager + HTTP login helper, reconciles Apple accounts, and rebuilds
             # the Temari-enabled bot. On the first v3 deploy it also removes the old
             # wrapper containers while preserving their volumes for rollback.
-            BUILD_BOT=1 ./setup.sh
+            ./setup.sh
