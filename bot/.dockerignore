@@ -1,8 +1,13 @@
-# Keep the Docker build context small. Without this, `build: ./bot` ships the
-# entire bot/ folder to the daemon every build — including the multi-GB live
-# downloads folder and runtime caches. The build only needs Go sources +
-# config.yaml (see Dockerfile), so exclude everything runtime-generated.
+# Keep the Docker build context deterministic. Production config is bind-mounted
+# and runtime state changes constantly; neither may invalidate the expensive Go
+# build layer. The image carries config.yaml.example only as a standalone fallback.
 downloads/
+state/
+config.yaml
 telegram-cache.json
+telegram-state.json
+telegram-schedule.json
+mtproto-session.json
+karen-state-*.json
 *.zip
 *.log

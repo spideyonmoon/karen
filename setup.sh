@@ -89,19 +89,10 @@ for ((i = 1; i <= N; i++)); do
 done
 mv "$REGISTRY_TMP" "$ACCOUNT_REGISTRY"
 
-# 5. Start the bot. Account-only setup runs should reuse the already-deployed
-# bot image: recompiling the large Go package is unnecessary and can take many
-# minutes on a small VPS. CI sets BUILD_BOT=1 for code deployments; a fresh VPS
-# also has no bot image yet, so both of those cases still build normally.
-BOT_IMAGE_ID="$("${DC[@]}" images -q bot 2>/dev/null || true)"
-if [[ "${BUILD_BOT:-0}" == "1" ]]; then
-  echo "Code deployment requested; rebuilding the bot image ..."
-  "${DC[@]}" up -d --build bot
-elif [[ -n "$BOT_IMAGE_ID" ]]; then
-  echo "Recreating bot with the existing image (skipping Go rebuild) ..."
-  "${DC[@]}" up -d --no-build --force-recreate bot
-else
-  echo "No existing bot image found; building it for the first setup ..."
-  "${DC[@]}" up -d --build bot
-fi
+# 5. Start the bot. Docker now sees only real image inputs: generated config and
+# mutable runtime state are excluded by bot/.dockerignore. Its cache therefore
+# makes this automatic — code changes rebuild, while account-only setup runs reuse
+# the compiled layer. Force a recreate so the bot re-reads config and account count.
+echo "Starting bot (rebuilds automatically only when bot code changed) ..."
+"${DC[@]}" up -d --build --force-recreate bot
 echo "Setup complete. Tail logs with: docker compose logs -f bot"
