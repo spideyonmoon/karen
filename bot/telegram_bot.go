@@ -3337,6 +3337,9 @@ func (b *TelegramBot) ripCollectionWithCatalog(ctx context.Context, chatID int64
 	// Rip only the gaps. ripSong appends each file to the worker's RipState, which
 	// runDownload then uploads (IndexInline) + delivers via deliverAudioViaPool.
 	var firstErr error
+	if info.isPlaylist {
+		ctx = context.WithValue(ctx, playlistCollectionKey{}, info)
+	}
 	for _, id := range missIDs {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -3370,6 +3373,8 @@ type collectionMeta struct {
 	contentRating string // album only ("explicit" | "clean" | "")
 	isPlaylist    bool
 }
+
+type playlistCollectionKey struct{}
 
 // fetchCollection expands an album or playlist (a single catalog API fetch, no
 // rip) into its ordered track ids and cover metadata. Returns ok=false on any fetch
@@ -3442,6 +3447,9 @@ func (b *TelegramBot) sendCollectionCover(chatID int64, m *collectionMeta, forma
 // file-based buildCoverCaption can't be used — a cached delivery has no files).
 // Quality is the requested tier; exact bit depth/sample rate isn't stored per row.
 func buildCachedCoverCaption(m *collectionMeta, format string, totalTracks int) string {
+	if m.isPlaylist {
+		return buildPlaylistCoverCaption(m.name, totalTracks)
+	}
 	lines := []string{}
 	if m.artist != "" {
 		lines = append(lines, fmt.Sprintf("Artist : %s", m.artist))
@@ -3824,12 +3832,7 @@ func (b *TelegramBot) deliverTelegramIndividual(chatID int64, paths []string, re
 
 	sentAny := false
 	// Send cover art as standalone photo with album info
-	if len(paths) > 0 {
-		if coverPath := findCoverFile(filepath.Dir(paths[0])); coverPath != "" {
-			coverCaption := buildCoverCaption(ctx, paths)
-			_ = b.sendPhotoWithReply(chatID, coverPath, coverCaption, replyToID)
-		}
-	}
+	b.sendDownloadedCollectionCover(ctx, chatID, paths, replyToID)
 
 	// Send animated artwork as labeled videos right after the cover photo,
 	// then exclude them from the regular track delivery.
@@ -4190,12 +4193,7 @@ func (b *TelegramBot) deliverTelegramIndividualFallback(chatID int64, paths []st
 	sentAny := false
 	var lastErr error
 	// Send cover art as standalone photo with album info
-	if len(paths) > 0 {
-		if coverPath := findCoverFile(filepath.Dir(paths[0])); coverPath != "" {
-			coverCaption := buildCoverCaption(ctx, paths)
-			_ = b.sendPhotoWithReply(chatID, coverPath, coverCaption, replyToID)
-		}
-	}
+	b.sendDownloadedCollectionCover(ctx, chatID, paths, replyToID)
 	// Send animated artwork as labeled videos, then exclude from track delivery.
 	var remaining []string
 	for _, p := range paths {
@@ -4353,12 +4351,7 @@ func (b *TelegramBot) deliverGofileZip(chatID int64, paths []string, replyToID i
 		sentAny := false
 		var lastErr error
 		// Send cover art as standalone photo with album info
-		if len(paths) > 0 {
-			if coverPath := findCoverFile(filepath.Dir(paths[0])); coverPath != "" {
-				coverCaption := buildCoverCaption(ctx, paths)
-				_ = b.sendPhotoWithReply(chatID, coverPath, coverCaption, replyToID)
-			}
-		}
+		b.sendDownloadedCollectionCover(ctx, chatID, paths, replyToID)
 		// Send animated artwork as Telegram videos before Gofile uploads.
 		var gofilePaths []string
 		for _, p := range paths {
@@ -8098,6 +8091,15 @@ func buildCoverCaption(ctx context.Context, paths []string) string {
 	if len(paths) == 0 {
 		return ""
 	}
+	for _, p := range paths {
+		if meta, ok := getDownloadedMeta(ctx, p); ok && meta.PlaylistName != "" {
+			total := meta.PlaylistTrackCount
+			if total <= 0 {
+				total = len(paths)
+			}
+			return buildPlaylistCoverCaption(meta.PlaylistName, total)
+		}
+	}
 	artist := ""
 	albumName := ""
 	releaseDate := ""
@@ -8105,8 +8107,6 @@ func buildCoverCaption(ctx context.Context, paths []string) string {
 	quality := ""
 	codec := ""
 	actualFormat := ""
-	playlistName := ""
-	playlistArtist := ""
 
 	for _, p := range paths {
 		if meta, ok := getDownloadedMeta(ctx, p); ok {
@@ -8131,20 +8131,7 @@ func buildCoverCaption(ctx context.Context, paths []string) string {
 			if codec == "" && meta.Codec != "" {
 				codec = meta.Codec
 			}
-			if playlistName == "" && meta.PlaylistName != "" {
-				playlistName = meta.PlaylistName
-				playlistArtist = meta.PlaylistArtist
-			}
 		}
-	}
-
-	// For a playlist, the per-track album/artist describe individual songs, so the
-	// aggregate caption would otherwise masquerade as the first track's album.
-	// Present the playlist's own identity instead (track count already correct).
-	if playlistName != "" {
-		albumName = playlistName
-		artist = playlistArtist
-		releaseDate = ""
 	}
 
 	if albumName == "" {
@@ -8167,8 +8154,7 @@ func buildCoverCaption(ctx context.Context, paths []string) string {
 		lines = append(lines, fmt.Sprintf("Artist : %s", artist))
 	}
 	lines = append(lines, fmt.Sprintf("Album : %s", albumName))
-	// Release Date is omitted for playlists (it has no single meaningful value)
-	// and whenever it's otherwise unknown, rather than printing a blank field.
+	// Omit an unknown release date rather than printing a blank field.
 	if releaseDate != "" {
 		lines = append(lines, fmt.Sprintf("Release Date : %s", releaseDate))
 	}
@@ -8178,6 +8164,31 @@ func buildCoverCaption(ctx context.Context, paths []string) string {
 		fmt.Sprintf("Explicit : %s", explicit),
 	)
 	return strings.Join(lines, "\n")
+}
+
+func buildPlaylistCoverCaption(name string, totalTracks int) string {
+	return fmt.Sprintf("Playlist : %s\nTotal Tracks : %d", name, totalTracks)
+}
+
+// Playlist gap tracks live in their own album folders. Use the playlist's
+// artwork explicitly rather than discovering a song's album cover there.
+func (b *TelegramBot) sendDownloadedCollectionCover(ctx context.Context, chatID int64, paths []string, replyToID int) {
+	if len(paths) == 0 {
+		return
+	}
+	for _, p := range paths {
+		if meta, ok := getDownloadedMeta(ctx, p); ok && meta.PlaylistName != "" {
+			b.sendCollectionCover(chatID, &collectionMeta{
+				name:       meta.PlaylistName,
+				artworkURL: meta.PlaylistArtworkURL,
+				isPlaylist: true,
+			}, "", meta.PlaylistTrackCount, replyToID)
+			return
+		}
+	}
+	if coverPath := findCoverFile(filepath.Dir(paths[0])); coverPath != "" {
+		_ = b.sendPhotoWithReply(chatID, coverPath, buildCoverCaption(ctx, paths), replyToID)
+	}
 }
 
 // formatQualityDisplay renders the caption's Quality field as "<codec> <spec>",
