@@ -3231,11 +3231,9 @@ func (b *TelegramBot) catalogTryServeTrack(chatID int64, replyToID int, trackID,
 // serially on the update loop and must not block.
 //
 // In the worker it expands the collection to its ordered track ids, looks each up
-// in the catalog, copies the cached tracks straight from the dump, and rips ONLY
-// the misses (which then flow through the normal upload→IndexInline→deliver path,
-// so they become HITs next time). A fully-cached collection rips nothing; a cold
-// one (no hits) falls back to the whole-collection rip. Cached tracks arrive first,
-// gaps follow as they finish (strict album order isn't required, per design).
+// in the catalog, and rips ONLY the misses. After ripping and uploading, cached
+// and fresh tracks are delivered together in collection order. A fully-cached
+// collection rips nothing; a cold one falls back to the whole-collection rip.
 //
 // Only individual-track delivery is cached — album ZIPs are deliberately not
 // indexed (they bloat the DB and duplicate the per-track rows). kind is "album" or
@@ -3269,92 +3267,57 @@ func (b *TelegramBot) catalogServeCollection(chatID int64, kind, collectionID st
 	return true
 }
 
-// ripCollectionWithCatalog runs inside a download worker: it partitions the
-// collection into catalog hits and misses, delivers the hits from the dump, and
-// rips only the misses (via ripSong, which appends to the worker's shared RipState
-// so the post-rip pipeline uploads + indexes + delivers them). On a clean expansion
-// failure or zero hits it falls back to ripping the whole collection.
+// ripCollectionWithCatalog prepares an ordered delivery plan and rips only the
+// misses. Cached messages stay in the plan until runDownload's delivery phase.
 func (b *TelegramBot) ripCollectionWithCatalog(ctx context.Context, chatID int64, kind, collectionID string, replyToID int, variant, format string, forceAAC bool) error {
+	plan, _ := ctx.Value(collectionDeliveryKey{}).(*collectionDeliveryPlan)
 	info, ok := b.fetchCollection(kind, collectionID)
-	if !ok || len(info.trackIDs) == 0 {
+	if plan == nil || !ok || len(info.trackIDs) == 0 {
 		return b.ripWholeCollection(ctx, kind, collectionID, forceAAC)
 	}
 
-	// Partition. We're off the update loop, so the per-track lookups are fine here.
-	type chit struct {
-		trackID string
-		msgID   int
-	}
-	var dumpID int64
-	var hits []chit
-	var missIDs []string
-	for _, tid := range info.trackIDs {
+	tracks := make([]collectionDeliveryTrack, len(info.trackIDs))
+	hits := 0
+	for i, tid := range info.trackIDs {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		tracks[i].trackID = tid
 		adamID, _ := strconv.ParseInt(tid, 10, 64)
 		if adamID == 0 {
-			missIDs = append(missIDs, tid)
 			continue
 		}
 		h, found, err := b.catalog.Lookup(ctx, catalog.KindTrack, adamID, "", variant)
 		if err != nil {
 			fmt.Printf("catalog lookup track %d (collection %s): %v\n", adamID, collectionID, err)
-			missIDs = append(missIDs, tid)
 			continue
 		}
-		if !found {
-			missIDs = append(missIDs, tid)
-			continue
+		if found && h.DumpID != 0 && h.MsgID != 0 {
+			tracks[i].dumpID, tracks[i].msgID = h.DumpID, h.MsgID
+			hits++
 		}
-		dumpID = h.DumpID
-		hits = append(hits, chit{trackID: tid, msgID: h.MsgID})
 	}
-
-	// No hits → ripping the whole collection is cheaper than a per-song gap loop and
-	// keeps the normal progress board.
-	if len(hits) == 0 {
+	if hits == 0 {
 		return b.ripWholeCollection(ctx, kind, collectionID, forceAAC)
 	}
 
-	// Fully cached (no gaps) → the gap rip that normally sends the standalone cover
-	// photo won't run, so send it here first (matching the fresh-rip order). A partial
-	// album instead gets its cover from the gap delivery (deliverTelegramIndividual).
-	if len(missIDs) == 0 {
-		b.sendCollectionCover(chatID, info, format, len(hits), replyToID)
-	}
-
-	// Deliver the cached tracks; a stale pointer fails the whole batch, so failures
-	// are retried per-message and any straggler is folded back into the rip set.
-	delivered := len(hits)
-	if dumpID != 0 {
-		msgIDs := make([]int, len(hits))
-		for i := range hits {
-			msgIDs[i] = hits[i].msgID
-		}
-		failedIdx := b.deliverHitsInOrder(ctx, dumpID, msgIDs, chatID, replyToID)
-		delivered -= len(failedIdx)
-		for _, fi := range failedIdx {
-			missIDs = append(missIDs, hits[fi].trackID)
-		}
-	}
-	// Record the cache deliveries so runDownload reports success even when there are
-	// no gaps to rip (empty path remainder).
-	ripStateFrom(ctx).markCacheDelivered(delivered)
-	fmt.Printf("catalog collection %s: %d cached delivered, %d to rip\n", collectionID, delivered, len(missIDs))
-
-	// Rip only the gaps. ripSong appends each file to the worker's RipState, which
-	// runDownload then uploads (IndexInline) + delivers via deliverAudioViaPool.
-	var firstErr error
+	plan.info, plan.tracks, plan.forceAAC = info, tracks, forceAAC
+	ripStateFrom(ctx).setFlush(ripFlushThresholdBytes(), plan.stageChunk)
 	if info.isPlaylist {
 		ctx = context.WithValue(ctx, playlistCollectionKey{}, info)
 	}
-	for _, id := range missIDs {
+	for _, track := range tracks {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := ripSong(id, b.appleToken, Config.Storefront, forceAAC, ctx); err != nil && firstErr == nil {
-			firstErr = err
+		if track.msgID != 0 {
+			continue
+		}
+		if err := ripSong(track.trackID, b.appleToken, Config.Storefront, forceAAC, ctx); err != nil {
+			recordDownloadFailure(ctx, "Track %s: %v", track.trackID, err)
 		}
 	}
-	return firstErr
+	return ctx.Err()
 }
 
 // ripWholeCollection rips an entire album or playlist, exactly as the pre-D9 path
@@ -3492,43 +3455,6 @@ func cachedQualityLabel(format string) string {
 		return "Unknown"
 	}
 	return strings.ToUpper(format)
-}
-
-// deliverHitsInOrder copies cached dump messages (in track order) to the recipient
-// via the pool's batch forward, chunked under Telegram's per-forward cap. A batch
-// forward fails wholesale if any id is stale/deleted, so a failed chunk is retried
-// per-message; the indices (into msgIDs) of messages that STILL fail are returned
-// so the caller can rip those tracks instead.
-func (b *TelegramBot) deliverHitsInOrder(ctx context.Context, dumpID int64, msgIDs []int, chatID int64, replyToID int) []int {
-	var failed []int
-	const fwdChunk = 90 // Telegram caps a single forward at 100 ids
-	for s := 0; s < len(msgIDs); s += fwdChunk {
-		e := s + fwdChunk
-		if e > len(msgIDs) {
-			e = len(msgIDs)
-		}
-		if ctx.Err() != nil {
-			for k := s; k < len(msgIDs); k++ {
-				failed = append(failed, k)
-			}
-			return failed
-		}
-		if err := b.pool.DeliverManyFromDump(ctx, dumpID, msgIDs[s:e], chatID, replyToID); err == nil {
-			continue
-		}
-		// Batch failed → retry this chunk one message at a time; record stragglers.
-		for k := s; k < e; k++ {
-			if ctx.Err() != nil {
-				failed = append(failed, k)
-				continue
-			}
-			if err := b.deliverFromDump(ctx, dumpID, msgIDs[k], chatID, replyToID); err != nil {
-				fmt.Printf("catalog deliver (dump=%d msg=%d): %v\n", dumpID, msgIDs[k], err)
-				failed = append(failed, k)
-			}
-		}
-	}
-	return failed
 }
 
 // catalogTryServeAlbumZip is the read-through HIT path for an album-as-zip
@@ -3729,6 +3655,11 @@ func (b *TelegramBot) runDownload(req *downloadRequest) {
 	}
 
 	status.Update("Downloading", 0, 0)
+	collectionPlan := &collectionDeliveryPlan{prepared: make(map[string]*preparedCollectionTrack)}
+	collectionPlan.stageChunk = func(ctx context.Context, paths []string, _ int, _ string) error {
+		return b.prepareCollectionPaths(ctx, collectionPlan, paths, format, status)
+	}
+	rctx = context.WithValue(rctx, collectionDeliveryKey{}, collectionPlan)
 	err = fn(rctx)
 	// Download phase done (success or not): free the head slot so the scheduler can
 	// promote the next head while this rip proceeds to deliver/upload. No-op on the
@@ -3751,19 +3682,16 @@ func (b *TelegramBot) runDownload(req *downloadRequest) {
 	// flushing it is every downloaded file, identical to before.
 	paths := rs.remainderPaths()
 	flushed := rs.flushedSomething()
+	if collectionPlan.info != nil {
+		b.deliverCatalogCollection(chatID, replyToID, format, status, rctx, collectionPlan, paths)
+		return
+	}
 	ctr := rs.ctr()
 	if len(paths) == 0 {
 		// If chunks were already flushed to Gofile, an empty remainder means the rip
 		// fully delivered in parts — report success, not "no files".
 		if flushed {
 			status.UpdateSync(fmt.Sprintf("✅ Delivered in %d part(s) to Gofile.", rs.flushSeq), 0, 0)
-			status.Stop()
-			return
-		}
-		// D9 read-through: a fully-cached collection delivers every track from the dump
-		// and rips nothing, so an empty remainder here is success, not failure.
-		if n := rs.cacheDeliveredCount(); n > 0 {
-			status.UpdateSync(fmt.Sprintf("✅ Delivered %d track(s) from cache.", n), 0, 0)
 			status.Stop()
 			return
 		}

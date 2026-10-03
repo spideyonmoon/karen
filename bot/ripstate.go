@@ -115,18 +115,6 @@ type RipState struct {
 	// Guarded by flushMu.
 	flushName string
 
-	// cacheDelivered counts tracks already delivered straight from the dump by the
-	// D9 read-through (catalogServeCollection) before/instead of ripping. When a
-	// fully-cached collection rips nothing, runDownload uses this to report success
-	// instead of "No files were downloaded".
-	cacheDelivered atomic.Int64
-
-	// dedup carries this rip's Gofile re-rip identity (see dedup.go) so each Gofile
-	// delivery can be recorded under the same content key the admission check used.
-	// nil when the rip isn't a dedup-tracked Gofile collection (single song, Telegram
-	// delivery, artwork, etc.), in which case recordGofileDelivery is a no-op.
-	dedup *gofileDedupInfo
-
 	// quotaOwnerCancel records that THIS rip was cancelled by its own requester
 	// (not an admin or a /restart). The per-day quota refund logic reads it to apply
 	// the user-only exemption: a user who bails after >50% of releases (or after a
@@ -555,6 +543,23 @@ func (rs *RipState) isDone(preID string, taskNum int) bool {
 	return isInArray(rs.okDict[preID], taskNum)
 }
 
+// A staged file may need ripping again if its dump message disappears after
+// disk reclamation. Clear the old completion marks before that recovery rip.
+func (rs *RipState) forgetDone(preID string) {
+	if preID == "" {
+		return
+	}
+	if rs == nil {
+		okDictMu.Lock()
+		delete(okDict, preID)
+		okDictMu.Unlock()
+		return
+	}
+	rs.okDictMu.Lock()
+	delete(rs.okDict, preID)
+	rs.okDictMu.Unlock()
+}
+
 // --- downloaded paths -----------------------------------------------------
 
 func (rs *RipState) addPath(p string) {
@@ -674,23 +679,6 @@ func (rs *RipState) markQuotaOwnerCancel() {
 // cancelled this rip. False on a nil receiver.
 func (rs *RipState) quotaCancelledByOwner() bool {
 	return rs != nil && rs.quotaOwnerCancel.Load()
-}
-
-// markCacheDelivered records that n tracks were delivered from the dump by the D9
-// read-through (no-op on the nil/CLI path).
-func (rs *RipState) markCacheDelivered(n int) {
-	if rs == nil || n <= 0 {
-		return
-	}
-	rs.cacheDelivered.Add(int64(n))
-}
-
-// cacheDeliveredCount returns how many tracks were delivered from the dump.
-func (rs *RipState) cacheDeliveredCount() int {
-	if rs == nil {
-		return 0
-	}
-	return int(rs.cacheDelivered.Load())
 }
 
 // remainderPaths returns the files not yet delivered by a mid-rip flush — i.e. the
