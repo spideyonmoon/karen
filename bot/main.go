@@ -98,8 +98,10 @@ type AudioMeta struct {
 	// PlaylistName / PlaylistArtist are set only when the track was downloaded as
 	// part of a playlist, so the Telegram caption can show the playlist's identity
 	// instead of masquerading as the first track's album. Empty for albums/songs.
-	PlaylistName   string
-	PlaylistArtist string
+	PlaylistName       string
+	PlaylistArtist     string
+	PlaylistArtworkURL string
+	PlaylistTrackCount int
 }
 
 func loadConfig() error {
@@ -187,6 +189,9 @@ func recordDownloadedTrack(ctx context.Context, track *task.Track) {
 	if track == nil || track.SavePath == "" {
 		return
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	rs := ripStateFrom(ctx)
 	rs.addPath(track.SavePath)
 	meta := AudioMeta{
@@ -209,6 +214,15 @@ func recordDownloadedTrack(ctx context.Context, track *task.Track) {
 	if track.PreType == "playlists" {
 		meta.PlaylistName = strings.TrimSpace(track.PlaylistData.Attributes.Name)
 		meta.PlaylistArtist = strings.TrimSpace(track.PlaylistData.Attributes.ArtistName)
+		meta.PlaylistArtworkURL = track.PlaylistData.Attributes.Artwork.URL
+		meta.PlaylistTrackCount = track.TaskTotal
+	}
+	// Catalog gap downloads use ripSong, whose task has no playlist parent.
+	if playlist, ok := ctx.Value(playlistCollectionKey{}).(*collectionMeta); ok {
+		meta.PlaylistName = playlist.name
+		meta.PlaylistArtist = playlist.artist
+		meta.PlaylistArtworkURL = playlist.artworkURL
+		meta.PlaylistTrackCount = len(playlist.trackIDs)
 	}
 	if meta.TrackID != "" {
 		if override, ok := popSearchMeta(meta.TrackID); ok {
