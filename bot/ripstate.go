@@ -116,6 +116,12 @@ type RipState struct {
 	// Guarded by flushMu.
 	flushName string
 
+	// dedup carries this rip's Gofile re-rip identity (see dedup.go) so each Gofile
+	// delivery can be recorded under the same content key the admission check used.
+	// nil when the rip isn't a dedup-tracked Gofile collection (single song, Telegram
+	// delivery, artwork, etc.), in which case recordGofileDelivery is a no-op.
+	dedup *gofileDedupInfo
+
 	// quotaOwnerCancel records that THIS rip was cancelled by its own requester
 	// (not an admin or a /restart). The per-day quota refund logic reads it to apply
 	// the user-only exemption: a user who bails after >50% of releases (or after a
