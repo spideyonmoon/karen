@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 )
@@ -82,5 +84,41 @@ func TestCollectionDeliveryHonorsBatchLimit(t *testing.T) {
 	})
 	if err != nil || n != 181 || !reflect.DeepEqual(sizes, []int{90, 90, 1}) {
 		t.Fatalf("delivered=%d, error=%v, batches=%v", n, err, sizes)
+	}
+}
+
+func TestCollectionDeliveryStagingReclaimsOnlySuccessfulChunks(t *testing.T) {
+	for _, failed := range []bool{false, true} {
+		t.Run(map[bool]string{false: "success", true: "upload failure"}[failed], func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "track.m4a")
+			if err := os.WriteFile(path, []byte("track audio"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			rs := newRipState()
+			defer rs.releaseAllHeld()
+			rs.addPath(path)
+			staged := false
+			rs.setStagingFlush(1, func(_ context.Context, paths []string, _ int, _ string) error {
+				staged = true
+				if !reflect.DeepEqual(paths, []string{path}) {
+					t.Fatalf("staged paths=%v", paths)
+				}
+				if failed {
+					return errors.New("dump unavailable")
+				}
+				return nil
+			})
+			rs.checkpointFlush(context.Background(), nil)
+			_, err := os.Stat(path)
+			if !staged || (failed && err != nil) || (!failed && !os.IsNotExist(err)) {
+				t.Fatalf("staged=%v, failed=%v, source error=%v", staged, failed, err)
+			}
+			if rs.flushedSomething() || rs.deliveredReleases() != 0 {
+				t.Fatal("staging must not count as user delivery or consume cancellation quota")
+			}
+			if remaining := rs.remainderPaths(); (len(remaining) == 1) != failed {
+				t.Fatalf("remainder paths=%v, failed=%v", remaining, failed)
+			}
+		})
 	}
 }

@@ -3302,7 +3302,7 @@ func (b *TelegramBot) ripCollectionWithCatalog(ctx context.Context, chatID int64
 	}
 
 	plan.info, plan.tracks, plan.forceAAC = info, tracks, forceAAC
-	ripStateFrom(ctx).setFlush(ripFlushThresholdBytes(), plan.stageChunk)
+	ripStateFrom(ctx).setStagingFlush(ripFlushThresholdBytes(), plan.stageChunk)
 	if info.isPlaylist {
 		ctx = context.WithValue(ctx, playlistCollectionKey{}, info)
 	}

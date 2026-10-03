@@ -103,6 +103,7 @@ type RipState struct {
 	// CLI / single-track / disabled paths, where checkpointFlush is a no-op.
 	flushMu        sync.Mutex
 	flushThreshold int64
+	flushStageOnly bool // dump staging reclaims disk without delivering to the user
 	flush          func(ctx context.Context, paths []string, part int, label string) error
 	flushSeq       int        // chunks flushed so far (→ "Part N")
 	flushStart     int        // index into paths of the first not-yet-flushed file
@@ -601,6 +602,18 @@ func (rs *RipState) setFlush(threshold int64, fn func(ctx context.Context, paths
 	rs.flushMu.Lock()
 	rs.flushThreshold = threshold
 	rs.flush = fn
+	rs.flushStageOnly = false
+	rs.flushMu.Unlock()
+}
+
+func (rs *RipState) setStagingFlush(threshold int64, fn func(context.Context, []string, int, string) error) {
+	if rs == nil {
+		return
+	}
+	rs.flushMu.Lock()
+	rs.flushThreshold = threshold
+	rs.flush = fn
+	rs.flushStageOnly = true
 	rs.flushMu.Unlock()
 }
 
@@ -646,6 +659,9 @@ func (rs *RipState) deliveredReleases() int {
 	}
 	rs.flushMu.Lock()
 	defer rs.flushMu.Unlock()
+	if rs.flushStageOnly {
+		return 0
+	}
 	return rs.flushSeq
 }
 
@@ -779,7 +795,9 @@ func (rs *RipState) checkpointFlush(ctx context.Context, drain func()) {
 	rs.flushStart = chunkEnd
 	rs.measuredIdx = chunkEnd
 	rs.pendingBytes = 0
-	rs.flushedAny.Store(true)
+	if !rs.flushStageOnly {
+		rs.flushedAny.Store(true)
+	}
 	rs.flushMu.Unlock()
 }
 
@@ -832,7 +850,9 @@ func (rs *RipState) flushReleaseBoundary(ctx context.Context, label string) erro
 	rs.flushStart = chunkEnd
 	rs.measuredIdx = chunkEnd
 	rs.pendingBytes = 0
-	rs.flushedAny.Store(true)
+	if !rs.flushStageOnly {
+		rs.flushedAny.Store(true)
+	}
 	rs.flushMu.Unlock()
 	return nil
 }
