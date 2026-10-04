@@ -37,7 +37,8 @@ jobs:
 
       - name: test collection delivery order
         working-directory: bot
-        run: go test . -run '^TestCollectionDelivery'
+        # Named files avoid the Go test harness importing the module named "main".
+        run: go test -run '^TestCollectionDelivery' *.go
 
       - name: validate bootstrap scripts
         run: bash -n setup.sh generate.sh do-login.sh
