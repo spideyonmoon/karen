@@ -2591,7 +2591,10 @@ func mvDownloader(ctx context.Context, adamID string, saveDir string, token stri
 	}
 
 	os.MkdirAll(saveDir, os.ModePerm)
-	videom3u8url, _ := extractVideo(ctx, mvm3u8url)
+	videom3u8url, err := extractVideo(ctx, mvm3u8url)
+	if err != nil {
+		return fmt.Errorf("extract video manifest: %w", err)
+	}
 	videokeyAndUrls, err := runv3.Run(ctx, adamID, videom3u8url, token, mediaUserToken(), true, "", nil)
 	if err != nil {
 		return fmt.Errorf("video key retrieval failed: %w", err)
@@ -2599,7 +2602,10 @@ func mvDownloader(ctx context.Context, adamID string, saveDir string, token stri
 	if err := runv3.ExtMvData(ctx, videokeyAndUrls, vidPath, runv3.ProgressFunc(progress)); err != nil {
 		return fmt.Errorf("video track download failed: %w", err)
 	}
-	audiom3u8url, _ := extractMvAudio(mvm3u8url)
+	audiom3u8url, err := extractMvAudio(mvm3u8url)
+	if err != nil {
+		return fmt.Errorf("extract audio manifest: %w", err)
+	}
 	audiokeyAndUrls, err := runv3.Run(ctx, adamID, audiom3u8url, token, mediaUserToken(), true, "", nil)
 	if err != nil {
 		return fmt.Errorf("audio key retrieval failed: %w", err)
@@ -2724,53 +2730,100 @@ func extractMvAudio(c string) (string, error) {
 
 	audio := from.(*m3u8.MasterPlaylist)
 
-	var audioPriority = []string{"audio-atmos", "audio-ac3", "audio-stereo-256"}
-	if Config.MVAudioType == "ac3" {
-		audioPriority = []string{"audio-ac3", "audio-stereo-256"}
-	} else if Config.MVAudioType == "aac" {
-		audioPriority = []string{"audio-stereo-256"}
-	}
-
 	re := regexp.MustCompile(`_gr(\d+)_`)
 
 	type AudioStream struct {
 		URL     string
 		Rank    int
+		Score   int
 		GroupID string
 	}
 	var audioStreams []AudioStream
+	seenGroups := make(map[string]bool)
 
 	for _, variant := range audio.Variants {
 		for _, audiov := range variant.Alternatives {
-			if audiov.URI != "" {
-				for _, priority := range audioPriority {
-					if audiov.GroupId == priority {
-						matches := re.FindStringSubmatch(audiov.URI)
-						if len(matches) == 2 {
-							var rank int
-							fmt.Sscanf(matches[1], "%d", &rank)
-							streamUrl, _ := MediaUrl.Parse(audiov.URI)
-							audioStreams = append(audioStreams, AudioStream{
-								URL:     streamUrl.String(),
-								Rank:    rank,
-								GroupID: audiov.GroupId,
-							})
-						}
-					}
-				}
+			if audiov.URI == "" {
+				continue
 			}
+			seenGroups[audiov.GroupId] = true
+			score := mvAudioScore(audiov.GroupId, Config.MVAudioType)
+			if score < 0 {
+				continue
+			}
+			// The "_gr<N>_" rank is only a tie-breaker; not every playlist carries it.
+			rank := 0
+			if matches := re.FindStringSubmatch(audiov.URI); len(matches) == 2 {
+				fmt.Sscanf(matches[1], "%d", &rank)
+			}
+			streamUrl, err := MediaUrl.Parse(audiov.URI)
+			if err != nil {
+				continue
+			}
+			audioStreams = append(audioStreams, AudioStream{
+				URL:     streamUrl.String(),
+				Rank:    rank,
+				Score:   score,
+				GroupID: audiov.GroupId,
+			})
 		}
 	}
 
 	if len(audioStreams) == 0 {
-		return "", errors.New("no suitable audio stream found")
+		groups := make([]string, 0, len(seenGroups))
+		for g := range seenGroups {
+			groups = append(groups, g)
+		}
+		sort.Strings(groups)
+		return "", fmt.Errorf("no suitable audio stream found (playlist offers: %s)", strings.Join(groups, ", "))
 	}
 
 	sort.Slice(audioStreams, func(i, j int) bool {
+		if audioStreams[i].Score != audioStreams[j].Score {
+			return audioStreams[i].Score > audioStreams[j].Score
+		}
 		return audioStreams[i].Rank > audioStreams[j].Rank
 	})
 	fmt.Println("Audio: " + audioStreams[0].GroupID)
 	return audioStreams[0].URL, nil
+}
+
+// mvAudioScore ranks a music-video audio group (higher is better, -1 = excluded by
+// the mv-audio-type setting). Ported from upstream zhaarey/apple-music-downloader,
+// which accepts every stereo/HE-AAC bitrate instead of only audio-stereo-256 — a
+// video offering only e.g. audio-HE-stereo-64 used to be reported as having no audio.
+func mvAudioScore(groupID, preferredType string) int {
+	switch {
+	case groupID == "audio-atmos":
+		if preferredType == "ac3" || preferredType == "aac" {
+			return -1
+		}
+		return 10000
+	case groupID == "audio-ac3":
+		if preferredType == "aac" {
+			return -1
+		}
+		if preferredType == "ac3" {
+			return 10000
+		}
+		return 9000
+	case strings.HasPrefix(groupID, "audio-stereo-"):
+		return 8000 + mvAudioBitrate(groupID, "audio-stereo-")
+	case strings.HasPrefix(groupID, "audio-HE-stereo-"):
+		return 7000 + mvAudioBitrate(groupID, "audio-HE-stereo-")
+	case strings.HasPrefix(groupID, "audio-HE2-stereo-"):
+		return 6000 + mvAudioBitrate(groupID, "audio-HE2-stereo-")
+	default:
+		return -1
+	}
+}
+
+func mvAudioBitrate(groupID, prefix string) int {
+	bitrate, err := strconv.Atoi(strings.TrimPrefix(groupID, prefix))
+	if err != nil {
+		return 0
+	}
+	return bitrate
 }
 
 func checkM3u8(b string, f string) (string, error) {
