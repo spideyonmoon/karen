@@ -3116,6 +3116,47 @@ func extractVideo(ctx context.Context, c string) (string, error) {
 	return streamUrl.String(), nil
 }
 
+// mvStreamTopRung reads a music video's real HLS master playlist and returns its
+// highest video rung (by pixel height) and dynamic range. /check uses it instead of
+// the catalog flags, which say "HD" even for legacy videos whose stream tops out at
+// 360p. Needs a working media-user-token (webplayback is account-gated).
+func mvStreamTopRung(mvID, token string) (width, height int, videoRange string, err error) {
+	masterURL, _, _, _ := runv3.GetWebplayback(mvID, token, mediaUserToken(), true)
+	if masterURL == "" {
+		return 0, 0, "", errors.New("no webplayback manifest (media-user-token missing or expired)")
+	}
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Get(masterURL)
+	if err != nil {
+		return 0, 0, "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, 0, "", errors.New(resp.Status)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, 0, "", err
+	}
+	from, listType, err := m3u8.DecodeFrom(strings.NewReader(string(body)), true)
+	if err != nil || listType != m3u8.MASTER {
+		return 0, 0, "", errors.New("m3u8 not of media type")
+	}
+	for _, variant := range from.(*m3u8.MasterPlaylist).Variants {
+		var w, h int
+		if _, scanErr := fmt.Sscanf(variant.Resolution, "%dx%d", &w, &h); scanErr != nil {
+			continue
+		}
+		if h > height {
+			width, height, videoRange = w, h, variant.VideoRange
+		}
+	}
+	if height == 0 {
+		return 0, 0, "", errors.New("no video variants in playlist")
+	}
+	return width, height, videoRange, nil
+}
+
 func ripSong(songId string, token string, storefront string, forceAAC bool, ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
