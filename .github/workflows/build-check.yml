@@ -41,10 +41,16 @@ jobs:
         run: go test -run '^TestCollectionDelivery' *.go
 
       - name: validate bootstrap scripts
-        run: bash -n setup.sh generate.sh do-login.sh
+        run: bash -n setup.sh generate.sh do-login.sh do-token.sh
 
       - name: validate login helper
-        run: python -m py_compile login/login.py
+        run: python -m py_compile login/login.py token/fetch_token.py
+
+      - name: build token helper image and check its SRP setup imports
+        run: |
+          docker build -t karen-token-check ./token
+          docker run --rm --entrypoint python karen-token-check -c \
+            'import srp._pysrp as s, pbkdf2, requests; from Cryptodome.Hash import SHA256; s.rfc5054_enable(); s.no_username_in_x(); print("token helper deps ok")'
 
       - name: build and validate runnable bot image
         run: |

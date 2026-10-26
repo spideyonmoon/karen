@@ -1007,6 +1007,7 @@ func ripTrack(track *task.Track, token string, ctx context.Context) trackOutcome
 		err := mvDownloader(ctx, track.ID, track.SaveDir, token, track.Storefront, track, trackProgress)
 		if err != nil {
 			fmt.Println("\u26A0 Failed to dl MV:", err)
+			recordDownloadFailure(ctx, "%s: music video failed: %v", track.Name, err)
 			ctr.Inc(&ctr.Error)
 			return trackRetryableFailure
 		}
@@ -1133,7 +1134,7 @@ func ripTrack(track *task.Track, token string, ctx context.Context) trackOutcome
 	}
 	var lrc string = ""
 	if cfg.EmbedLrc || cfg.SaveLrcFile {
-		lrcStr, err := lyrics.Get(track.Storefront, track.ID, cfg.LrcType, cfg.Language, cfg.LrcFormat, token, cfg.MediaUserToken)
+		lrcStr, err := lyrics.Get(track.Storefront, track.ID, cfg.LrcType, cfg.Language, cfg.LrcFormat, token, mediaUserToken())
 		if err != nil {
 			fmt.Println(err)
 		} else {
@@ -1230,7 +1231,7 @@ func ripTrack(track *task.Track, token string, ctx context.Context) trackOutcome
 		wvCtx, wvCancel := context.WithTimeout(ctx, 6*time.Minute)
 		done := make(chan error, 1)
 		go func() {
-			_, e := runv3.Run(wvCtx, track.ID, trackPath, token, Config.MediaUserToken, false, "", runv3.ProgressFunc(trackProgress))
+			_, e := runv3.Run(wvCtx, track.ID, trackPath, token, mediaUserToken(), false, "", runv3.ProgressFunc(trackProgress))
 			done <- e
 		}()
 		var werr error
@@ -1322,7 +1323,7 @@ func ripStation(albumId string, token string, storefront string, ctx context.Con
 	rs := ripStateFrom(ctx)
 	ctr := rs.ctr()
 	station := task.NewStation(storefront, albumId)
-	err := station.GetResp(Config.MediaUserToken, token, Config.Language)
+	err := station.GetResp(mediaUserToken(), token, Config.Language)
 	if err != nil {
 		return err
 	}
@@ -1452,7 +1453,7 @@ func ripStation(albumId string, token string, storefront string, ctx context.Con
 			fmt.Println("Radio already exists locally.")
 			return nil
 		}
-		assetsUrl, _, err := ampapi.GetStationAssetsUrlAndServerUrl(station.ID, Config.MediaUserToken, token)
+		assetsUrl, _, err := ampapi.GetStationAssetsUrlAndServerUrl(station.ID, mediaUserToken(), token)
 		if err != nil {
 			fmt.Println("Failed to get station assets url.", err)
 			ctr.Error++
@@ -1581,7 +1582,7 @@ func ripArtwork(link string, token string, storefront string, ctx context.Contex
 			storefront = sf
 		}
 		st := task.NewStation(storefront, id)
-		if err := st.GetResp(Config.MediaUserToken, token, Config.Language); err != nil {
+		if err := st.GetResp(mediaUserToken(), token, Config.Language); err != nil {
 			return err
 		}
 		if len(st.Resp.Data) == 0 {
@@ -2584,14 +2585,14 @@ func mvDownloader(ctx context.Context, adamID string, saveDir string, token stri
 	// Music videos are Widevine-encrypted (PSSH keys), not FairPlay (skd://).
 	// wrapper-manager only decrypts FairPlay, so MV uses the bundled Widevine CDM
 	// (runv3) + mp4decrypt path instead of the Temari audio path.
-	mvm3u8url, _, _, _ := runv3.GetWebplayback(adamID, token, Config.MediaUserToken, true)
+	mvm3u8url, _, _, _ := runv3.GetWebplayback(adamID, token, mediaUserToken(), true)
 	if mvm3u8url == "" {
-		return errors.New("media-user-token may be wrong or expired")
+		return errors.New("media-user-token may be wrong or expired (refresh it with ./do-token.sh on the VPS)")
 	}
 
 	os.MkdirAll(saveDir, os.ModePerm)
 	videom3u8url, _ := extractVideo(ctx, mvm3u8url)
-	videokeyAndUrls, err := runv3.Run(ctx, adamID, videom3u8url, token, Config.MediaUserToken, true, "", nil)
+	videokeyAndUrls, err := runv3.Run(ctx, adamID, videom3u8url, token, mediaUserToken(), true, "", nil)
 	if err != nil {
 		return fmt.Errorf("video key retrieval failed: %w", err)
 	}
@@ -2599,7 +2600,7 @@ func mvDownloader(ctx context.Context, adamID string, saveDir string, token stri
 		return fmt.Errorf("video track download failed: %w", err)
 	}
 	audiom3u8url, _ := extractMvAudio(mvm3u8url)
-	audiokeyAndUrls, err := runv3.Run(ctx, adamID, audiom3u8url, token, Config.MediaUserToken, true, "", nil)
+	audiokeyAndUrls, err := runv3.Run(ctx, adamID, audiom3u8url, token, mediaUserToken(), true, "", nil)
 	if err != nil {
 		return fmt.Errorf("audio key retrieval failed: %w", err)
 	}

@@ -59,6 +59,8 @@ cp .env.example .env
 
 - **Restriction mode** (`bot/restriction.go`, admin `/restrict [on|off]`, hidden): a temporary valve, **OFF by default** (a deploy changes nothing). While ON, non-admin non-donor members get 20 albums/day + 2 playlists/day (≤100 tracks; larger ones and ALL artist/discography rips are refused), unlimited songs/MVs/stations; donors are unlimited (`ripLimit` returns `quotaUnlimited`), admins are never gated. Albums/playlists reuse the per-day quota engine (`quotaCheckAndCharge` kinds `album`/`playlist`, charged in `enqueueAlbumDownload`/`enqueuePlaylistDownload` via `admitRestricted`, committed/refunded like heavy rips). Persisted as `restriction_mode` in `telegram-state.json`. When OFF the old always-on `heavyRipLimit` caps still apply. Donor-only DMs are unchanged and independent of the valve.
 
+- **media-user-token** (music videos, AAC Widevine fallback, lyrics, stations): minted from the `APPLE_ID_n` accounts by `./do-token.sh` (containerized Python helper in `token/`, Apple web SRP login; skips accounts that ask for 2FA, one attempt per account) into `bot/state/media-user-token`. `setup.sh` runs it when the file is missing or `RETOKEN=1`. The bot reads it via `mediaUserToken()` (`bot/media_token.go`, re-read on mtime change, no restart) and falls back to `MEDIA_USER_TOKEN` from `.env`. Refresh any time with `./do-token.sh`.
+
 ## State & persistence (`bot/state/`)
 - **All JSON state lives in one directory mount: `./bot/state:/app/state`** (`docker-compose.yml`). It holds three files:
   - `telegram-cache.json` — Telegram `file_id` cache (re-send without re-upload).

@@ -89,6 +89,15 @@ for ((i = 1; i <= N; i++)); do
 done
 mv "$REGISTRY_TMP" "$ACCOUNT_REGISTRY"
 
+# 4b. Mint the Apple Music media-user-token from the accounts above (music videos,
+# the AAC Widevine fallback, lyrics, stations). Only when no token has been minted
+# yet, or on RETOKEN=1 — never a reason to fail setup, since a hand-pasted
+# MEDIA_USER_TOKEN in .env still works as the fallback.
+if [[ "${RETOKEN:-0}" == "1" || ! -s bot/state/media-user-token ]]; then
+  echo "Minting media-user-token (./do-token.sh) ..."
+  ./do-token.sh || echo "WARN: could not mint a media-user-token; using MEDIA_USER_TOKEN from .env if set."
+fi
+
 # 5. Start the bot. Docker now sees only real image inputs: generated config and
 # mutable runtime state are excluded by bot/.dockerignore. Its cache therefore
 # makes this automatic — code changes rebuild, while account-only setup runs reuse
