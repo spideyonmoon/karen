@@ -1861,13 +1861,16 @@ func (b *TelegramBot) countMusicVideo(chatID int64, storefront, mvID, sfCode str
 		meta = append(meta, "📅 "+a.ReleaseDate)
 	}
 
-	// Video-quality line from catalog flags (resolution class + dynamic range).
-	video := "HD 1080p"
-	if a.Has4K {
-		video = "4K (2160p)"
-	}
-	if a.HasHDR {
-		video += " · HDR"
+	// Video-quality line: the real top rung of the stream. The catalog flags only say
+	// "HD" and are wrong for legacy videos (a 1983 video the catalog calls HD streams
+	// at 504×378), so when the stream can't be read the line is left out rather than
+	// guessed.
+	video := ""
+	if w, h, rng, err := mvStreamTopRung(mvID, b.appleToken); err == nil {
+		video = fmt.Sprintf("%s (%d×%d)", videoQualityLabel(h), w, h)
+		if rng != "" && !strings.EqualFold(rng, "SDR") {
+			video += " · " + rng
+		}
 	}
 
 	headline := "🔢 1 music video"
@@ -1887,8 +1890,10 @@ func (b *TelegramBot) countMusicVideo(chatID int64, storefront, mvID, sfCode str
 		richBody = append(richBody, escapeRichMD(strings.Join(meta, " · ")))
 		plainBody = append(plainBody, strings.Join(meta, " · "))
 	}
-	richBody = append(richBody, "📺 "+escapeRichMD(video))
-	plainBody = append(plainBody, "📺 "+video)
+	if video != "" {
+		richBody = append(richBody, "📺 "+escapeRichMD(video))
+		plainBody = append(plainBody, "📺 "+video)
+	}
 	richBody = append(richBody, escapeRichMD(headline))
 	plainBody = append(plainBody, headline)
 	if r := regionBadge(orStorefront(sfCode)); r != "" {
