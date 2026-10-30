@@ -1,6 +1,6 @@
 FROM golang:1.25 AS builder
 
-ARG WRAPPER_MANAGER_REF=0f14e3f241bcc4ecd7282a3e5b98144e94611a8b
+ARG WRAPPER_MANAGER_REF=4a8859d066af8d9da99ef25006a449b3f161bbd8
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
     && git init \
